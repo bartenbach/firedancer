@@ -117,8 +117,9 @@ fd_accdb_join( void * shaccdb );
    accordingly, the same way it does for in-shmem joiner_epochs[].
 
    Only fd_accdb_read_one_nocache, fd_accdb_read_one_meta, fd_accdb_exists,
-   fd_accdb_lamports, and fd_accdb_data_len are supported on a readonly
-   join; any other API is undefined behavior. */
+   fd_accdb_lamports, fd_accdb_data_len, fd_accdb_scan_keys and
+   fd_accdb_scan_chain_cnt are supported on a readonly join; any other
+   API is undefined behavior. */
 
 fd_accdb_t *
 fd_accdb_join_readonly( void *             ljoin,
@@ -513,6 +514,36 @@ fd_accdb_read_one_nocache( fd_accdb_t *       accdb,
 /* Reads owner (32 bytes) and data length without acquiring account data.
    Uses cache when available, otherwise reads only the owner from disk.
    Returns FD_ACCDB_READ_ONE_NOCACHE_*; outputs are undefined on MISS. */
+
+/* fd_accdb_scan_keys walks the account index and copies out the pubkeys
+   of the accounts it holds, for callers that need to visit every
+   account (RPC account scans).  It is a plain walk of the hash chains:
+   slow next to a keyed read, never meant for a hot path.
+
+   *chain_cursor is the chain to resume from (0 to start) and is
+   advanced past every chain fully reported; the scan is complete when
+   it reaches fd_accdb_scan_chain_cnt.  At most chain_budget chains are
+   visited per call, which bounds how long the caller's epoch is held.
+   Up to out_max keys are written to out_pubkeys (32 bytes each) and the
+   count is returned.  A chain is reported whole or not at all, so
+   out_max must be at least the longest chain; a chain longer than
+   out_max is skipped.
+
+   A key is reported once per chain even if several versions of the
+   account are indexed.  The keys are those of every fork: the caller
+   reads each one on its own fork with fd_accdb_read_one_nocache, which
+   answers whether the account exists there (lamports 0 if not).  A
+   concurrent writer can add or remove accounts mid scan; like any scan
+   over a live database the result is not a point in time view. */
+ulong
+fd_accdb_scan_keys( fd_accdb_t * accdb,
+                    ulong *      chain_cursor,
+                    uchar *      out_pubkeys,
+                    ulong        out_max,
+                    ulong        chain_budget );
+
+ulong
+fd_accdb_scan_chain_cnt( fd_accdb_t const * accdb );
 
 int
 fd_accdb_read_one_meta( fd_accdb_t *       accdb,

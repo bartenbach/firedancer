@@ -3044,6 +3044,64 @@ done:
   return result;
 }
 
+ulong
+fd_accdb_scan_chain_cnt( fd_accdb_t const * accdb ) {
+  return accdb->shmem->chain_cnt;
+}
+
+ulong
+fd_accdb_scan_keys( fd_accdb_t * accdb,
+                    ulong *      chain_cursor,
+                    uchar *      out_pubkeys,
+                    ulong        out_max,
+                    ulong        chain_budget ) {
+  /* The epoch keeps every accmeta on the chains alive */
+  FD_COMPILER_MFENCE();
+  FD_VOLATILE( *accdb->my_epoch_slot ) = FD_VOLATILE_CONST( accdb->shmem->epoch );
+  FD_HW_MFENCE();
+
+  ulong chain_cnt = accdb->shmem->chain_cnt;
+  ulong cnt       = 0UL;
+  ulong chain     = *chain_cursor;
+  for( ; chain<chain_cnt && chain_budget; chain++, chain_budget-- ) {
+    ulong start    = cnt;
+    int   full     = 0;
+    ulong restarts = 0UL;
+    uint  acc_idx  = FD_VOLATILE_CONST( accdb->acc_map[ chain ] );
+    while( acc_idx!=UINT_MAX ) {
+      fd_accdb_accmeta_t const * candidate = &accdb->acc_pool[ acc_idx ];
+      uint next_idx = FD_VOLATILE_CONST( candidate->map.next );
+      if( FD_UNLIKELY( fd_accdb_acc_unlinked( candidate ) ) ) {
+        /* unlinked under us: its next pointer is no longer this chain */
+        if( FD_UNLIKELY( ++restarts>64UL ) ) break;
+        cnt     = start;
+        acc_idx = FD_VOLATILE_CONST( accdb->acc_map[ chain ] );
+        continue;
+      }
+      int dup = 0;
+      for( ulong i=start; i<cnt; i++ ) {
+        if( !memcmp( out_pubkeys+i*32UL, candidate->key.pubkey, 32UL ) ) { dup = 1; break; }
+      }
+      if( !dup ) {
+        if( FD_UNLIKELY( cnt==out_max ) ) { full = 1; break; }
+        memcpy( out_pubkeys+cnt*32UL, candidate->key.pubkey, 32UL );
+        cnt++;
+      }
+      acc_idx = next_idx;
+    }
+    if( FD_UNLIKELY( full ) ) {
+      cnt = start;
+      if( FD_UNLIKELY( !start ) ) chain++; /* longer than out_max: skip it */
+      break;
+    }
+  }
+  *chain_cursor = chain;
+
+  FD_COMPILER_MFENCE();
+  FD_VOLATILE( *accdb->my_epoch_slot ) = ULONG_MAX;
+  return cnt;
+}
+
 int
 fd_accdb_read_one_meta( fd_accdb_t *       accdb,
                         fd_accdb_fork_id_t fork_id,
