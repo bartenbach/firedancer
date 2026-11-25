@@ -4,6 +4,7 @@
 #include "../../choreo/votor/fd_cert.h"
 
 #include "../../ballet/base64/fd_base64.h"
+#include "../../ballet/txn/fd_txn_v1.h"
 #include "../../ballet/ed25519/fd_ed25519.h"
 #include "../../ballet/json/fd_jtok.h"
 #include "../../disco/topo/fd_topo.h"
@@ -2999,13 +3000,23 @@ getFeeForMessage( fd_rpc_tile_t *         ctx,
 
   /* Wrap the message in a transaction with blank signatures so the
      transaction parser can validate it and find its instructions. */
+  /* Legacy and v0 transactions are [signature count][signatures][message].
+     A v1 transaction (first byte 0x81) is [message][signatures]. */
+  int   is_v1   = msg[ 0 ]==(uchar)0x81;
   uchar sig_cnt = (msg[ 0 ] & 0x80) ? msg[ 1 ] : msg[ 0 ];
   if( FD_UNLIKELY( !sig_cnt || sig_cnt>12 ) ) return fd_rpc_err_msg( ctx, id_cstr, -32602, "Invalid params: failed to deserialize message." );
   uchar payload[ 1UL+12UL*64UL+3UL*FD_TXN_MTU_V0+3UL ];
-  ulong payload_sz = 1UL+(ulong)sig_cnt*64UL+(ulong)msg_sz;
-  payload[ 0 ] = sig_cnt;
-  memset( payload+1UL, 0, (ulong)sig_cnt*64UL );
-  memcpy( payload+1UL+(ulong)sig_cnt*64UL, msg, (ulong)msg_sz );
+  ulong payload_sz;
+  if( is_v1 ) {
+    payload_sz = (ulong)msg_sz+(ulong)sig_cnt*64UL;
+    memcpy( payload, msg, (ulong)msg_sz );
+    memset( payload+msg_sz, 0, (ulong)sig_cnt*64UL );
+  } else {
+    payload_sz = 1UL+(ulong)sig_cnt*64UL+(ulong)msg_sz;
+    payload[ 0 ] = sig_cnt;
+    memset( payload+1UL, 0, (ulong)sig_cnt*64UL );
+    memcpy( payload+1UL+(ulong)sig_cnt*64UL, msg, (ulong)msg_sz );
+  }
   uchar txn_buf[ FD_TXN_MAX_SZ ] __attribute__((aligned(alignof(fd_txn_t))));
   if( FD_UNLIKELY( payload_sz>FD_TXN_MTU || !fd_txn_parse( payload, payload_sz, txn_buf, NULL ) ) ) {
     return fd_rpc_err_msg( ctx, id_cstr, -32602, "Invalid params: failed to deserialize message." );
@@ -3033,7 +3044,11 @@ getFeeForMessage( fd_rpc_tile_t *         ctx,
     }
   }
   ulong priority_fee = 0UL;
-  if( has_price && cu_price ) {
+  if( txn->transaction_version==FD_TXN_V1 ) {
+    /* v1 states its priority fee in lamports in the message header */
+    ulong v1_cu_limit, v1_loaded, v1_heap;
+    fd_txn_parse_v1_config( fd_uint_load_4( payload+4UL ), payload+txn->v1_txn_config_values_off, &priority_fee, &v1_cu_limit, &v1_loaded, &v1_heap );
+  } else if( has_price && cu_price ) {
     /* Without an explicit limit the default depends on which of the
        transaction's programs are builtins on this bank, which this
        tile does not know.  Refuse rather than guess. */
@@ -4269,6 +4284,17 @@ fd_rpc_print_loaded_addresses( fd_rpc_tile_t *     ctx,
   fd_http_server_printf( ctx->http, "]}" );
 }
 
+/* Version of a stored transaction: -1 legacy, else 0 or 1.  A v1
+   transaction starts with its version byte; legacy and v0 start with
+   the signature count and carry the version after the signatures. */
+static int
+fd_rpc_txn_rec_version( fd_rpc_txn_rec_t const * rec ) {
+  if( rec->payload_sz && (rec->payload[ 0 ] & 0x80) ) return (int)( rec->payload[ 0 ] & 0x7f );
+  ulong off = 1UL+64UL*(ulong)rec->payload[ 0 ];
+  if( FD_UNLIKELY( off>=rec->payload_sz ) ) return -1;
+  return ( rec->payload[ off ] & 0x80 ) ? (int)( rec->payload[ off ] & 0x7f ) : -1;
+}
+
 #define FD_RPC_TXN_ENC_JSON   (0)
 #define FD_RPC_TXN_ENC_BASE64 (1)
 #define FD_RPC_TXN_ENC_BASE58 (2)
@@ -4347,7 +4373,7 @@ fd_rpc_print_txn( fd_rpc_tile_t *          ctx,
   for( ulong i=0UL; i<rec->bal_cnt; i++ ) fd_http_server_printf( ctx->http, "%s%lu", i ? "," : "", rec->pre_lamports[ i ] );
   fd_http_server_printf( ctx->http, "],\"preTokenBalances\":null,\"rewards\":null}," );
   if( txn->transaction_version==FD_TXN_VLEGACY ) fd_http_server_printf( ctx->http, "\"version\":\"legacy\"" );
-  else                                           fd_http_server_printf( ctx->http, "\"version\":0" );
+  else                                           fd_http_server_printf( ctx->http, "\"version\":%u", (uint)txn->transaction_version );
   return 1;
 }
 
@@ -4396,9 +4422,9 @@ getTransaction( fd_rpc_tile_t *         ctx,
   if( !rec || rec->slot>info->slot ) return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"result\":null,\"id\":%s}\n", id_cstr );
 
   fd_rpc_val_t v[1];
-  int has_max_version = fd_rpc_cfg_member( config, "maxSupportedTransactionVersion", v ) && v->kind==FD_RPC_VAL_INT;
-  if( FD_UNLIKELY( !has_max_version && (rec->payload[ 1UL+64UL*(ulong)rec->payload[ 0 ] ] & 0x80) ) ) {
-    return fd_rpc_err_msg( ctx, id_cstr, -32015, "Transaction version (0) is not supported by the requesting client. Please try the request again with the following configuration parameter: \\\"maxSupportedTransactionVersion\\\": 0" );
+  long max_version = ( fd_rpc_cfg_member( config, "maxSupportedTransactionVersion", v ) && v->kind==FD_RPC_VAL_INT && !v->neg ) ? (long)fd_ulong_min( v->u, 255UL ) : -1L;
+  if( FD_UNLIKELY( (long)fd_rpc_txn_rec_version( rec )>max_version ) ) {
+    return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32015,\"message\":\"Transaction version (%d) is not supported by the requesting client. Please try the request again with the following configuration parameter: \\\"maxSupportedTransactionVersion\\\": %d\"},\"id\":%s}\n", fd_rpc_txn_rec_version( rec ), fd_rpc_txn_rec_version( rec ), id_cstr );
   }
 
   fd_rpc_block_time_t const * bt = fd_rpc_block_time_query( ctx, rec->slot );
@@ -4525,7 +4551,7 @@ getBlock( fd_rpc_tile_t *         ctx,
   int enc = FD_RPC_TXN_ENC_JSON;
   if( want_full && FD_UNLIKELY( !fd_rpc_txn_encoding( ctx, id_cstr, config, &enc, &response ) ) ) return response;
   int want_rewards    = !( fd_rpc_cfg_member( config, "rewards", v ) && v->kind==FD_RPC_VAL_BOOL && v->raw_sz==5UL );
-  int has_max_version = fd_rpc_cfg_member( config, "maxSupportedTransactionVersion", v ) && v->kind==FD_RPC_VAL_INT;
+  long max_version = ( fd_rpc_cfg_member( config, "maxSupportedTransactionVersion", v ) && v->kind==FD_RPC_VAL_INT && !v->neg ) ? (long)fd_ulong_min( v->u, 255UL ) : -1L;
 
   if( FD_UNLIKELY( slot>info->slot ) ) {
     return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32004,\"message\":\"Block not available for slot %lu\"},\"id\":%s}\n", slot, id_cstr );
@@ -4566,11 +4592,11 @@ getBlock( fd_rpc_tile_t *         ctx,
     if( FD_UNLIKELY( meta->txn_cnt==ULONG_MAX || cnt!=meta->txn_cnt ) ) {
       return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32004,\"message\":\"Block not available for slot %lu\"},\"id\":%s}\n", slot, id_cstr );
     }
-    if( want_full && !has_max_version ) {
+    if( want_full ) {
       for( ulong i=0UL; i<cnt; i++ ) {
-        fd_rpc_txn_rec_t const * rec = &ctx->txn_recs[ ctx->block_txns[ i ].rec ];
-        if( FD_UNLIKELY( rec->payload[ 1UL+64UL*(ulong)rec->payload[ 0 ] ] & 0x80 ) ) {
-          return fd_rpc_err_msg( ctx, id_cstr, -32015, "Transaction version (0) is not supported by the requesting client. Please try the request again with the following configuration parameter: \\\"maxSupportedTransactionVersion\\\": 0" );
+        int version = fd_rpc_txn_rec_version( &ctx->txn_recs[ ctx->block_txns[ i ].rec ] );
+        if( FD_UNLIKELY( (long)version>max_version ) ) {
+          return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32015,\"message\":\"Transaction version (%d) is not supported by the requesting client. Please try the request again with the following configuration parameter: \\\"maxSupportedTransactionVersion\\\": %d\"},\"id\":%s}\n", version, version, id_cstr );
         }
       }
     }
@@ -5303,7 +5329,7 @@ sendTransaction( fd_rpc_tile_t *         ctx,
   uchar const * sigs  = payload+txn->signature_off;
   uchar const * accts = payload+txn->acct_addr_off;
   uchar const * msg   = payload+txn->message_off;
-  ulong         msg_sz = payload_sz-txn->message_off;
+  ulong         msg_sz = fd_txn_msg_sz( txn, payload_sz );
   for( ulong i=0UL; i<txn->signature_cnt; i++ ) {
     if( FD_UNLIKELY( FD_ED25519_SUCCESS!=fd_ed25519_verify( msg, msg_sz, sigs+64UL*i, accts+32UL*i, ctx->sha ) ) ) {
       return fd_rpc_err_msg( ctx, id_cstr, -32003, "Transaction signature verification failure" );

@@ -99,9 +99,20 @@ current stake. This patch does not change that.
   community cluster, and the answers compared. That is one small
   cluster with Alpenglow active. Nothing here has been run on mainnet
   or testnet, with pre-v4 vote accounts, or with Token-2022 accounts.
-- `sendTransaction` was checked for decoding, signature verification
-  and its error paths by resubmitting a transaction that had already
-  landed. **It has not been seen landing a new transaction.**
+- `sendTransaction` landed one transaction: a `solana transfer` from
+  the 4.5.0-beta.0 CLI pointed at the patched node, finalized and
+  confirmed on the Agave node too. That is one transaction, sent from
+  a node that was not a leader, while some leaders ran Firedancer.
+  Decoding, signature verification and the error paths were also
+  checked by resubmitting a transaction that had already landed.
+- The 4.5 CLI sends **v1 transactions** (message first, signatures
+  last, fee settings in the header). `getFeeForMessage`,
+  `sendTransaction` and the history calls handle them. The `json`
+  rendering of a v1 transaction (`"version":1`, with the same message
+  fields as v0) has nothing to be compared against and is unverified.
+- Twenty read-only `solana` CLI commands (`validators`,
+  `block-production`, `stakes`, `vote-account`, `supply`, `block`,
+  `largest-accounts`, ...) ran against the patched node without error.
 - `getSignatureStatuses` matched Agave for successful transactions.
   The cluster produced no failed transactions during the check, so the
   failed-transaction path has not been seen working.
@@ -110,7 +121,7 @@ current stake. This patch does not change that.
   (blockhash chain, height, time, each signature's slot) and against
   another operator's independent Firedancer RPC gateway, where full
   blocks and transactions matched field for field on the blocks
-  sampled. Every sampled block held one legacy transaction: v0
+  sampled. Every sampled block held one transaction, legacy or v1: v0
   transactions, lookup tables, memos and multi-transaction blocks have
   not been seen.
 - The `test_rpc_tile` and `test_execrp_tile` unit tests pass.
