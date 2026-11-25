@@ -14,7 +14,7 @@ chain attacks in build tooling or dependencies.
 
 ## Agave RPC compatibility patch (this branch)
 
-This branch is `firedancer-geo-aware-lsched` plus one commit that adds
+This branch is `firedancer-geo-aware-lsched` plus two commits that add
 Agave JSON-RPC methods the Firedancer RPC tile answered with HTTP 501.
 It is an operator patch, not an official Firedancer release, and it has
 not been reviewed by the Firedancer team.
@@ -36,6 +36,8 @@ not been reviewed by the Firedancer team.
 | `getSupply` | full account scan | Everything is reported as circulating; the non-circulating list is empty. |
 | `getTokenAccountBalance`, `getTokenSupply` | account read | |
 | `getTokenAccountsByOwner`, `getTokenAccountsByDelegate`, `getTokenLargestAccounts` | full account scan | No `jsonParsed`. |
+| `getSignatureStatuses` | recent transaction window | Only transactions replayed since this node started that are still in the window (the last 524,288). A failed transaction is reported as failed, but when an instruction failed the error is `{"InstructionError":[null,null]}`: which instruction and why is not known to the tile. `confirmations` is the number of slots since the transaction's slot, not Agave's count. `searchTransactionHistory` is ignored. |
+| `getBlock` | recent transaction window | **Signatures only.** `transactionDetails` must be `"signatures"` or `"none"` and `rewards` must be `false`; the default call (full detail, with rewards) returns an error. Only blocks replayed since this node started, and only while every transaction of the block is still in the window; otherwise "Block not available". |
 | `jsonParsed` encoding | vote accounts only (v4 vote state) | Accounts Agave does not parse fall back to base64, as in Agave. Accounts Agave does parse (stake, token, sysvar, config, nonce, BPF loader, lookup table) return an error instead of unparsed data. |
 
 ### Already in the base branch (not part of this patch)
@@ -52,7 +54,8 @@ current stake. This patch does not change that.
 
 | Method | Why |
 |---|---|
-| `getBlock`, `getTransaction`, `getSignaturesForAddress`, `getSignatureStatuses` | Firedancer keeps no transaction history, and the per-transaction result the RPC tile could subscribe to does not say which instruction failed or why. |
+| `getTransaction` | The tile is told a transaction's result code, fee and compute units, but not balance changes, logs or inner instructions. |
+| `getSignaturesForAddress` | The window is not indexed by address, and addresses loaded through lookup tables are not resolved. |
 | `getInflationReward` | No per-epoch reward history. |
 | `getStakeMinimumDelegation` | The answer comes from executing the on-chain stake program. |
 | `getHighestSnapshotSlot` | The tile is not told which snapshots are on disk. |
@@ -69,6 +72,12 @@ current stake. This patch does not change that.
   answers nothing else and does not drain its input from replay. Do not
   expose these to untrusted callers. Behaviour under sustained scan
   load, or on a mainnet-sized database, has not been tested.
+- **The patch touches the tile wiring.** For `getSignatureStatuses`
+  and `getBlock` the RPC tile becomes a reader of the `replay_out`
+  link (one line in `topology.c`). It reads it unreliably, so it cannot
+  backpressure replay, and it discards a transaction it was too slow to
+  read; such a transaction is then missing from the window. The window
+  adds about 65 MB to the RPC tile.
 - **A scan is not a point-in-time view.** Accounts written while a scan
   runs may or may not be included.
 - **How it was checked.** Each call was issued to an Agave 4.5.0-beta.0
@@ -76,6 +85,12 @@ current stake. This patch does not change that.
   community cluster, and the answers compared. That is one small
   cluster with Alpenglow active. Nothing here has been run on mainnet
   or testnet, with pre-v4 vote accounts, or with Token-2022 accounts.
+- `getSignatureStatuses` matched Agave for successful transactions.
+  The cluster produced no failed transactions during the check, so the
+  failed-transaction path has not been seen working.
+- Agave on the test cluster does not serve `getBlock`, so `getBlock`
+  was checked for internal consistency only (blockhash chain, height,
+  time, and each signature's slot via `getSignatureStatuses`).
 - The base branch's RPC unit test passes with the patch applied. The
   patch adds no unit tests of its own.
 
