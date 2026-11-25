@@ -4,6 +4,7 @@
 #include "../../choreo/votor/fd_cert.h"
 
 #include "../../ballet/base64/fd_base64.h"
+#include "../../ballet/ed25519/fd_ed25519.h"
 #include "../../ballet/json/fd_jtok.h"
 #include "../../disco/topo/fd_topo.h"
 #include "../../disco/topo/fd_dns_resolve.h"
@@ -37,6 +38,8 @@
 #include <stddef.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <errno.h>
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
@@ -604,6 +607,22 @@ typedef struct fd_rpc_block_txn fd_rpc_block_txn_t;
 #define SORT_BEFORE(a,b) ((a).index_in_slot<(b).index_in_slot)
 #include "../../util/tmpl/fd_sort.c"
 
+/* sendTransaction: transactions are sent as UDP datagrams to the TPU
+   port of the upcoming leaders, and kept here to be sent again each
+   leader rotation until they are seen in a block or have expired. */
+#define FD_RPC_SEND_PENDING_MAX      (256UL)
+#define FD_RPC_SEND_EXPIRE_SLOTS     (150UL)
+#define FD_RPC_SEND_LEADER_ROTATIONS (4UL)
+
+struct fd_rpc_send_pending {
+  int    used;
+  ushort sz;
+  ulong  submit_slot;
+  uchar  sig[ 64 ];
+  uchar  payload[ FD_TXN_MTU_V0 ];
+};
+typedef struct fd_rpc_send_pending fd_rpc_send_pending_t;
+
 #define FD_RPC_SCAN_KEYS_MAX     (4096UL)
 #define FD_RPC_SCAN_CHAIN_BUDGET (1UL<<20)
 #define FD_RPC_PRIO_FEE_CNT      (150UL)
@@ -714,6 +733,11 @@ struct fd_rpc_tile {
   ulong prio_fee_next;
   ulong ns_per_slot;                           /* from the latest epoch message, 0 if none */
   uchar scan_keys[ FD_RPC_SCAN_KEYS_MAX*32UL ]; /* account scan batch */
+
+  int                   udp_fd;                               /* sendTransaction socket, -1 if none */
+  fd_sha512_t           sha[ 1 ];
+  fd_rpc_send_pending_t send_pending[ FD_RPC_SEND_PENDING_MAX ];
+  ulong                 send_datagram_cnt;                    /* datagrams handed to the kernel */
 
   ulong               txn_rec_next;                           /* total transactions recorded; ring position is % CNT */
   fd_rpc_txn_rec_t    txn_recs[ FD_RPC_TXN_REC_CNT ];
@@ -1170,6 +1194,75 @@ fd_rpc_txn_query( fd_rpc_tile_t *     ctx,
                   bank_info_t const * tip,
                   ulong               next_slot ); /* defined with the handlers */
 
+/* fd_rpc_send_to_leaders sends a transaction to the TPU UDP port of
+   the leaders of the next few rotations starting at from_slot, as
+   advertised in gossip.  Returns the number of datagrams sent.  A
+   leader that advertises no TPU UDP port (Agave accepts QUIC only) is
+   skipped, as is this node itself, which is not in its own gossip
+   table. */
+static ulong
+fd_rpc_send_to_leaders( fd_rpc_tile_t * ctx,
+                        uchar const *   payload,
+                        ulong           payload_sz,
+                        ulong           from_slot ) {
+  if( FD_UNLIKELY( ctx->udp_fd<0 ) ) return 0UL;
+  ulong               sent = 0UL;
+  fd_pubkey_t const * done[ FD_RPC_SEND_LEADER_ROTATIONS ];
+  ulong               done_cnt = 0UL;
+  for( ulong r=0UL; r<FD_RPC_SEND_LEADER_ROTATIONS; r++ ) {
+    fd_pubkey_t const * leader = fd_rpc_mleaders_get_leader_for_slot( ctx->mleaders, from_slot+r*FD_EPOCH_SLOTS_PER_ROTATION );
+    if( FD_UNLIKELY( !leader ) ) continue;
+    int dup = 0;
+    for( ulong k=0UL; k<done_cnt; k++ ) if( !memcmp( done[ k ]->uc, leader->uc, 32UL ) ) dup = 1;
+    if( dup ) continue;
+    done[ done_cnt++ ] = leader;
+
+    for( fd_rpc_cluster_node_dlist_iter_t iter = fd_rpc_cluster_node_dlist_iter_rev_init( ctx->cluster_nodes_dlist, ctx->cluster_nodes );
+         !fd_rpc_cluster_node_dlist_iter_done( iter, ctx->cluster_nodes_dlist, ctx->cluster_nodes );
+         iter = fd_rpc_cluster_node_dlist_iter_rev_next( iter, ctx->cluster_nodes_dlist, ctx->cluster_nodes ) ) {
+      fd_rpc_cluster_node_t const * ele = fd_rpc_cluster_node_dlist_iter_ele( iter, ctx->cluster_nodes_dlist, ctx->cluster_nodes );
+      if( memcmp( ele->identity.uc, leader->uc, 32UL ) ) continue;
+      fd_gossip_socket_t const * sock = &ele->ci->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_TPU ];
+      if( sock->is_ipv6 || !sock->ip4 || !sock->port ) break;
+      struct sockaddr_in dst = { .sin_family = AF_INET, .sin_port = sock->port, .sin_addr = { .s_addr = sock->ip4 } };
+      if( FD_LIKELY( sendto( ctx->udp_fd, payload, payload_sz, MSG_DONTWAIT|MSG_NOSIGNAL, fd_type_pun_const( &dst ), sizeof(dst) )==(long)payload_sz ) ) {
+        sent++;
+        ctx->send_datagram_cnt++;
+      }
+      break;
+    }
+  }
+  return sent;
+}
+
+/* Returns 1 if a transaction with this signature is in the recent
+   transaction window, on any fork. */
+static int
+fd_rpc_txn_seen( fd_rpc_tile_t const * ctx,
+                 uchar const *         sig ) {
+  ulong home = fd_ulong_hash( fd_ulong_load_8( sig ) ^ fd_ulong_load_8( sig+8UL ) ) % FD_RPC_TXN_TABLE_CNT;
+  for( ulong i=0UL; i<FD_RPC_TXN_PROBE_MAX; i++ ) {
+    ulong entry = ctx->txn_table[ (home+i) % FD_RPC_TXN_TABLE_CNT ];
+    if( !entry ) return 0;
+    if( !fd_rpc_txn_seq_live( ctx, entry ) ) continue;
+    if( !memcmp( ctx->txn_recs[ (entry-1UL) % FD_RPC_TXN_REC_CNT ].sig, sig, 64UL ) ) return 1;
+  }
+  return 0;
+}
+
+/* Called once per leader rotation: sends every pending transaction
+   again unless it has landed or expired. */
+static void
+fd_rpc_send_retry( fd_rpc_tile_t * ctx,
+                   ulong           slot ) {
+  for( ulong i=0UL; i<FD_RPC_SEND_PENDING_MAX; i++ ) {
+    fd_rpc_send_pending_t * p = &ctx->send_pending[ i ];
+    if( !p->used ) continue;
+    if( slot>p->submit_slot+FD_RPC_SEND_EXPIRE_SLOTS || fd_rpc_txn_seen( ctx, p->sig ) ) { p->used = 0; continue; }
+    fd_rpc_send_to_leaders( ctx, p->payload, p->sz, slot+1UL );
+  }
+}
+
 static void
 fd_rpc_block_meta_record( fd_rpc_tile_t *                    ctx,
                           fd_replay_slot_completed_t const * msg ) {
@@ -1223,6 +1316,7 @@ returnable_frag( fd_rpc_tile_t *     ctx,
         fd_rpc_block_time_record( ctx, slot_completed->slot, slot_completed->accdb_fork_id );
         fd_rpc_prio_fee_record( ctx, slot_completed );
         fd_rpc_block_meta_record( ctx, slot_completed );
+        if( FD_UNLIKELY( !(slot_completed->slot % FD_EPOCH_SLOTS_PER_ROTATION) ) ) fd_rpc_send_retry( ctx, slot_completed->slot );
         bank->block_height = slot_completed->block_height;
         fd_memcpy( bank->block_hash, slot_completed->block_hash.uc, 32 );
 
@@ -3579,7 +3673,7 @@ fd_rpc_base58_decode( char const * in,
                       uchar *      out,
                       ulong        out_max ) {
   static char const alphabet[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-  uchar tmp[ 192 ];
+  static uchar tmp[ 2UL*FD_TXN_MTU_V0 ];
   ulong tmp_len = 0UL;
   ulong zeros   = 0UL;
   while( zeros<in_len && in[ zeros ]=='1' ) zeros++;
@@ -4780,7 +4874,102 @@ minimumLedgerSlot( fd_rpc_tile_t *         ctx,
   return fd_rpc_first_slot( ctx, id_cstr, params );
 }
 UNIMPLEMENTED(requestAirdrop)
-UNIMPLEMENTED(sendTransaction)
+/* sendTransaction checks what it can without executing the transaction
+   (well formed, signatures valid and, unless skipPreflight, a recent
+   blockhash), then sends it to the upcoming leaders over UDP and keeps
+   resending it each leader rotation until it lands or expires.  There
+   is no simulation: a transaction that would fail on chain is still
+   sent, and lands as a failed transaction. */
+static fd_http_server_response_t
+sendTransaction( fd_rpc_tile_t *         ctx,
+                 char const *            id_cstr,
+                 fd_rpc_params_t const * params ) {
+  fd_http_server_response_t response;
+  if( FD_UNLIKELY( !fd_rpc_validate_params( ctx, id_cstr, params, 1, 2, &response ) ) ) return response;
+  fd_rpc_val_t const * t      = &params->v[ 0 ];
+  fd_rpc_val_t const * config = &params->v[ 1 ];
+  if( FD_UNLIKELY( t->kind!=FD_RPC_VAL_STR ) ) return fd_rpc_err_invalid( ctx, id_cstr, "type", t, "a string" );
+  if( FD_UNLIKELY( ctx->processed_idx==ULONG_MAX ) ) return fd_rpc_err_msg( ctx, id_cstr, -32065, "Firedancer Error: banks uninitialized" );
+  bank_info_t const * tip = &ctx->banks[ ctx->processed_idx ];
+
+  fd_rpc_val_t v[1];
+  char enc[ 16 ] = "base58";
+  if( fd_rpc_cfg_member( config, "encoding", v ) && v->kind==FD_RPC_VAL_STR ) fd_rpc_val_cstr( v, enc, sizeof(enc) );
+  int skip_preflight = fd_rpc_cfg_member( config, "skipPreflight", v ) && v->kind==FD_RPC_VAL_BOOL && v->raw_sz==4UL;
+
+  static char  txt[ 2UL*FD_TXN_MTU_V0 ];
+  static uchar payload[ 2UL*FD_TXN_MTU_V0 ];
+  if( FD_UNLIKELY( !fd_rpc_val_cstr( t, txt, sizeof(txt) ) ) ) return fd_rpc_err_msg( ctx, id_cstr, -32602, "Invalid params: transaction too large." );
+  ulong txt_len = strlen( txt );
+  ulong payload_sz;
+  if( !strcmp( enc, "base64" ) ) {
+    long dec = (ulong)FD_BASE64_DEC_SZ( txt_len )<=sizeof(payload) ? fd_base64_decode( payload, txt, txt_len ) : -1L;
+    payload_sz = dec<0L ? ULONG_MAX : (ulong)dec;
+  } else if( !strcmp( enc, "base58" ) ) {
+    payload_sz = fd_rpc_base58_decode( txt, txt_len, payload, sizeof(payload) );
+  } else {
+    return fd_rpc_err_msg( ctx, id_cstr, -32602, "Invalid params: unsupported encoding, expected base58 or base64." );
+  }
+  uchar txn_buf[ FD_TXN_MAX_SZ ] __attribute__((aligned(alignof(fd_txn_t))));
+  if( FD_UNLIKELY( payload_sz==ULONG_MAX || payload_sz>FD_TXN_MTU_V0 || !fd_txn_parse( payload, payload_sz, txn_buf, NULL ) ) ) {
+    return fd_rpc_err_msg( ctx, id_cstr, -32602, "Invalid params: failed to deserialize transaction." );
+  }
+  fd_txn_t const * txn = (fd_txn_t const *)txn_buf;
+  if( FD_UNLIKELY( !txn->signature_cnt ) ) return fd_rpc_err_msg( ctx, id_cstr, -32602, "Invalid params: transaction has no signatures." );
+
+  uchar const * sigs  = payload+txn->signature_off;
+  uchar const * accts = payload+txn->acct_addr_off;
+  uchar const * msg   = payload+txn->message_off;
+  ulong         msg_sz = payload_sz-txn->message_off;
+  for( ulong i=0UL; i<txn->signature_cnt; i++ ) {
+    if( FD_UNLIKELY( FD_ED25519_SUCCESS!=fd_ed25519_verify( msg, msg_sz, sigs+64UL*i, accts+32UL*i, ctx->sha ) ) ) {
+      return fd_rpc_err_msg( ctx, id_cstr, -32003, "Transaction signature verification failure" );
+    }
+  }
+
+  if( !skip_preflight ) {
+    /* A durable nonce transaction (first instruction is the system
+       program's AdvanceNonceAccount) carries a nonce, not a recent
+       blockhash, so it is exempt. */
+    int is_nonce = 0;
+    if( txn->instr_cnt ) {
+      fd_txn_instr_t const * ix = &txn->instr[ 0 ];
+      is_nonce = !memcmp( accts+32UL*ix->program_id, fd_solana_system_program_id.uc, 32UL ) && ix->data_sz>=4UL && FD_LOAD( uint, payload+ix->data_off )==4U;
+    }
+    uchar const * bh = payload+txn->recent_blockhash_off;
+    int valid = is_nonce || !memcmp( tip->block_hash, bh, 32UL );
+    if( !valid ) {
+      ulong lamports; int executable; uchar owner[ 32UL ]; ulong data_len;
+      fd_accdb_read_one_nocache( ctx->accdb, tip->accdb_fork_id, fd_sysvar_recent_block_hashes_id.uc, &lamports, &executable, owner, ctx->scratch.accdb_data_buf, &data_len );
+      if( FD_LIKELY( lamports && data_len>=8UL ) ) {
+        ulong cnt = fd_ulong_min( FD_LOAD( ulong, ctx->scratch.accdb_data_buf ), (data_len-8UL)/40UL );
+        for( ulong i=0UL; i<cnt && !valid; i++ ) valid = !memcmp( ctx->scratch.accdb_data_buf+8UL+40UL*i, bh, 32UL );
+      }
+    }
+    if( FD_UNLIKELY( !valid ) ) {
+      return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32002,\"message\":\"Transaction simulation failed: Blockhash not found\",\"data\":{\"accounts\":null,\"err\":\"BlockhashNotFound\",\"innerInstructions\":null,\"logs\":[],\"returnData\":null,\"unitsConsumed\":0}},\"id\":%s}\n", id_cstr );
+    }
+  }
+
+  fd_rpc_send_to_leaders( ctx, payload, payload_sz, tip->slot+1UL );
+
+  /* remember it for resending, replacing the oldest entry if full */
+  fd_rpc_send_pending_t * slot_p = NULL;
+  for( ulong i=0UL; i<FD_RPC_SEND_PENDING_MAX; i++ ) {
+    fd_rpc_send_pending_t * p = &ctx->send_pending[ i ];
+    if( p->used && !memcmp( p->sig, sigs, 64UL ) ) { slot_p = p; break; }
+    if( !p->used ) { if( !slot_p || slot_p->used ) slot_p = p; }
+    else if( !slot_p || ( slot_p->used && p->submit_slot<slot_p->submit_slot ) ) slot_p = p;
+  }
+  slot_p->used        = 1;
+  slot_p->sz          = (ushort)payload_sz;
+  slot_p->submit_slot = tip->slot;
+  memcpy( slot_p->sig, sigs, 64UL );
+  memcpy( slot_p->payload, payload, payload_sz );
+
+  FD_BASE58_ENCODE_64_BYTES( sigs, sig_b58 );
+  return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"result\":\"%s\",\"id\":%s}\n", sig_b58, id_cstr );
+}
 UNIMPLEMENTED(simulateTransaction)
 
 static fd_http_server_response_t
@@ -5125,6 +5314,10 @@ privileged_init( fd_topo_t const *      topo,
         "http://" FD_IP4_ADDR_FMT ":%u", FD_IP4_ADDR_FMT_ARGS( ip_addr ),
         tile->rpc.snapshot_server_port ) );
   }
+  /* sendTransaction socket.  Opened here, before the sandbox. */
+  ctx->udp_fd = socket( AF_INET, SOCK_DGRAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0 );
+  if( FD_UNLIKELY( ctx->udp_fd<0 ) ) FD_LOG_WARNING(( "socket(AF_INET,SOCK_DGRAM) failed (%i-%s), sendTransaction will not send", errno, fd_io_strerror( errno ) ));
+
   ctx->waker_client_idx = tile->waker_client_idx;
   FD_TEST( ctx->waker_client_idx!=ULONG_MAX );
   fd_http_server_listen6( ctx->http, FD_WAKER_INNER_FD( ctx->waker_client_idx ), &tile->rpc.listen_addr, tile->rpc.listen_port );
@@ -5227,6 +5420,9 @@ unprivileged_init( fd_topo_t const *      topo,
 
   fd_rpc_mleaders_init( ctx->mleaders );
   ctx->prio_fee_cnt  = 0UL;
+  FD_TEST( fd_sha512_join( fd_sha512_new( ctx->sha ) ) );
+  memset( ctx->send_pending, 0, sizeof(ctx->send_pending) );
+  ctx->send_datagram_cnt = 0UL;
   ctx->txn_rec_next  = 0UL;
   memset( ctx->txn_table, 0, sizeof(ctx->txn_table) );
   for( ulong i=0UL; i<FD_RPC_BLOCK_META_CNT; i++ ) ctx->block_metas[ i ].slot = ULONG_MAX;
@@ -5316,7 +5512,7 @@ populate_allowed_fds( fd_topo_t const *      topo,
   FD_SCRATCH_ALLOC_INIT( l, scratch );
   fd_rpc_tile_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof( fd_rpc_tile_t ), sizeof( fd_rpc_tile_t ) );
 
-  if( FD_UNLIKELY( out_fds_cnt<6UL ) ) FD_LOG_ERR(( "out_fds_cnt %lu", out_fds_cnt ));
+  if( FD_UNLIKELY( out_fds_cnt<7UL ) ) FD_LOG_ERR(( "out_fds_cnt %lu", out_fds_cnt ));
 
   ulong out_cnt = 0UL;
   out_fds[ out_cnt++ ] = 2; /* stderr */
@@ -5326,6 +5522,7 @@ populate_allowed_fds( fd_topo_t const *      topo,
   out_fds[ out_cnt++ ] = FD_ACCDB_FD_RO; /* accounts db readonly fd */
   out_fds[ out_cnt++ ] = FD_WAKER_OUTER_FD;
   out_fds[ out_cnt++ ] = FD_WAKER_INNER_FD( tile->waker_client_idx );
+  if( FD_LIKELY( ctx->udp_fd>=0 ) ) out_fds[ out_cnt++ ] = ctx->udp_fd; /* sendTransaction socket */
 
   return out_cnt;
 }

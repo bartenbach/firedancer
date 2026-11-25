@@ -14,7 +14,7 @@ chain attacks in build tooling or dependencies.
 
 ## Agave RPC compatibility patch (this branch)
 
-This branch is `firedancer-geo-aware-lsched` plus two commits that add
+This branch is `firedancer-geo-aware-lsched` plus a few commits that add
 Agave JSON-RPC methods the Firedancer RPC tile answered with HTTP 501.
 It is an operator patch, not an official Firedancer release, and it has
 not been reviewed by the Firedancer team.
@@ -38,6 +38,7 @@ not been reviewed by the Firedancer team.
 | `getTokenAccountsByOwner`, `getTokenAccountsByDelegate`, `getTokenLargestAccounts` | full account scan | No `jsonParsed`. |
 | `getSignatureStatuses` | recent transaction window | Only transactions replayed since this node started that are still in the window (the last 524,288). A failed transaction is reported as failed, but when an instruction failed the error is `{"InstructionError":[null,null]}`: which instruction and why is not known to the tile. `confirmations` is the number of slots since the transaction's slot, not Agave's count. `searchTransactionHistory` is ignored. |
 | `getBlock` | recent transaction window | **Signatures only.** `transactionDetails` must be `"signatures"` or `"none"` and `rewards` must be `false`; the default call (full detail, with rewards) returns an error. Only blocks replayed since this node started, and only while every transaction of the block is still in the window; otherwise "Block not available". |
+| `sendTransaction` | UDP to upcoming leaders | The transaction is parsed, its signatures verified and, unless `skipPreflight`, its blockhash checked. It is then sent as a UDP datagram to the TPU port of the leaders of the next 4 rotations and resent every rotation until it is seen in a block or 150 slots pass. **There is no simulation**: a transaction that would fail on chain is still sent. A leader that advertises no TPU UDP port (Agave takes QUIC only) is skipped, and so is this node itself when it is the leader. `maxRetries`, `preflightCommitment` and `minContextSlot` are ignored. At most 256 transactions are kept for resending. |
 | `jsonParsed` encoding | vote accounts only (v4 vote state) | Accounts Agave does not parse fall back to base64, as in Agave. Accounts Agave does parse (stake, token, sysvar, config, nonce, BPF loader, lookup table) return an error instead of unparsed data. |
 
 ### Already in the base branch (not part of this patch)
@@ -59,7 +60,6 @@ current stake. This patch does not change that.
 | `getInflationReward` | No per-epoch reward history. |
 | `getStakeMinimumDelegation` | The answer comes from executing the on-chain stake program. |
 | `getHighestSnapshotSlot` | The tile is not told which snapshots are on disk. |
-| `sendTransaction` | Needs a path from the RPC tile into transaction ingest or a QUIC client. |
 | `simulateTransaction` | Needs a transaction executor in the RPC tile. |
 | `requestAirdrop` | Needs a faucet. |
 
@@ -85,6 +85,9 @@ current stake. This patch does not change that.
   community cluster, and the answers compared. That is one small
   cluster with Alpenglow active. Nothing here has been run on mainnet
   or testnet, with pre-v4 vote accounts, or with Token-2022 accounts.
+- `sendTransaction` was checked for decoding, signature verification
+  and its error paths by resubmitting a transaction that had already
+  landed. **It has not been seen landing a new transaction.**
 - `getSignatureStatuses` matched Agave for successful transactions.
   The cluster produced no failed transactions during the check, so the
   failed-transaction path has not been seen working.
