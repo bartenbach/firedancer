@@ -1407,6 +1407,14 @@ publish_txn_executed( fd_replay_tile_t *  ctx,
   txn_executed->transaction_fee = txn_info->transaction_fee;
   txn_executed->priority_fee = txn_info->priority_fee;
   txn_executed->tips = txn_info->tips;
+  txn_executed->bal_cnt = 0UL;
+  if( FD_LIKELY( ctx->txn_bal_cache[ txn_idx % FD_REPLAY_TXN_BAL_CACHE_CNT ].txn_idx==txn_idx ) ) {
+    ulong bal_cnt = ctx->txn_bal_cache[ txn_idx % FD_REPLAY_TXN_BAL_CACHE_CNT ].cnt;
+    txn_executed->bal_cnt = bal_cnt;
+    fd_memcpy( txn_executed->pre_lamports,  ctx->txn_bal_cache[ txn_idx % FD_REPLAY_TXN_BAL_CACHE_CNT ].pre,  bal_cnt*sizeof(ulong) );
+    fd_memcpy( txn_executed->post_lamports, ctx->txn_bal_cache[ txn_idx % FD_REPLAY_TXN_BAL_CACHE_CNT ].post, bal_cnt*sizeof(ulong) );
+    ctx->txn_bal_cache[ txn_idx % FD_REPLAY_TXN_BAL_CACHE_CNT ].txn_idx = ULONG_MAX;
+  }
   publish_replay_out( ctx, stem, REPLAY_SIG_TXN_EXECUTED, sizeof(*txn_executed) );
 }
 
@@ -3619,6 +3627,13 @@ process_exec_task_done( fd_replay_tile_t *          ctx,
       fd_sched_txn_info_t * txn_info = fd_sched_get_txn_info( ctx->sched, txn_idx );
       txn_info->flags |= FD_SCHED_TXN_EXEC_DONE;
       txn_info->bank_seq = msg->txn_exec->bank_seq;
+      {
+        ulong bal_cnt = fd_ulong_min( (ulong)msg->txn_exec->bal_cnt, MAX_TX_ACCOUNT_LOCKS );
+        ctx->txn_bal_cache[ txn_idx % FD_REPLAY_TXN_BAL_CACHE_CNT ].txn_idx = txn_idx;
+        ctx->txn_bal_cache[ txn_idx % FD_REPLAY_TXN_BAL_CACHE_CNT ].cnt     = bal_cnt;
+        fd_memcpy( ctx->txn_bal_cache[ txn_idx % FD_REPLAY_TXN_BAL_CACHE_CNT ].pre,  msg->txn_exec->pre_lamports,  bal_cnt*sizeof(ulong) );
+        fd_memcpy( ctx->txn_bal_cache[ txn_idx % FD_REPLAY_TXN_BAL_CACHE_CNT ].post, msg->txn_exec->post_lamports, bal_cnt*sizeof(ulong) );
+      }
 
       txn_info->tick_load_start        = msg->txn_exec->tick_load_start;
       txn_info->tick_check_start       = msg->txn_exec->tick_check_start;
@@ -4715,6 +4730,7 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->lthash_rec->cnt  = 0UL;
   ctx->lthash_rec->max  = FD_SCHED_LTHASH_START_WRITES_MAX;
   ctx->lthash_rec->keys = lthash_rec_keys;
+  for( ulong i=0UL; i<FD_REPLAY_TXN_BAL_CACHE_CNT; i++ ) ctx->txn_bal_cache[ i ].txn_idx = ULONG_MAX;
   ulong execrp_result_obj_id = fd_pod_query_ulong( topo->props, "execrp_result", ULONG_MAX );
   FD_TEST( execrp_result_obj_id!=ULONG_MAX );
   ctx->execrp_result = fd_topo_obj_laddr( topo, execrp_result_obj_id );

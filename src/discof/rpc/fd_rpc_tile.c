@@ -573,17 +573,26 @@ fd_rpc_mleaders_get_leader_for_slot( fd_multi_epoch_leaders_t const * mleaders,
    older than the ring, and nothing from before this node started, is
    known.  The link from replay is unreliable, so a transaction can be
    missing if the tile fell behind. */
-#define FD_RPC_TXN_REC_CNT     (1UL<<19)
+#define FD_RPC_TXN_REC_CNT     (1UL<<17)
 #define FD_RPC_TXN_TABLE_CNT   (1UL<<21)
 #define FD_RPC_TXN_PROBE_MAX   (32UL)
 #define FD_RPC_BLOCK_META_CNT  (1UL<<16)
 #define FD_RPC_BLOCK_TXN_MAX   (16384UL)
 
 struct fd_rpc_txn_rec {
-  uchar sig[ 64 ];
-  ulong slot;
-  uint  index_in_slot;
-  int   txn_err;      /* FD_RUNTIME_TXN_ERR_*, 0 on success */
+  uchar  sig[ 64 ];
+  ulong  slot;
+  uint   index_in_slot;
+  int    txn_err;      /* FD_RUNTIME_TXN_ERR_*, 0 on success */
+  ulong  fee;          /* signature fee plus priority fee, lamports */
+  uint   compute_units;
+  ushort payload_sz;
+  ushort acct_off;     /* static account addresses in payload */
+  ushort acct_cnt;
+  ushort bal_cnt;      /* 0 if replay did not report balances */
+  ulong  pre_lamports [ MAX_TX_ACCOUNT_LOCKS ];
+  ulong  post_lamports[ MAX_TX_ACCOUNT_LOCKS ];
+  uchar  payload[ FD_TXN_MTU_V0 ];
 };
 typedef struct fd_rpc_txn_rec fd_rpc_txn_rec_t;
 
@@ -1163,19 +1172,12 @@ fd_rpc_txn_seq_live( fd_rpc_tile_t const * ctx,
   return entry && (entry-1UL)+FD_RPC_TXN_REC_CNT>=ctx->txn_rec_next;
 }
 
+/* fd_rpc_txn_commit publishes the record the caller just filled in at
+   ring position txn_rec_next. */
 static void
-fd_rpc_txn_record( fd_rpc_tile_t * ctx,
-                   uchar const *   sig,
-                   ulong           slot,
-                   ulong           index_in_slot,
-                   int             txn_err ) {
+fd_rpc_txn_commit( fd_rpc_tile_t * ctx ) {
   ulong seq = ctx->txn_rec_next++;
-  fd_rpc_txn_rec_t * rec = &ctx->txn_recs[ seq % FD_RPC_TXN_REC_CNT ];
-  memcpy( rec->sig, sig, 64UL );
-  rec->slot          = slot;
-  rec->index_in_slot = (uint)index_in_slot;
-  rec->txn_err       = txn_err;
-
+  uchar const * sig = ctx->txn_recs[ seq % FD_RPC_TXN_REC_CNT ].sig;
   ulong home = fd_ulong_hash( fd_ulong_load_8( sig ) ^ fd_ulong_load_8( sig+8UL ) ) % FD_RPC_TXN_TABLE_CNT;
   ulong pos  = home;
   for( ulong i=0UL; i<FD_RPC_TXN_PROBE_MAX; i++ ) {
@@ -1431,17 +1433,35 @@ returnable_frag( fd_rpc_tile_t *     ctx,
     /* This link is unreliable: copy what is needed, then check the frag
        was not overwritten underneath us before using the copy. */
     fd_replay_txn_executed_t const * msg = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
-    uchar sig[ 64 ];
-    ulong sig_off       = (ulong)TXN( msg->txn )->signature_off;
-    ulong slot          = msg->slot;
-    ulong index_in_slot = msg->index_in_slot;
-    int   txn_err       = msg->txn_err;
-    int   landed        = ( msg->is_committable || msg->is_fees_only ) && !msg->is_noop;
-    if( FD_LIKELY( sig_off<=FD_TPU_MTU-64UL ) ) memcpy( sig, msg->txn->payload+sig_off, 64UL );
-    else                                       landed = 0;
+    fd_rpc_txn_rec_t * rec = &ctx->txn_recs[ ctx->txn_rec_next % FD_RPC_TXN_REC_CNT ];
+    fd_txn_t const *   txn = TXN( msg->txn );
+    ulong payload_sz = (ulong)msg->txn->payload_sz;
+    ulong sig_off    = (ulong)txn->signature_off;
+    ulong acct_off   = (ulong)txn->acct_addr_off;
+    ulong acct_cnt   = (ulong)txn->acct_addr_cnt;
+    int   landed     = ( msg->is_committable || msg->is_fees_only ) && !msg->is_noop;
+    int   sane       = payload_sz<=FD_TXN_MTU_V0 && sig_off+64UL<=payload_sz && acct_off+32UL*acct_cnt<=payload_sz;
+    if( FD_LIKELY( sane ) ) {
+      memcpy( rec->payload, msg->txn->payload, payload_sz );
+      memcpy( rec->sig, rec->payload+sig_off, 64UL );
+      rec->slot          = msg->slot;
+      rec->index_in_slot = (uint)msg->index_in_slot;
+      rec->txn_err       = msg->txn_err;
+      rec->fee           = msg->transaction_fee+msg->priority_fee;
+      rec->compute_units = msg->compute_units_consumed;
+      rec->payload_sz    = (ushort)payload_sz;
+      rec->acct_off      = (ushort)acct_off;
+      rec->acct_cnt      = (ushort)acct_cnt;
+      ulong bal_cnt = fd_ulong_min( msg->bal_cnt, MAX_TX_ACCOUNT_LOCKS );
+      rec->bal_cnt       = (ushort)bal_cnt;
+      memcpy( rec->pre_lamports,  msg->pre_lamports,  bal_cnt*sizeof(ulong) );
+      memcpy( rec->post_lamports, msg->post_lamports, bal_cnt*sizeof(ulong) );
+    }
     FD_COMPILER_MFENCE();
     ulong seq_now = fd_frag_meta_seq_query( ctx->in_mcache[ in_idx ]+fd_mcache_line_idx( seq, ctx->in_depth[ in_idx ] ) );
-    if( FD_LIKELY( seq_now==seq && landed ) ) fd_rpc_txn_record( ctx, sig, slot, index_in_slot, txn_err );
+    /* Only a record that was copied whole is published; otherwise the
+       ring position is simply reused by the next transaction. */
+    if( FD_LIKELY( seq_now==seq && landed && sane ) ) fd_rpc_txn_commit( ctx );
   } else if( ctx->in_kind[ in_idx ]==IN_KIND_VOTOR ) {
     fd_votor_msg_t const * msg = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
     if( FD_LIKELY( msg->certed.kind==FD_CERT_KIND_FINAL || msg->certed.kind==FD_CERT_KIND_FAST_FINAL ) ) {
@@ -4043,7 +4063,6 @@ getRecentPrioritizationFees( fd_rpc_tile_t *         ctx,
   fd_http_server_printf( ctx->http, "],\"id\":%s}\n", id_cstr );
   return STAGE_JSON( ctx );
 }
-UNIMPLEMENTED(getSignaturesForAddress)
 static fd_rpc_txn_rec_t const *
 fd_rpc_txn_query( fd_rpc_tile_t *     ctx,
                   uchar const *       sig,
@@ -4163,10 +4182,325 @@ getSignatureStatuses( fd_rpc_tile_t *         ctx,
   return STAGE_JSON( ctx );
 }
 
+/* ---- transaction history from the recent transaction window ------------- */
+
+/* Base58 for arbitrary lengths (instruction data, whole transactions).
+   Quadratic, which is fine for at most a transaction's worth of bytes.
+   out must hold 2*in_sz+2 chars. */
+static void
+fd_rpc_print_base58( fd_rpc_tile_t * ctx,
+                     uchar const *   in,
+                     ulong           in_sz ) {
+  static char const alphabet[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  static uchar digits[ 2UL*FD_TXN_MTU_V0+2UL ];
+  static char  out   [ 2UL*FD_TXN_MTU_V0+2UL ];
+  if( FD_UNLIKELY( in_sz>FD_TXN_MTU_V0 ) ) return;
+  ulong zeros = 0UL;
+  while( zeros<in_sz && !in[ zeros ] ) zeros++;
+  ulong len = 0UL;
+  for( ulong i=zeros; i<in_sz; i++ ) {
+    uint carry = in[ i ];
+    for( ulong k=0UL; k<len; k++ ) {
+      carry += (uint)digits[ k ]<<8;
+      digits[ k ] = (uchar)( carry % 58U );
+      carry /= 58U;
+    }
+    while( carry ) { digits[ len++ ] = (uchar)( carry % 58U ); carry /= 58U; }
+  }
+  ulong o = 0UL;
+  for( ulong i=0UL; i<zeros; i++ ) out[ o++ ] = '1';
+  for( ulong k=0UL; k<len; k++ ) out[ o++ ] = alphabet[ digits[ len-1UL-k ] ];
+  fd_http_server_printf( ctx->http, "%.*s", (int)o, out );
+}
+
+static void
+fd_rpc_print_json_text( fd_rpc_tile_t * ctx,
+                        uchar const *   t,
+                        ulong           sz ) {
+  for( ulong i=0UL; i<sz; i++ ) {
+    uchar c = t[ i ];
+    if(      c=='"'  ) fd_http_server_printf( ctx->http, "\\\"" );
+    else if( c=='\\' ) fd_http_server_printf( ctx->http, "\\\\" );
+    else if( c<0x20  ) fd_http_server_printf( ctx->http, "\\u%04x", (uint)c );
+    else               fd_http_server_printf( ctx->http, "%c", (char)c );
+  }
+}
+
+static void
+fd_rpc_print_txn_status( fd_rpc_tile_t * ctx,
+                         int             txn_err ) {
+  if( !txn_err ) { fd_http_server_printf( ctx->http, "\"err\":null,\"status\":{\"Ok\":null}" ); return; }
+  fd_http_server_printf( ctx->http, "\"err\":" );
+  fd_rpc_print_txn_err( ctx, txn_err );
+  fd_http_server_printf( ctx->http, ",\"status\":{\"Err\":" );
+  fd_rpc_print_txn_err( ctx, txn_err );
+  fd_http_server_printf( ctx->http, "}" );
+}
+
+/* Prints the addresses a v0 transaction loads through address lookup
+   tables, read from the tables as they are on the given bank (tables
+   only grow, so this is what the transaction saw unless a table was
+   closed since).  Prints empty lists if a table cannot be read. */
+static void
+fd_rpc_print_loaded_addresses( fd_rpc_tile_t *     ctx,
+                               bank_info_t const * info,
+                               fd_txn_t const *    txn,
+                               uchar const *       payload ) {
+  fd_txn_acct_addr_lut_t const * luts = fd_txn_get_address_tables_const( txn );
+  int ok = 1;
+  for( int pass=0; pass<2; pass++ ) { /* 0 writable, 1 readonly */
+    fd_http_server_printf( ctx->http, pass ? "],\"readonly\":[" : "{\"writable\":[" );
+    ulong printed = 0UL;
+    for( ulong i=0UL; ok && i<txn->addr_table_lookup_cnt; i++ ) {
+      ulong lamports; int executable; uchar owner[ 32UL ]; ulong data_len;
+      fd_accdb_read_one_nocache( ctx->accdb, info->accdb_fork_id, payload+luts[ i ].addr_off, &lamports, &executable, owner, ctx->scratch.accdb_data_buf, &data_len );
+      if( FD_UNLIKELY( !lamports || data_len<56UL || memcmp( owner, fd_solana_address_lookup_table_program_id.uc, 32UL ) ) ) { ok = 0; break; }
+      ulong         cnt  = pass ? luts[ i ].readonly_cnt : luts[ i ].writable_cnt;
+      uchar const * idxs = payload + ( pass ? luts[ i ].readonly_off : luts[ i ].writable_off );
+      for( ulong k=0UL; k<cnt; k++ ) {
+        ulong off = 56UL+32UL*(ulong)idxs[ k ];
+        if( FD_UNLIKELY( off+32UL>data_len ) ) continue;
+        FD_BASE58_ENCODE_32_BYTES( ctx->scratch.accdb_data_buf+off, key_b58 );
+        fd_http_server_printf( ctx->http, "%s\"%s\"", printed ? "," : "", key_b58 );
+        printed++;
+      }
+    }
+  }
+  fd_http_server_printf( ctx->http, "]}" );
+}
+
+#define FD_RPC_TXN_ENC_JSON   (0)
+#define FD_RPC_TXN_ENC_BASE64 (1)
+#define FD_RPC_TXN_ENC_BASE58 (2)
+
+/* Prints "transaction":…,"meta":{…},"version":… for one record.
+   Returns 0 if the stored payload does not parse (should not happen). */
+static int
+fd_rpc_print_txn( fd_rpc_tile_t *          ctx,
+                  bank_info_t const *      info,
+                  fd_rpc_txn_rec_t const * rec,
+                  int                      enc ) {
+  uchar txn_buf[ FD_TXN_MAX_SZ ] __attribute__((aligned(alignof(fd_txn_t))));
+  if( FD_UNLIKELY( !fd_txn_parse( rec->payload, rec->payload_sz, txn_buf, NULL ) ) ) return 0;
+  fd_txn_t const * txn = (fd_txn_t const *)txn_buf;
+  uchar const *    p   = rec->payload;
+
+  if( enc==FD_RPC_TXN_ENC_BASE64 ) {
+    static char b64[ FD_BASE64_ENC_SZ( FD_TXN_MTU_V0 )+1UL ];
+    ulong n = fd_base64_encode( b64, p, rec->payload_sz );
+    fd_http_server_printf( ctx->http, "\"transaction\":[\"%.*s\",\"base64\"],", (int)n, b64 );
+  } else if( enc==FD_RPC_TXN_ENC_BASE58 ) {
+    fd_http_server_printf( ctx->http, "\"transaction\":[\"" );
+    fd_rpc_print_base58( ctx, p, rec->payload_sz );
+    fd_http_server_printf( ctx->http, "\",\"base58\"]," );
+  } else {
+    fd_http_server_printf( ctx->http, "\"transaction\":{\"signatures\":[" );
+    for( ulong i=0UL; i<txn->signature_cnt; i++ ) {
+      FD_BASE58_ENCODE_64_BYTES( p+txn->signature_off+64UL*i, sig_b58 );
+      fd_http_server_printf( ctx->http, "%s\"%s\"", i ? "," : "", sig_b58 );
+    }
+    fd_http_server_printf( ctx->http, "],\"message\":{\"accountKeys\":[" );
+    for( ulong i=0UL; i<txn->acct_addr_cnt; i++ ) {
+      FD_BASE58_ENCODE_32_BYTES( p+txn->acct_addr_off+32UL*i, key_b58 );
+      fd_http_server_printf( ctx->http, "%s\"%s\"", i ? "," : "", key_b58 );
+    }
+    FD_BASE58_ENCODE_32_BYTES( p+txn->recent_blockhash_off, bh_b58 );
+    fd_http_server_printf( ctx->http, "],\"header\":{\"numReadonlySignedAccounts\":%u,\"numReadonlyUnsignedAccounts\":%u,\"numRequiredSignatures\":%u},\"recentBlockhash\":\"%s\",\"instructions\":[",
+                           (uint)txn->readonly_signed_cnt, (uint)txn->readonly_unsigned_cnt, (uint)txn->signature_cnt, bh_b58 );
+    for( ulong i=0UL; i<txn->instr_cnt; i++ ) {
+      fd_txn_instr_t const * ix = &txn->instr[ i ];
+      fd_http_server_printf( ctx->http, "%s{\"accounts\":[", i ? "," : "" );
+      for( ulong k=0UL; k<ix->acct_cnt; k++ ) fd_http_server_printf( ctx->http, "%s%u", k ? "," : "", (uint)p[ ix->acct_off+k ] );
+      fd_http_server_printf( ctx->http, "],\"data\":\"" );
+      fd_rpc_print_base58( ctx, p+ix->data_off, ix->data_sz );
+      fd_http_server_printf( ctx->http, "\",\"programIdIndex\":%u,\"stackHeight\":1}", (uint)ix->program_id );
+    }
+    fd_http_server_printf( ctx->http, "]" );
+    if( txn->transaction_version!=FD_TXN_VLEGACY ) {
+      fd_txn_acct_addr_lut_t const * luts = fd_txn_get_address_tables_const( txn );
+      fd_http_server_printf( ctx->http, ",\"addressTableLookups\":[" );
+      for( ulong i=0UL; i<txn->addr_table_lookup_cnt; i++ ) {
+        FD_BASE58_ENCODE_32_BYTES( p+luts[ i ].addr_off, lut_b58 );
+        fd_http_server_printf( ctx->http, "%s{\"accountKey\":\"%s\",\"readonlyIndexes\":[", i ? "," : "", lut_b58 );
+        for( ulong k=0UL; k<luts[ i ].readonly_cnt; k++ ) fd_http_server_printf( ctx->http, "%s%u", k ? "," : "", (uint)p[ luts[ i ].readonly_off+k ] );
+        fd_http_server_printf( ctx->http, "],\"writableIndexes\":[" );
+        for( ulong k=0UL; k<luts[ i ].writable_cnt; k++ ) fd_http_server_printf( ctx->http, "%s%u", k ? "," : "", (uint)p[ luts[ i ].writable_off+k ] );
+        fd_http_server_printf( ctx->http, "]}" );
+      }
+      fd_http_server_printf( ctx->http, "]" );
+    }
+    fd_http_server_printf( ctx->http, "}}," );
+  }
+
+  /* meta.  Replay reports a transaction's result code, fee, compute
+     units and the lamport balances of its accounts before and after.
+     Logs, inner instructions and token balances are not reported and
+     are null, which is also what Agave prints when it did not record
+     them.  Balances are empty lists if replay had none to report. */
+  fd_http_server_printf( ctx->http, "\"meta\":{\"computeUnitsConsumed\":%u,", rec->compute_units );
+  fd_rpc_print_txn_status( ctx, rec->txn_err );
+  fd_http_server_printf( ctx->http, ",\"fee\":%lu,\"innerInstructions\":null,\"loadedAddresses\":", rec->fee );
+  fd_rpc_print_loaded_addresses( ctx, info, txn, p );
+  fd_http_server_printf( ctx->http, ",\"logMessages\":null,\"postBalances\":[" );
+  for( ulong i=0UL; i<rec->bal_cnt; i++ ) fd_http_server_printf( ctx->http, "%s%lu", i ? "," : "", rec->post_lamports[ i ] );
+  fd_http_server_printf( ctx->http, "],\"postTokenBalances\":null,\"preBalances\":[" );
+  for( ulong i=0UL; i<rec->bal_cnt; i++ ) fd_http_server_printf( ctx->http, "%s%lu", i ? "," : "", rec->pre_lamports[ i ] );
+  fd_http_server_printf( ctx->http, "],\"preTokenBalances\":null,\"rewards\":null}," );
+  if( txn->transaction_version==FD_TXN_VLEGACY ) fd_http_server_printf( ctx->http, "\"version\":\"legacy\"" );
+  else                                           fd_http_server_printf( ctx->http, "\"version\":0" );
+  return 1;
+}
+
+/* Reads "encoding" for getTransaction / getBlock.  Returns 1 on
+   success. */
+static int
+fd_rpc_txn_encoding( fd_rpc_tile_t *             ctx,
+                     char const *                id_cstr,
+                     fd_rpc_val_t const *        config,
+                     int *                       enc,
+                     fd_http_server_response_t * res ) {
+  fd_rpc_val_t v[1];
+  char e[ 16 ] = "json";
+  if( fd_rpc_cfg_member( config, "encoding", v ) && v->kind==FD_RPC_VAL_STR ) fd_rpc_val_cstr( v, e, sizeof(e) );
+  if(      !strcmp( e, "json"   ) ) *enc = FD_RPC_TXN_ENC_JSON;
+  else if( !strcmp( e, "base64" ) ) *enc = FD_RPC_TXN_ENC_BASE64;
+  else if( !strcmp( e, "base58" ) ) *enc = FD_RPC_TXN_ENC_BASE58;
+  else {
+    *res = fd_rpc_err_msg( ctx, id_cstr, -32065, "Firedancer Error: supported transaction encodings are json, base64 and base58" );
+    return 0;
+  }
+  return 1;
+}
+
+static fd_http_server_response_t
+getTransaction( fd_rpc_tile_t *         ctx,
+                char const *            id_cstr,
+                fd_rpc_params_t const * params ) {
+  fd_http_server_response_t response;
+  if( FD_UNLIKELY( !fd_rpc_validate_params( ctx, id_cstr, params, 1, 2, &response ) ) ) return response;
+  fd_rpc_val_t const * config = &params->v[ 1 ];
+  char  sig_cstr[ 96 ];
+  uchar sig[ 64 ];
+  if( FD_UNLIKELY( !fd_rpc_val_cstr( &params->v[ 0 ], sig_cstr, sizeof(sig_cstr) ) || !fd_base58_decode_64( sig_cstr, sig ) ) ) {
+    return fd_rpc_err_msg( ctx, id_cstr, -32602, "Invalid param: Invalid" );
+  }
+  int enc;
+  if( FD_UNLIKELY( !fd_rpc_txn_encoding( ctx, id_cstr, config, &enc, &response ) ) ) return response;
+  ulong bank_idx = ULONG_MAX;
+  if( FD_UNLIKELY( !fd_rpc_cfg_bank( ctx, id_cstr, config, &bank_idx, &response ) ) ) return response;
+  bank_info_t const * info = &ctx->banks[ bank_idx ];
+
+  ulong next_slot;
+  if( FD_UNLIKELY( !fd_rpc_slot_history_load( ctx, info, &next_slot ) ) ) return fd_rpc_err_msg( ctx, id_cstr, -32065, "Firedancer Error: slot history unavailable" );
+  fd_rpc_txn_rec_t const * rec = fd_rpc_txn_query( ctx, sig, info, next_slot );
+  if( !rec || rec->slot>info->slot ) return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"result\":null,\"id\":%s}\n", id_cstr );
+
+  fd_rpc_val_t v[1];
+  int has_max_version = fd_rpc_cfg_member( config, "maxSupportedTransactionVersion", v ) && v->kind==FD_RPC_VAL_INT;
+  if( FD_UNLIKELY( !has_max_version && (rec->payload[ 1UL+64UL*(ulong)rec->payload[ 0 ] ] & 0x80) ) ) {
+    return fd_rpc_err_msg( ctx, id_cstr, -32015, "Transaction version (0) is not supported by the requesting client. Please try the request again with the following configuration parameter: \\\"maxSupportedTransactionVersion\\\": 0" );
+  }
+
+  fd_rpc_block_time_t const * bt = fd_rpc_block_time_query( ctx, rec->slot );
+  if( bt ) fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"result\":{\"blockTime\":%ld,\"slot\":%lu,", bt->unix_timestamp, rec->slot );
+  else     fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"result\":{\"blockTime\":null,\"slot\":%lu,", rec->slot );
+  if( FD_UNLIKELY( !fd_rpc_print_txn( ctx, info, rec, enc ) ) ) {
+    fd_http_server_unstage( ctx->http );
+    return fd_rpc_err_msg( ctx, id_cstr, -32065, "Firedancer Error: stored transaction is unreadable" );
+  }
+  fd_http_server_printf( ctx->http, "},\"id\":%s}\n", id_cstr );
+  return STAGE_JSON( ctx );
+}
+
+/* getSignaturesForAddress walks the window newest first.  It matches
+   the addresses written in the transaction itself; an address the
+   transaction only reaches through an address lookup table is not
+   matched. */
+static fd_http_server_response_t
+getSignaturesForAddress( fd_rpc_tile_t *         ctx,
+                         char const *            id_cstr,
+                         fd_rpc_params_t const * params ) {
+  fd_http_server_response_t response;
+  if( FD_UNLIKELY( !fd_rpc_validate_params( ctx, id_cstr, params, 1, 2, &response ) ) ) return response;
+  fd_pubkey_t address;
+  if( FD_UNLIKELY( !fd_rpc_validate_address( ctx, id_cstr, &params->v[ 0 ], &address, &response ) ) ) return response;
+  fd_rpc_val_t const * config = &params->v[ 1 ];
+  ulong bank_idx = ULONG_MAX;
+  if( FD_UNLIKELY( !fd_rpc_cfg_bank( ctx, id_cstr, config, &bank_idx, &response ) ) ) return response;
+  bank_info_t const * info = &ctx->banks[ bank_idx ];
+  ulong finalized = ctx->finalized_idx!=ULONG_MAX ? ctx->banks[ ctx->finalized_idx ].slot : 0UL;
+
+  fd_rpc_val_t v[1];
+  ulong limit = 1000UL;
+  if( fd_rpc_cfg_member( config, "limit", v ) && v->kind==FD_RPC_VAL_INT ) {
+    if( FD_UNLIKELY( v->neg || !v->u || v->u>1000UL ) ) return fd_rpc_err_msg( ctx, id_cstr, -32602, "Invalid limit; max 1000" );
+    limit = v->u;
+  }
+  uchar before[ 64 ]; int has_before = 0;
+  uchar until [ 64 ]; int has_until  = 0;
+  char  sig_cstr[ 96 ];
+  if( fd_rpc_cfg_member( config, "before", v ) && v->kind==FD_RPC_VAL_STR ) {
+    if( FD_UNLIKELY( !fd_rpc_val_cstr( v, sig_cstr, sizeof(sig_cstr) ) || !fd_base58_decode_64( sig_cstr, before ) ) ) return fd_rpc_err_msg( ctx, id_cstr, -32602, "Invalid param: Invalid" );
+    has_before = 1;
+  }
+  if( fd_rpc_cfg_member( config, "until", v ) && v->kind==FD_RPC_VAL_STR ) {
+    if( FD_UNLIKELY( !fd_rpc_val_cstr( v, sig_cstr, sizeof(sig_cstr) ) || !fd_base58_decode_64( sig_cstr, until ) ) ) return fd_rpc_err_msg( ctx, id_cstr, -32602, "Invalid param: Invalid" );
+    has_until = 1;
+  }
+
+  ulong next_slot;
+  if( FD_UNLIKELY( !fd_rpc_slot_history_load( ctx, info, &next_slot ) ) ) return fd_rpc_err_msg( ctx, id_cstr, -32065, "Firedancer Error: slot history unavailable" );
+
+  fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"result\":[" );
+  ulong printed  = 0UL;
+  int   skipping = has_before;
+  ulong live     = fd_ulong_min( ctx->txn_rec_next, FD_RPC_TXN_REC_CNT );
+  for( ulong n=0UL; n<live && printed<limit; n++ ) {
+    fd_rpc_txn_rec_t const * rec = &ctx->txn_recs[ (ctx->txn_rec_next-1UL-n) % FD_RPC_TXN_REC_CNT ];
+    if( has_until && !memcmp( rec->sig, until, 64UL ) ) break;
+    if( skipping ) { if( !memcmp( rec->sig, before, 64UL ) ) skipping = 0; continue; }
+    if( rec->slot>info->slot ) continue;
+    if( rec->slot!=info->slot && !fd_rpc_slot_history_has( ctx, next_slot, rec->slot ) ) continue;
+    int match = 0;
+    for( ulong k=0UL; k<rec->acct_cnt && !match; k++ ) match = !memcmp( rec->payload+rec->acct_off+32UL*k, address.uc, 32UL );
+    if( !match ) continue;
+
+    FD_BASE58_ENCODE_64_BYTES( rec->sig, sig_b58 );
+    fd_rpc_block_time_t const * bt = fd_rpc_block_time_query( ctx, rec->slot );
+    fd_http_server_printf( ctx->http, "%s{", printed ? "," : "" );
+    if( bt ) fd_http_server_printf( ctx->http, "\"blockTime\":%ld,", bt->unix_timestamp );
+    else     fd_http_server_printf( ctx->http, "\"blockTime\":null," );
+    fd_http_server_printf( ctx->http, "\"confirmationStatus\":\"%s\",", rec->slot<=finalized ? "finalized" : "confirmed" );
+    if( !rec->txn_err ) fd_http_server_printf( ctx->http, "\"err\":null," );
+    else { fd_http_server_printf( ctx->http, "\"err\":" ); fd_rpc_print_txn_err( ctx, rec->txn_err ); fd_http_server_printf( ctx->http, "," ); }
+
+    /* memo: the data of every memo program instruction, as Agave formats it */
+    uchar txn_buf[ FD_TXN_MAX_SZ ] __attribute__((aligned(alignof(fd_txn_t))));
+    int   has_memo = 0;
+    if( FD_LIKELY( fd_txn_parse( rec->payload, rec->payload_sz, txn_buf, NULL ) ) ) {
+      fd_txn_t const * txn = (fd_txn_t const *)txn_buf;
+      for( ulong i=0UL; i<txn->instr_cnt; i++ ) {
+        fd_txn_instr_t const * ix = &txn->instr[ i ];
+        if( ix->program_id>=txn->acct_addr_cnt ) continue;
+        FD_BASE58_ENCODE_32_BYTES( rec->payload+txn->acct_addr_off+32UL*(ulong)ix->program_id, prog_b58 );
+        if( strcmp( prog_b58, "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr" ) && strcmp( prog_b58, "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo" ) ) continue;
+        fd_http_server_printf( ctx->http, has_memo ? "; [%u] " : "\"memo\":\"[%u] ", (uint)ix->data_sz );
+        fd_rpc_print_json_text( ctx, rec->payload+ix->data_off, ix->data_sz );
+        has_memo = 1;
+      }
+    }
+    fd_http_server_printf( ctx->http, has_memo ? "\"," : "\"memo\":null," );
+    fd_http_server_printf( ctx->http, "\"signature\":\"%s\",\"slot\":%lu}", sig_b58, rec->slot );
+    printed++;
+  }
+  fd_http_server_printf( ctx->http, "],\"id\":%s}\n", id_cstr );
+  return STAGE_JSON( ctx );
+}
+
 /* getBlock answers from the recent transaction window, so it only
-   knows blocks replayed since this node started that are still in the
-   window, and only their signatures: transactionDetails must be
-   "signatures" or "none" and rewards must be false. */
+   knows blocks replayed since this node started whose transactions are
+   all still in the window.  transactionDetails may be "full",
+   "signatures" or "none".  Rewards are not known: "rewards" is null. */
 static fd_http_server_response_t
 getBlock( fd_rpc_tile_t *         ctx,
           char const *            id_cstr,
@@ -4183,12 +4517,15 @@ getBlock( fd_rpc_tile_t *         ctx,
   fd_rpc_val_t v[1];
   char details[ 16 ] = "full";
   if( fd_rpc_cfg_member( config, "transactionDetails", v ) && v->kind==FD_RPC_VAL_STR ) fd_rpc_val_cstr( v, details, sizeof(details) );
+  int want_full = !strcmp( details, "full" );
   int want_sigs = !strcmp( details, "signatures" );
-  if( FD_UNLIKELY( !want_sigs && strcmp( details, "none" ) ) ) {
-    return fd_rpc_err_msg( ctx, id_cstr, -32065, "Firedancer Error: getBlock supports transactionDetails \\\"signatures\\\" or \\\"none\\\" only" );
+  if( FD_UNLIKELY( !want_full && !want_sigs && strcmp( details, "none" ) ) ) {
+    return fd_rpc_err_msg( ctx, id_cstr, -32065, "Firedancer Error: getBlock supports transactionDetails full, signatures or none" );
   }
-  int rewards = !( fd_rpc_cfg_member( config, "rewards", v ) && v->kind==FD_RPC_VAL_BOOL && v->raw_sz==5UL );
-  if( FD_UNLIKELY( rewards ) ) return fd_rpc_err_msg( ctx, id_cstr, -32065, "Firedancer Error: getBlock cannot report rewards, pass rewards: false" );
+  int enc = FD_RPC_TXN_ENC_JSON;
+  if( want_full && FD_UNLIKELY( !fd_rpc_txn_encoding( ctx, id_cstr, config, &enc, &response ) ) ) return response;
+  int want_rewards    = !( fd_rpc_cfg_member( config, "rewards", v ) && v->kind==FD_RPC_VAL_BOOL && v->raw_sz==5UL );
+  int has_max_version = fd_rpc_cfg_member( config, "maxSupportedTransactionVersion", v ) && v->kind==FD_RPC_VAL_INT;
 
   if( FD_UNLIKELY( slot>info->slot ) ) {
     return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32004,\"message\":\"Block not available for slot %lu\"},\"id\":%s}\n", slot, id_cstr );
@@ -4207,7 +4544,7 @@ getBlock( fd_rpc_tile_t *         ctx,
   }
 
   ulong cnt = 0UL;
-  if( want_sigs ) {
+  if( want_sigs || want_full ) {
     ulong live = fd_ulong_min( ctx->txn_rec_next, FD_RPC_TXN_REC_CNT );
     for( ulong i=0UL; i<live; i++ ) {
       if( ctx->txn_recs[ i ].slot!=slot ) continue;
@@ -4229,17 +4566,37 @@ getBlock( fd_rpc_tile_t *         ctx,
     if( FD_UNLIKELY( meta->txn_cnt==ULONG_MAX || cnt!=meta->txn_cnt ) ) {
       return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32004,\"message\":\"Block not available for slot %lu\"},\"id\":%s}\n", slot, id_cstr );
     }
+    if( want_full && !has_max_version ) {
+      for( ulong i=0UL; i<cnt; i++ ) {
+        fd_rpc_txn_rec_t const * rec = &ctx->txn_recs[ ctx->block_txns[ i ].rec ];
+        if( FD_UNLIKELY( rec->payload[ 1UL+64UL*(ulong)rec->payload[ 0 ] ] & 0x80 ) ) {
+          return fd_rpc_err_msg( ctx, id_cstr, -32015, "Transaction version (0) is not supported by the requesting client. Please try the request again with the following configuration parameter: \\\"maxSupportedTransactionVersion\\\": 0" );
+        }
+      }
+    }
   }
 
   FD_BASE58_ENCODE_32_BYTES( meta->block_hash,   blockhash_b58 );
   FD_BASE58_ENCODE_32_BYTES( parent->block_hash, prev_b58      );
   fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"result\":{\"blockHeight\":%lu,\"blockTime\":%ld,\"blockhash\":\"%s\",\"parentSlot\":%lu,\"previousBlockhash\":\"%s\"",
                          meta->block_height, bt->unix_timestamp, blockhash_b58, meta->parent_slot, prev_b58 );
+  if( want_rewards ) fd_http_server_printf( ctx->http, ",\"rewards\":null" );
   if( want_sigs ) {
     fd_http_server_printf( ctx->http, ",\"signatures\":[" );
     for( ulong i=0UL; i<cnt; i++ ) {
       FD_BASE58_ENCODE_64_BYTES( ctx->txn_recs[ ctx->block_txns[ i ].rec ].sig, sig_b58 );
       fd_http_server_printf( ctx->http, "%s\"%s\"", i ? "," : "", sig_b58 );
+    }
+    fd_http_server_printf( ctx->http, "]" );
+  } else if( want_full ) {
+    fd_http_server_printf( ctx->http, ",\"transactions\":[" );
+    for( ulong i=0UL; i<cnt; i++ ) {
+      fd_http_server_printf( ctx->http, "%s{", i ? "," : "" );
+      if( FD_UNLIKELY( !fd_rpc_print_txn( ctx, info, &ctx->txn_recs[ ctx->block_txns[ i ].rec ], enc ) ) ) {
+        fd_http_server_unstage( ctx->http );
+        return fd_rpc_err_msg( ctx, id_cstr, -32065, "Firedancer Error: stored transaction is unreadable" );
+      }
+      fd_http_server_printf( ctx->http, "}" );
     }
     fd_http_server_printf( ctx->http, "]" );
   }
@@ -4499,7 +4856,6 @@ getTokenSupply( fd_rpc_tile_t *         ctx,
   fd_http_server_printf( ctx->http, "},\"id\":%s}\n", id_cstr );
   return STAGE_JSON( ctx );
 }
-UNIMPLEMENTED(getTransaction)
 
 static fd_http_server_response_t
 getTransactionCount( fd_rpc_tile_t *         ctx,

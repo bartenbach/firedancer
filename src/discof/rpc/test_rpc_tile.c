@@ -772,7 +772,7 @@ main( int     argc,
   FD_TEST( FD_MGAUGE_GET( RPC, WEBSOCKET_SUBSCRIBER_COUNT_VOTE )==0UL );
   /* an unimplemented method over ws is -32601, not a closed socket */
   expect_ws_rpc_response( ctx, 0UL,
-      "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"getTransaction\",\"params\":[\"1\"]}",
+      "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"requestAirdrop\",\"params\":[\"1\"]}",
       "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32601,\"message\":\"Method not found\"},\"id\":9}"
   );
   FD_TEST( ctx->ws_subscribers_slot_cnt==1UL );

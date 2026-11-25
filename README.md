@@ -36,8 +36,10 @@ not been reviewed by the Firedancer team.
 | `getSupply` | full account scan | Everything is reported as circulating; the non-circulating list is empty. |
 | `getTokenAccountBalance`, `getTokenSupply` | account read | |
 | `getTokenAccountsByOwner`, `getTokenAccountsByDelegate`, `getTokenLargestAccounts` | full account scan | No `jsonParsed`. |
-| `getSignatureStatuses` | recent transaction window | Only transactions replayed since this node started that are still in the window (the last 524,288). A failed transaction is reported as failed, but when an instruction failed the error is `{"InstructionError":[null,null]}`: which instruction and why is not known to the tile. `confirmations` is the number of slots since the transaction's slot, not Agave's count. `searchTransactionHistory` is ignored. |
-| `getBlock` | recent transaction window | **Signatures only.** `transactionDetails` must be `"signatures"` or `"none"` and `rewards` must be `false`; the default call (full detail, with rewards) returns an error. Only blocks replayed since this node started, and only while every transaction of the block is still in the window; otherwise "Block not available". |
+| `getSignatureStatuses` | recent transaction window | See "The recent transaction window" below. A failed transaction is reported as failed, but when an instruction failed the error is `{"InstructionError":[null,null]}`: which instruction and why is not known to the tile. `confirmations` is the number of slots since the transaction's slot, not Agave's count. `searchTransactionHistory` is ignored. |
+| `getTransaction` | recent transaction window | Encodings `json`, `base64`, `base58` (no `jsonParsed`). `meta` has the result, fee, compute units, lamport balances before and after, and the addresses loaded from lookup tables. `logMessages`, `innerInstructions`, `preTokenBalances`, `postTokenBalances` and `rewards` are always null. Lookup-table addresses are read from the table as it is now, not as it was at the transaction's slot. Failed-instruction errors as for `getSignatureStatuses`. |
+| `getBlock` | recent transaction window | `transactionDetails` `full`, `signatures` or `none` (not `accounts`). Transactions as for `getTransaction`. `rewards` is always null. A block is served only while every one of its transactions is in the window; otherwise "Block not available". |
+| `getSignaturesForAddress` | recent transaction window | Matches addresses written in the transaction itself. **A transaction that only reaches the address through a lookup table is not found.** `limit`, `before`, `until` are supported. Each call walks the whole window. |
 | `sendTransaction` | UDP to upcoming leaders | The transaction is parsed, its signatures verified and, unless `skipPreflight`, its blockhash checked. It is then sent as a UDP datagram to the TPU port of the leaders of the next 4 rotations and resent every rotation until it is seen in a block or 150 slots pass. **There is no simulation**: a transaction that would fail on chain is still sent. A leader that advertises no TPU UDP port (Agave takes QUIC only) is skipped, and so is this node itself when it is the leader. `maxRetries`, `preflightCommitment` and `minContextSlot` are ignored. At most 256 transactions are kept for resending. |
 | `jsonParsed` encoding | vote accounts only (v4 vote state) | Accounts Agave does not parse fall back to base64, as in Agave. Accounts Agave does parse (stake, token, sysvar, config, nonce, BPF loader, lookup table) return an error instead of unparsed data. |
 
@@ -55,8 +57,6 @@ current stake. This patch does not change that.
 
 | Method | Why |
 |---|---|
-| `getTransaction` | The tile is told a transaction's result code, fee and compute units, but not balance changes, logs or inner instructions. |
-| `getSignaturesForAddress` | The window is not indexed by address, and addresses loaded through lookup tables are not resolved. |
 | `getInflationReward` | No per-epoch reward history. |
 | `getStakeMinimumDelegation` | The answer comes from executing the on-chain stake program. |
 | `getHighestSnapshotSlot` | The tile is not told which snapshots are on disk. |
@@ -72,12 +72,26 @@ current stake. This patch does not change that.
   answers nothing else and does not drain its input from replay. Do not
   expose these to untrusted callers. Behaviour under sustained scan
   load, or on a mainnet-sized database, has not been tested.
-- **The patch touches the tile wiring.** For `getSignatureStatuses`
-  and `getBlock` the RPC tile becomes a reader of the `replay_out`
-  link (one line in `topology.c`). It reads it unreliably, so it cannot
-  backpressure replay, and it discards a transaction it was too slow to
-  read; such a transaction is then missing from the window. The window
-  adds about 65 MB to the RPC tile.
+- **The recent transaction window.** `getTransaction`, `getBlock`,
+  `getSignaturesForAddress` and `getSignatureStatuses` answer from the
+  last 131,072 transactions this node replayed, held in memory (about
+  320 MB in the RPC tile). There is no history from before the node
+  started, none survives a restart, and nothing older than the window
+  is known. The RPC tile reads replay's per-transaction messages from
+  the `replay_out` link unreliably, so it cannot backpressure replay,
+  and it discards a message it was too slow to read; that transaction
+  is then missing, and `getBlock` refuses its block.
+- **Blocks this node produces as leader have not been checked.** The
+  window is fed by replay. The check node was not a leader, so whether
+  a node's own blocks reach the window is unknown.
+- **The patch is not confined to the RPC tile.** Besides one wiring
+  line in `topology.c`, it adds transaction balances to the message
+  the execution tiles send replay (`fd_execrp_tile.c`, `fd_execrp.h`)
+  and to the message replay publishes (`fd_replay_tile.c`). Those
+  changes copy data out; they do not change what is executed or
+  committed. The node ran in step with the cluster with them in place,
+  but this is the execution path of a validator: review it before
+  running it on anything that matters.
 - **A scan is not a point-in-time view.** Accounts written while a scan
   runs may or may not be included.
 - **How it was checked.** Each call was issued to an Agave 4.5.0-beta.0
@@ -91,11 +105,18 @@ current stake. This patch does not change that.
 - `getSignatureStatuses` matched Agave for successful transactions.
   The cluster produced no failed transactions during the check, so the
   failed-transaction path has not been seen working.
-- Agave on the test cluster does not serve `getBlock`, so `getBlock`
-  was checked for internal consistency only (blockhash chain, height,
-  time, and each signature's slot via `getSignatureStatuses`).
-- The base branch's RPC unit test passes with the patch applied. The
-  patch adds no unit tests of its own.
+- Agave on the test cluster does not serve `getBlock` or
+  `getTransaction`. They were checked for internal consistency
+  (blockhash chain, height, time, each signature's slot) and against
+  another operator's independent Firedancer RPC gateway, where full
+  blocks and transactions matched field for field on the blocks
+  sampled. Every sampled block held one legacy transaction: v0
+  transactions, lookup tables, memos and multi-transaction blocks have
+  not been seen.
+- The `test_rpc_tile` and `test_execrp_tile` unit tests pass.
+  `test_replay_tile` and `test_sched` could not be run on the test
+  machine (no huge pages).
+- The patch adds no unit tests of its own.
 
 ## Documentation
 If you are an operator or looking to run the validator, see the Getting

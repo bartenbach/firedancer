@@ -169,6 +169,16 @@ struct fd_execrp_txn_exec_done_msg {
   ulong  bank_seq;
   ushort start_shred_idx;
   ushort end_shred_idx;
+
+  /* Lamport balance of each of the transaction's accounts before it
+     ran and after, in transaction account order (static keys, then
+     the writable and the read-only addresses loaded from lookup
+     tables).  For RPC transaction metadata only: nothing in replay
+     decides anything from these.  bal_cnt is 0 if the accounts were
+     not loaded. */
+  uchar bal_cnt;
+  ulong pre_lamports [ MAX_TX_ACCOUNT_LOCKS ];
+  ulong post_lamports[ MAX_TX_ACCOUNT_LOCKS ];
 };
 typedef struct fd_execrp_txn_exec_done_msg fd_execrp_txn_exec_done_msg_t;
 

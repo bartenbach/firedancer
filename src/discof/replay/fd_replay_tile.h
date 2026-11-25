@@ -262,6 +262,12 @@ struct fd_replay_txn_executed {
   ulong transaction_fee;
   ulong priority_fee;
   ulong tips;
+
+  /* Lamport balances of the transaction's accounts before and after,
+     in transaction account order.  bal_cnt is 0 if unknown. */
+  ulong bal_cnt;
+  ulong pre_lamports [ MAX_TX_ACCOUNT_LOCKS ];
+  ulong post_lamports[ MAX_TX_ACCOUNT_LOCKS ];
 };
 typedef struct fd_replay_txn_executed fd_replay_txn_executed_t;
 

@@ -235,6 +235,19 @@ struct fd_replay_tile {
   fd_bank_lthash_rec_t lthash_rec[ 1 ];
   fd_execrp_result_t * execrp_result; /* One entry per exec tile. */
 
+  /* Balances reported by the exec tile for a transaction, held until
+     its txn_executed message is published (which can be when its
+     sigverify task finishes, after the exec tile has moved on).  A
+     small direct-mapped cache: an entry that was overwritten before
+     use just means that message goes out without balances. */
+# define FD_REPLAY_TXN_BAL_CACHE_CNT (2048UL)
+  struct {
+    ulong txn_idx; /* ULONG_MAX if empty */
+    ulong cnt;
+    ulong pre [ MAX_TX_ACCOUNT_LOCKS ];
+    ulong post[ MAX_TX_ACCOUNT_LOCKS ];
+  } txn_bal_cache[ FD_REPLAY_TXN_BAL_CACHE_CNT ];
+
   /* Signing payload of each exec tile's footer cert verify task */
   uchar cert_payload   [ FD_SCHED_MAX_EXEC_TILE_CNT ][ FD_ALPENGLOW_CERT_PAYLOAD_MAX ];
   ulong cert_payload_sz[ FD_SCHED_MAX_EXEC_TILE_CNT ];

@@ -40,6 +40,13 @@ typedef struct link_ctx {
 struct fd_execrp_tile {
   ulong tile_idx;
 
+  /* Balances of the transaction just executed, for the done message
+     (RPC transaction metadata).  Captured after execution and before
+     commit, while the transaction's accounts are still held. */
+  ulong bal_cnt;
+  ulong bal_pre [ MAX_TX_ACCOUNT_LOCKS ];
+  ulong bal_post[ MAX_TX_ACCOUNT_LOCKS ];
+
   fd_startup_gate_t startup_gate[1];
 
   /* link-related data structures. */
@@ -208,6 +215,10 @@ publish_txn_finalized_msg( fd_execrp_tile_t *  ctx,
   msg->txn_exec->start_shred_idx = ctx->txn_in.txn->start_shred_idx;
   msg->txn_exec->end_shred_idx   = ctx->txn_in.txn->end_shred_idx;
 
+  msg->txn_exec->bal_cnt = (uchar)ctx->bal_cnt;
+  fd_memcpy( msg->txn_exec->pre_lamports,  ctx->bal_pre,  ctx->bal_cnt*sizeof(ulong) );
+  fd_memcpy( msg->txn_exec->post_lamports, ctx->bal_post, ctx->bal_cnt*sizeof(ulong) );
+
   /* Leave the writable ALT accounts in this tile's result buffer if
      replay asked for them.  txn_out.accounts.cnt only exceeds
      acct_addr_cnt once the ALTs expanded successfully, and the expanded
@@ -288,6 +299,29 @@ returnable_frag( fd_execrp_tile_t *  ctx,
 
         ctx->metrics.txn_result[ fd_execle_err_from_runtime_err( ctx->txn_out.err.txn_err ) ]++;
         ctx->metrics.txn_version[ fd_execle_version_from_txn( TXN( ctx->txn_in.txn ) ) ]++;
+
+        /* Read-only snapshot of the balances.  A transaction that
+           failed keeps its starting balances except for the fee the
+           fee payer is charged. */
+        ctx->bal_cnt = 0UL;
+        if( FD_LIKELY( ctx->txn_out.err.is_committable && !ctx->txn_out.err.is_noop && ctx->txn_out.accounts.is_setup &&
+                       ctx->txn_out.accounts.cnt<=MAX_TX_ACCOUNT_LOCKS ) ) {
+          ulong cnt      = ctx->txn_out.accounts.cnt;
+          int   ok       = !ctx->txn_out.err.txn_err;
+          int   complete = 1;
+          for( ulong i=0UL; i<cnt; i++ ) {
+            fd_acc_t const * acc = ctx->txn_out.accounts.account[ i ];
+            ctx->bal_pre[ i ] = ctx->txn_out.accounts.starting_lamports[ i ];
+            if( ok ) {
+              if( FD_UNLIKELY( !acc ) ) { complete = 0; break; }
+              ctx->bal_post[ i ] = acc->lamports;
+            } else {
+              ctx->bal_post[ i ] = ctx->bal_pre[ i ];
+            }
+          }
+          if( !ok && cnt ) ctx->bal_post[ 0 ] = fd_ulong_sat_sub( ctx->bal_pre[ 0 ], fd_ulong_sat_add( ctx->txn_out.details.execution_fee, ctx->txn_out.details.priority_fee ) );
+          if( complete ) ctx->bal_cnt = cnt;
+        }
 
         if( FD_LIKELY( ctx->txn_out.err.is_committable ) ) {
           fd_runtime_commit_txn( ctx->runtime, ctx->bank, &ctx->txn_in, &ctx->txn_out );
