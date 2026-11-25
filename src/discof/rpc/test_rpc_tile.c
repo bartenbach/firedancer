@@ -451,6 +451,179 @@ test_genesis_static_body( fd_rpc_tile_t * ctx ) {
   ctx->genesis_tar_bz_sz = ULONG_MAX;
 }
 
+/* Agave compatibility handlers, run against account data captured from
+   a live Alpenglow cluster.  The responses are written to
+   $FD_RPC_COMPAT_OUT for comparison with Agave's answers at the same
+   slot.  The fixture header (vote accounts, SlotHistory and
+   RecentBlockhashes captured at one finalized slot) is not checked in;
+   this builds to a no-op without it. */
+
+#if __has_include("test_rpc_compat_fixture.h")
+#include "test_rpc_compat_fixture.h"
+#include <stdlib.h>
+
+static void
+compat_write_account( fd_accdb_t *       writer,
+                      fd_accdb_fork_id_t fork,
+                      uchar const *      key,
+                      uchar const *      owner,
+                      ulong              lamports,
+                      uchar const *      data,
+                      ulong              data_len ) {
+  uchar const * pks[ 1 ] = { key };
+  int           wr [ 1 ] = { 1 };
+  fd_acc_t      acc[ 1 ]; memset( acc, 0, sizeof(acc) );
+  fd_accdb_acquire( writer, fork, 1UL, pks, wr, acc );
+  acc[ 0 ].lamports = lamports;
+  acc[ 0 ].data_len = data_len;
+  memcpy( acc[ 0 ].owner, owner, 32UL );
+  memcpy( acc[ 0 ].data, data, data_len );
+  acc[ 0 ].commit = 1;
+  fd_accdb_release( writer, 1UL, acc );
+}
+
+static void
+compat_request( fd_rpc_tile_t * ctx,
+                char const *    name,
+                char const *    rpc_req ) {
+  struct fd_http_server_connection * conn = &ctx->http->conns[0];
+  conn->state                  = FD_HTTP_SERVER_CONNECTION_STATE_READING;
+  conn->request_bytes          = (char *)rpc_req;
+  conn->request_bytes_read     = (ulong)strlen(rpc_req);
+  conn->response._body_off     = 0UL;
+  conn->response._body_len     = 0UL;
+  conn->response_bytes_written = 0UL;
+  fd_http_server_request_t http_req = {
+    .method  = FD_HTTP_SERVER_METHOD_POST,
+    .path    = "/",
+    .ctx     = ctx,
+    .headers = { .content_type = "application/json" },
+    .post    = { .body = (uchar const *)rpc_req, .body_len = strlen( rpc_req ) }
+  };
+  fd_http_server_response_t http_res = rpc_http_request( &http_req );
+  FD_TEST( http_res.status==200 );
+  FD_TEST( !ctx->http->stage_err );
+
+  char const * dir = getenv( "FD_RPC_COMPAT_OUT" );
+  if( !dir ) return;
+  char path[ 512 ];
+  FD_TEST( fd_cstr_printf_check( path, sizeof(path), NULL, "%s/%s.json", dir, name ) );
+  FILE * f = fopen( path, "w" );
+  FD_TEST( f );
+  ulong off = http_res._body_off % ctx->http->oring_sz;
+  ulong len = http_res._body_len;
+  ulong first = fd_ulong_min( len, ctx->http->oring_sz-off );
+  FD_TEST( fwrite( ctx->http->oring+off, 1UL, first, f )==first );
+  if( len>first ) FD_TEST( fwrite( ctx->http->oring, 1UL, len-first, f )==len-first );
+  fclose( f );
+}
+
+static void
+test_agave_compat( fd_rpc_tile_t *    ctx,
+                   fd_accdb_t *       writer,
+                   fd_accdb_fork_id_t fork ) {
+  /* accounts */
+  for( ulong i=0UL; i<COMPAT_VOTE_CNT; i++ ) {
+    compat_write_account( writer, fork, compat_votes[ i ].vote, fd_solana_vote_program_id.uc, compat_votes[ i ].lamports, compat_votes[ i ].data, compat_votes[ i ].data_len );
+  }
+  uchar sysvar_owner[ 32 ]; memset( sysvar_owner, 0, 32UL );
+  compat_write_account( writer, fork, fd_sysvar_slot_history_id.uc,       sysvar_owner, COMPAT_SLOT_HISTORY_LAMPORTS, compat_slot_history, sizeof(compat_slot_history) );
+  compat_write_account( writer, fork, fd_sysvar_recent_block_hashes_id.uc, sysvar_owner, COMPAT_RECENT_BH_LAMPORTS,    compat_recent_bh,    sizeof(compat_recent_bh) );
+
+  /* epoch message: real stakes, so the leader schedule is the cluster's */
+  static uchar epoch_msg_buf[ FD_EPOCH_INFO_MAX_MSG_SZ ] __attribute__((aligned(64)));
+  fd_epoch_info_msg_t * emsg = (fd_epoch_info_msg_t *)fd_type_pun( epoch_msg_buf );
+  memset( emsg, 0, FD_EPOCH_INFO_MSG_HEADER_SZ );
+  emsg->features.geo_aware_leader_schedule = FD_FEATURE_DISABLED;
+  emsg->epoch           = COMPAT_EPOCH;
+  emsg->start_slot      = COMPAT_FIRST_SLOT;
+  emsg->slot_cnt        = COMPAT_SLOTS_IN_EPOCH;
+  emsg->staked_vote_cnt = COMPAT_VOTE_CNT;
+  emsg->staked_id_cnt   = COMPAT_VOTE_CNT;
+  FD_TEST( fd_epoch_schedule_derive( &emsg->epoch_schedule, COMPAT_SLOTS_IN_EPOCH, COMPAT_SLOTS_IN_EPOCH, 0 ) );
+  fd_vote_stake_weight_t * w = fd_epoch_info_msg_stake_weights( emsg );
+  for( ulong i=0UL; i<COMPAT_VOTE_CNT; i++ ) {
+    memset( &w[ i ], 0, sizeof(fd_vote_stake_weight_t) );
+    memcpy( w[ i ].vote_key.uc, compat_votes[ i ].vote, 32UL );
+    memcpy( w[ i ].id_key.uc,   compat_votes[ i ].node, 32UL );
+    w[ i ].stake = compat_votes[ i ].stake;
+  }
+  fd_stake_weight_t * idw = fd_epoch_info_msg_id_weights( emsg );
+  for( ulong i=0UL; i<COMPAT_VOTE_CNT; i++ ) {
+    memcpy( idw[ i ].key.uc, compat_votes[ i ].node, 32UL );
+    idw[ i ].stake = compat_votes[ i ].stake;
+  }
+
+  /* the same ingest the tile does on a replay_epoch frag */
+  ctx->epoch_schedule     = emsg->epoch_schedule;
+  ctx->has_epoch_schedule = 1;
+  fd_rpc_mleaders_init( ctx->mleaders );
+  fd_rpc_mleaders_ingest( ctx->mleaders, emsg );
+  for( ulong i=0UL; i<FD_RPC_VOTE_WEIGHTS_CNT; i++ ) ctx->vote_weights[ i ].epoch = ULONG_MAX;
+  fd_rpc_vote_weights_t * vw = &ctx->vote_weights[ COMPAT_EPOCH % FD_RPC_VOTE_WEIGHTS_CNT ];
+  vw->epoch = COMPAT_EPOCH;
+  vw->cnt   = COMPAT_VOTE_CNT;
+  memcpy( vw->w, w, COMPAT_VOTE_CNT*sizeof(fd_vote_stake_weight_t) );
+
+  /* bank */
+  memset( &ctx->banks[ 0 ], 0, sizeof(bank_info_t) );
+  ctx->banks[ 0 ].slot            = COMPAT_SLOT;
+  ctx->banks[ 0 ].accdb_fork_id   = fork;
+  ctx->banks[ 0 ].epoch           = COMPAT_EPOCH;
+  ctx->banks[ 0 ].slot_in_epoch   = COMPAT_SLOT_INDEX;
+  ctx->banks[ 0 ].slots_per_epoch = COMPAT_SLOTS_IN_EPOCH;
+  memcpy( ctx->banks[ 0 ].block_hash, compat_blockhash, 32UL );
+  ctx->processed_idx = 0UL;
+  ctx->confirmed_idx = 0UL;
+  ctx->finalized_idx = 0UL;
+
+  /* per-slot ingest: two slots 61 seconds apart make one sample */
+  for( ulong i=0UL; i<FD_RPC_BLOCK_TIME_CNT; i++ ) ctx->block_times[ i ].slot = ULONG_MAX;
+  ctx->perf_sample_cnt = 0UL; ctx->perf_sample_next = 0UL; ctx->perf_last_nanos = 0L; ctx->first_slot = ULONG_MAX;
+  static fd_replay_slot_completed_t sc;
+  memset( &sc, 0, sizeof(sc) );
+  sc.slot = COMPAT_SLOT-300UL; sc.transaction_count = 1000UL; sc.completion_time_nanos = 1700000000L*1000000000L;
+  sc.nonvote_success = 7UL; sc.nonvote_failed = 1UL;
+  sc.footer.block_producer_time_nanos = 1700000000UL*1000000000UL;
+  fd_rpc_compat_slot_completed( ctx, &sc );
+  sc.slot = COMPAT_SLOT; sc.transaction_count = 1900UL; sc.completion_time_nanos += 61L*1000000000L;
+  sc.nonvote_success = 800UL; sc.nonvote_failed = 100UL;
+  sc.footer.block_producer_time_nanos += 61UL*1000000000UL;
+  fd_rpc_compat_slot_completed( ctx, &sc );
+
+  char req[ 1024 ];
+  compat_request( ctx, "getVoteAccounts",    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getVoteAccounts\",\"params\":[{\"commitment\":\"finalized\"}]}" );
+  compat_request( ctx, "getVoteAccountsNoParams", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getVoteAccounts\"}" );
+  compat_request( ctx, "getBlockProduction", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBlockProduction\",\"params\":[{\"commitment\":\"finalized\"}]}" );
+  compat_request( ctx, "getEpochSchedule",   "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getEpochSchedule\"}" );
+  FD_TEST( fd_cstr_printf_check( req, sizeof(req), NULL, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBlocks\",\"params\":[%lu,%lu]}", COMPAT_FIRST_SLOT, COMPAT_SLOT ) );
+  compat_request( ctx, "getBlocks", req );
+  FD_TEST( fd_cstr_printf_check( req, sizeof(req), NULL, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBlocksWithLimit\",\"params\":[%lu,25]}", COMPAT_FIRST_SLOT ) );
+  compat_request( ctx, "getBlocksWithLimit", req );
+  FD_TEST( fd_cstr_printf_check( req, sizeof(req), NULL, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"isBlockhashValid\",\"params\":[\"%s\"]}", compat_blockhash_b58 ) );
+  compat_request( ctx, "isBlockhashValid_latest", req );
+  FD_TEST( fd_cstr_printf_check( req, sizeof(req), NULL, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"isBlockhashValid\",\"params\":[\"%s\"]}", compat_old_blockhash_b58 ) );
+  compat_request( ctx, "isBlockhashValid_recent", req );
+  compat_request( ctx, "isBlockhashValid_bogus", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"isBlockhashValid\",\"params\":[\"11111111111111111111111111111112\"]}" );
+  FD_TEST( fd_cstr_printf_check( req, sizeof(req), NULL, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBlockTime\",\"params\":[%lu]}", COMPAT_SLOT ) );
+  compat_request( ctx, "getBlockTime", req );
+  compat_request( ctx, "getBlockTime_missing", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBlockTime\",\"params\":[5]}" );
+  compat_request( ctx, "getRecentPerformanceSamples", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getRecentPerformanceSamples\",\"params\":[5]}" );
+  compat_request( ctx, "getFirstAvailableBlock", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getFirstAvailableBlock\"}" );
+  compat_request( ctx, "minimumLedgerSlot", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"minimumLedgerSlot\"}" );
+  FD_TEST( fd_cstr_printf_check( req, sizeof(req), NULL, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBlockCommitment\",\"params\":[%lu]}", COMPAT_SLOT ) );
+  compat_request( ctx, "getBlockCommitment", req );
+  FD_LOG_NOTICE(( "agave compat fixture: pass" ));
+}
+#else
+static void
+test_agave_compat( fd_rpc_tile_t *    ctx,
+                   fd_accdb_t *       writer,
+                   fd_accdb_fork_id_t fork ) {
+  (void)ctx; (void)writer; (void)fork;
+}
+#endif
+
 int
 main( int     argc,
       char ** argv ) {
@@ -631,7 +804,7 @@ main( int     argc,
   FD_TEST( FD_MGAUGE_GET( RPC, WEBSOCKET_SUBSCRIBER_COUNT_VOTE )==0UL );
   /* an unimplemented method over ws is -32601, not a closed socket */
   expect_ws_rpc_response( ctx, 0UL,
-      "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"getBlockTime\",\"params\":[1]}",
+      "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"getBlock\",\"params\":[1]}",
       "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32601,\"message\":\"Method not found\"},\"id\":9}"
   );
   FD_TEST( ctx->ws_subscribers_slot_cnt==1UL );
@@ -1354,6 +1527,8 @@ main( int     argc,
 #undef HEALTH_BEHIND
 #undef WRITE_AG_ACCT
   }
+
+  test_agave_compat( ctx, writer_accdb, test_fork_id );
 
   /* Reset the HTTP server so the eviction regression starts with empty
      connection and eviction data structures.  It intentionally leaves
