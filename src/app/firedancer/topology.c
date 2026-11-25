@@ -1007,6 +1007,10 @@ fd_topo_initialize( config_t * config ) {
     fd_topob_tile_in( topo, "replay", 0UL, "metric_in", "rpc_replay",   0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
     fd_topob_tile_in( topo, "rpc",    0UL, "metric_in", "gossip_ciaddr", 0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
     fd_topob_tile_in( topo, "rpc",    0UL, "metric_in", "replay_epoch", 0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
+    /* executed transactions, for getSignatureStatuses and getBlock.
+       Unreliable: the rpc tile must never backpressure replay_out,
+       which dedup and pack also read. */
+    fd_topob_tile_in( topo, "rpc",    0UL, "metric_in", "replay_out",   0UL, FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
   }
 
   if( FD_UNLIKELY( solcap_enabled ) ) {
