@@ -44,7 +44,7 @@ not been reviewed by the Firedancer team.
 | `getStakeMinimumDelegation` | the simulator | Simulates the stake program's `GetMinimumDelegation` instruction and returns what the program answers, as Agave does. |
 | `getHighestSnapshotSlot` | the snapshot writer's messages | The newest full snapshot the node has on disk and the newest incremental built on it. Only on a node that writes snapshots (`[layout] enable_snapshot_production = true`, which the Firedancer defaults mark as unsupported); otherwise "No snapshot". With it on, the check node reported the same full snapshot slot as Agave and its incremental slot followed each new file. |
 | `sendTransaction` | UDP to upcoming leaders | The transaction is parsed, its signatures verified and, unless `skipPreflight`, its blockhash checked. It is then sent as a UDP datagram to the TPU port of the leaders of the next 4 rotations and resent every rotation until it is seen in a block or 150 slots pass. **There is no simulation**: a transaction that would fail on chain is still sent. A leader that advertises no TPU UDP port (Agave takes QUIC only) is skipped, and so is this node itself when it is the leader. `maxRetries`, `preflightCommitment` and `minContextSlot` are ignored. At most 256 transactions are kept for resending. |
-| `jsonParsed` encoding | account data | Parsed for vote accounts (v4 vote state), stake accounts, and plain SPL token mints (82 bytes) and accounts (165 bytes) of either token program. Accounts Agave does not parse fall back to base64, as in Agave. Accounts Agave does parse but this does not (sysvars, config, nonce, BPF loader, lookup tables, Token-2022 accounts with extensions, token multisigs) return an error instead of unparsed data. `rentEpoch` is always printed as 18446744073709551615, where Agave prints 0 for some genesis accounts. |
+| `jsonParsed` encoding | account data | Parsed for vote accounts (v4 vote state), stake accounts, plain SPL token mints (82 bytes) and accounts (165 bytes) of either token program, and the sysvars clock, epochSchedule, rent, lastRestartSlot, epochRewards, recentBlockhashes, slotHashes, slotHistory and stakeHistory. Accounts Agave does not parse fall back to base64, as in Agave. Accounts Agave does parse but this does not (config, nonce, BPF loader, lookup tables, Token-2022 accounts with extensions, token multisigs) return an error instead of unparsed data. `rentEpoch` is always printed as 18446744073709551615, where Agave prints 0 for accounts not rewritten since genesis. A sysvar is parsed only where its address is known to the encoder (`getAccountInfo`, `getMultipleAccounts`, `getProgramAccounts`). |
 
 ### Already in the base branch (not part of this patch)
 
@@ -149,6 +149,9 @@ current stake. This patch does not change that.
   differed only in `rentEpoch` of the system program account. Not
   tried: v0 transactions with lookup tables, v1 transactions, programs
   that make cross-program calls, large programs, Token-2022.
+- Parsed sysvars were compared with Agave at the same finalized slot:
+  all nine matched, including the million-bit slot history, apart
+  from `rentEpoch` on three of them.
 - Parsed stake, token and vote output was compared with Agave over
   whole programs: all 12 token accounts, all 76 vote accounts, 27,730
   delegated and 4,285 undelegated stake accounts. They matched apart

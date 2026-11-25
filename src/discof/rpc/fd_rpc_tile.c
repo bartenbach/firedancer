@@ -753,6 +753,7 @@ struct fd_rpc_tile {
 # define FD_RPC_SNAP_MAX (64UL)
   struct { ulong slot; ulong base; } snaps[ FD_RPC_SNAP_MAX ];
   ulong                 snap_cnt;
+  uchar const *         encode_key;                           /* address of the account being encoded, NULL if unknown (jsonParsed sysvars) */
   fd_rpc_sim_t *        sim;                                  /* simulateTransaction runtime, NULL if unavailable */
   fd_features_t         features;                             /* from the latest epoch message */
   int                   has_features;
@@ -2361,6 +2362,90 @@ fd_rpc_encode_account_parsed( fd_rpc_tile_t * ctx,
     return 1;
   }
 
+  if( !memcmp( owner, fd_sysvar_owner_id.uc, 32UL ) ) {
+    /* Sysvars are told apart by address.  Each is printed as Agave's
+       parse_sysvar does. */
+    uchar const * key = ctx->encode_key;
+    if( FD_UNLIKELY( !key ) ) return -1;
+    fd_http_server_printf( ctx->http, "{\"data\":{\"parsed\":{\"info\":" );
+    char const * type;
+    if( !memcmp( key, fd_sysvar_clock_id.uc, 32UL ) && sz>=40UL ) {
+      type = "clock";
+      fd_http_server_printf( ctx->http, "{\"epoch\":%lu,\"epochStartTimestamp\":%ld,\"leaderScheduleEpoch\":%lu,\"slot\":%lu,\"unixTimestamp\":%ld}",
+                             FD_LOAD( ulong, d+16UL ), FD_LOAD( long, d+8UL ), FD_LOAD( ulong, d+24UL ), FD_LOAD( ulong, d ), FD_LOAD( long, d+32UL ) );
+    } else if( !memcmp( key, fd_sysvar_epoch_schedule_id.uc, 32UL ) && sz>=33UL ) {
+      type = "epochSchedule";
+      fd_http_server_printf( ctx->http, "{\"firstNormalEpoch\":%lu,\"firstNormalSlot\":%lu,\"leaderScheduleSlotOffset\":%lu,\"slotsPerEpoch\":%lu,\"warmup\":%s}",
+                             FD_LOAD( ulong, d+17UL ), FD_LOAD( ulong, d+25UL ), FD_LOAD( ulong, d+8UL ), FD_LOAD( ulong, d ), d[ 16 ] ? "true" : "false" );
+    } else if( !memcmp( key, fd_sysvar_rent_id.uc, 32UL ) && sz>=8UL ) {
+      type = "rent";
+      fd_http_server_printf( ctx->http, "{\"lamportsPerByte\":\"%lu\"}", FD_LOAD( ulong, d ) );
+    } else if( !memcmp( key, fd_sysvar_last_restart_slot_id.uc, 32UL ) && sz>=8UL ) {
+      type = "lastRestartSlot";
+      fd_http_server_printf( ctx->http, "{\"lastRestartSlot\":%lu}", FD_LOAD( ulong, d ) );
+    } else if( !memcmp( key, fd_sysvar_epoch_rewards_id.uc, 32UL ) && sz>=81UL ) {
+      /* distribution_starting_block_height, num_partitions, parent_blockhash,
+         total_points (u128), total_rewards, distributed_rewards, active */
+      type = "epochRewards";
+      FD_BASE58_ENCODE_32_BYTES( d+16UL, parent_b58 );
+      uint128 points = FD_LOAD( uint128, d+48UL );
+      char points_cstr[ 48 ]; ulong pl = sizeof(points_cstr)-1UL; points_cstr[ pl ] = '\0';
+      do { points_cstr[ --pl ] = (char)( '0'+(int)( points%10 ) ); points /= 10; } while( points );
+      fd_http_server_printf( ctx->http, "{\"active\":%s,\"distributedRewards\":\"%lu\",\"distributionStartingBlockHeight\":%lu,\"numPartitions\":%lu,\"parentBlockhash\":\"%s\",\"totalPoints\":\"%s\",\"totalRewards\":\"%lu\"}",
+                             d[ 80 ] ? "true" : "false", FD_LOAD( ulong, d+72UL ), FD_LOAD( ulong, d ), FD_LOAD( ulong, d+8UL ), parent_b58, points_cstr+pl, FD_LOAD( ulong, d+64UL ) );
+    } else if( !memcmp( key, fd_sysvar_recent_block_hashes_id.uc, 32UL ) && sz>=8UL ) {
+      type = "recentBlockhashes";
+      ulong cnt = fd_ulong_min( FD_LOAD( ulong, d ), (sz-8UL)/40UL );
+      fd_http_server_printf( ctx->http, "[" );
+      for( ulong i=0UL; i<cnt; i++ ) {
+        FD_BASE58_ENCODE_32_BYTES( d+8UL+40UL*i, h_b58 );
+        fd_http_server_printf( ctx->http, "%s{\"blockhash\":\"%s\",\"feeCalculator\":{\"lamportsPerSignature\":\"%lu\"}}", i ? "," : "", h_b58, FD_LOAD( ulong, d+8UL+40UL*i+32UL ) );
+      }
+      fd_http_server_printf( ctx->http, "]" );
+    } else if( !memcmp( key, fd_sysvar_slot_hashes_id.uc, 32UL ) && sz>=8UL ) {
+      type = "slotHashes";
+      ulong cnt = fd_ulong_min( FD_LOAD( ulong, d ), (sz-8UL)/40UL );
+      fd_http_server_printf( ctx->http, "[" );
+      for( ulong i=0UL; i<cnt; i++ ) {
+        FD_BASE58_ENCODE_32_BYTES( d+8UL+40UL*i+8UL, h_b58 );
+        fd_http_server_printf( ctx->http, "%s{\"hash\":\"%s\",\"slot\":%lu}", i ? "," : "", h_b58, FD_LOAD( ulong, d+8UL+40UL*i ) );
+      }
+      fd_http_server_printf( ctx->http, "]" );
+    } else if( !memcmp( key, fd_sysvar_stake_history_id.uc, 32UL ) && sz>=8UL ) {
+      /* entries: epoch, effective, activating, deactivating */
+      type = "stakeHistory";
+      ulong cnt = fd_ulong_min( FD_LOAD( ulong, d ), (sz-8UL)/32UL );
+      fd_http_server_printf( ctx->http, "[" );
+      for( ulong i=0UL; i<cnt; i++ ) {
+        uchar const * e = d+8UL+32UL*i;
+        fd_http_server_printf( ctx->http, "%s{\"epoch\":%lu,\"stakeHistory\":{\"activating\":%lu,\"deactivating\":%lu,\"effective\":%lu}}", i ? "," : "",
+                               FD_LOAD( ulong, e ), FD_LOAD( ulong, e+16UL ), FD_LOAD( ulong, e+24UL ), FD_LOAD( ulong, e+8UL ) );
+      }
+      fd_http_server_printf( ctx->http, "]" );
+    } else if( !memcmp( key, fd_sysvar_slot_history_id.uc, 32UL ) && sz>=9UL ) {
+      /* bit vector: option tag, word count, words, bit count; then next_slot */
+      type = "slotHistory";
+      ulong words = FD_LOAD( ulong, d+1UL );
+      if( FD_UNLIKELY( d[ 0 ]!=1 || words>(sz-9UL)/8UL || sz<9UL+8UL*words+16UL ) ) { fd_http_server_unstage( ctx->http ); return -1; }
+      ulong bits = fd_ulong_min( FD_LOAD( ulong, d+9UL+8UL*words ), 64UL*words );
+      fd_http_server_printf( ctx->http, "{\"bits\":\"" );
+      char chunk[ 65 ]; chunk[ 64 ] = '\0';
+      for( ulong w=0UL; w*64UL<bits; w++ ) {
+        ulong word = FD_LOAD( ulong, d+9UL+8UL*w );
+        ulong n    = fd_ulong_min( 64UL, bits-w*64UL );
+        for( ulong b=0UL; b<n; b++ ) chunk[ b ] = (char)( '0'+(int)( (word>>b)&1UL ) );
+        fd_http_server_printf( ctx->http, "%.*s", (int)n, chunk );
+      }
+      fd_http_server_printf( ctx->http, "\",\"nextSlot\":%lu}", FD_LOAD( ulong, d+9UL+8UL*words+8UL ) );
+    } else {
+      fd_http_server_unstage( ctx->http );
+      return -1;
+    }
+    fd_http_server_printf( ctx->http, ",\"type\":\"%s\"},\"program\":\"sysvar\",\"space\":%lu},\"executable\":%s,\"lamports\":%lu,\"owner\":\"%s\",\"rentEpoch\":18446744073709551615,\"space\":%lu}",
+                           type, sz, executable ? "true" : "false", lamports, owner_b58, sz );
+    return 1;
+  }
+
   if( memcmp( owner, fd_solana_vote_program_id.uc, 32UL ) ) {
     if( !memcmp( owner, fd_solana_config_program_id.uc,                32UL ) ||
         !memcmp( owner, fd_sysvar_owner_id.uc,                         32UL ) ||
@@ -2466,7 +2551,7 @@ fd_rpc_encode_account_data( fd_rpc_tile_t *             ctx,
     if( FD_UNLIKELY( parsed<0 ) ) {
       FD_BASE58_ENCODE_32_BYTES( acct_owner, owner_b58 );
       fd_http_server_unstage( ctx->http );
-      *err_response = PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32065,\"message\":\"Firedancer Error: jsonParsed is supported for vote (v4), stake and plain SPL token accounts; this account of program %s is not one of those\"},\"id\":%s}\n", owner_b58, id_cstr );
+      *err_response = PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32065,\"message\":\"Firedancer Error: jsonParsed is supported for vote (v4), stake, sysvar and plain SPL token accounts; this account of program %s is not one of those\"},\"id\":%s}\n", owner_b58, id_cstr );
       return 0;
     }
     encoding_cstr = "base64"; /* a program Agave does not parse either */
@@ -2585,7 +2670,10 @@ getAccountInfo( fd_rpc_tile_t *         ctx,
   fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"context\":{\"apiVersion\":\"%s\",\"slot\":%lu},\"value\":", id_cstr, FD_RPC_AGAVE_API_VERSION, info->slot );
 
   fd_http_server_response_t err_response;
-  if( FD_UNLIKELY( !fd_rpc_encode_account_data( ctx, ctx->scratch.accdb_data_buf, acct_data_len, acct_owner, acct_lamports, acct_executable, encoding_cstr, slice_offset, slice_length, id_cstr, &err_response ) ) ) {
+  ctx->encode_key = address.uc;
+  int encoded = fd_rpc_encode_account_data( ctx, ctx->scratch.accdb_data_buf, acct_data_len, acct_owner, acct_lamports, acct_executable, encoding_cstr, slice_offset, slice_length, id_cstr, &err_response );
+  ctx->encode_key = NULL;
+  if( FD_UNLIKELY( !encoded ) ) {
     return err_response;
   }
 
@@ -3772,7 +3860,10 @@ getMultipleAccounts( fd_rpc_tile_t *         ctx,
     }
 
     fd_http_server_response_t err_response;
-    if( FD_UNLIKELY( !fd_rpc_encode_account_data( ctx, ctx->scratch.accdb_data_buf, acct_data_len, acct_owner, acct_lamports, acct_executable, encoding_cstr, slice_offset, slice_length, id_cstr, &err_response ) ) ) {
+    ctx->encode_key = addresses[ i ].uc;
+    int encoded = fd_rpc_encode_account_data( ctx, ctx->scratch.accdb_data_buf, acct_data_len, acct_owner, acct_lamports, acct_executable, encoding_cstr, slice_offset, slice_length, id_cstr, &err_response );
+    ctx->encode_key = NULL;
+    if( FD_UNLIKELY( !encoded ) ) {
       return err_response;
     }
   }
@@ -3986,7 +4077,10 @@ fd_rpc_gpa_emit( fd_rpc_tile_t * ctx,
 
   FD_BASE58_ENCODE_32_BYTES( pubkey, pubkey_b58 );
   fd_http_server_printf( ctx->http, "%s{\"pubkey\":\"%s\",\"account\":", arg->printed ? "," : "", pubkey_b58 );
-  if( FD_UNLIKELY( !fd_rpc_encode_account_data( ctx, data, data_len, owner, lamports, executable, arg->encoding_cstr, arg->slice_offset, arg->slice_length, arg->id_cstr, &arg->err ) ) ) {
+  ctx->encode_key = pubkey;
+  int encoded = fd_rpc_encode_account_data( ctx, data, data_len, owner, lamports, executable, arg->encoding_cstr, arg->slice_offset, arg->slice_length, arg->id_cstr, &arg->err );
+  ctx->encode_key = NULL;
+  if( FD_UNLIKELY( !encoded ) ) {
     arg->failed = 1;
     return 0;
   }
