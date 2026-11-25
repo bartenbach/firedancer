@@ -40,6 +40,7 @@ not been reviewed by the Firedancer team.
 | `getTransaction` | recent transaction window | Encodings `json`, `base64`, `base58` (no `jsonParsed`). `meta` has the result, fee, compute units, lamport balances before and after, and the addresses loaded from lookup tables. `logMessages`, `innerInstructions`, `preTokenBalances`, `postTokenBalances` and `rewards` are always null. Lookup-table addresses are read from the table as it is now, not as it was at the transaction's slot. Failed-instruction errors as for `getSignatureStatuses`. |
 | `getBlock` | recent transaction window | `transactionDetails` `full`, `signatures` or `none` (not `accounts`). Transactions as for `getTransaction`. `rewards` is always null. A block is served only while every one of its transactions is in the window; otherwise "Block not available". |
 | `getSignaturesForAddress` | recent transaction window | Matches addresses written in the transaction itself. **A transaction that only reaches the address through a lookup table is not found.** `limit`, `before`, `until` are supported. Each call walks the whole window. |
+| `getStakeMinimumDelegation` | a built-in table | The real answer comes from running the cluster's stake program, which the tile cannot do. It answers from a table of clusters whose value was read off an Agave node, keyed by genesis hash. The table has one entry: the Alpenglow community cluster (1 SOL). **On any other cluster it returns an error.** |
 | `sendTransaction` | UDP to upcoming leaders | The transaction is parsed, its signatures verified and, unless `skipPreflight`, its blockhash checked. It is then sent as a UDP datagram to the TPU port of the leaders of the next 4 rotations and resent every rotation until it is seen in a block or 150 slots pass. **There is no simulation**: a transaction that would fail on chain is still sent. A leader that advertises no TPU UDP port (Agave takes QUIC only) is skipped, and so is this node itself when it is the leader. `maxRetries`, `preflightCommitment` and `minContextSlot` are ignored. At most 256 transactions are kept for resending. |
 | `jsonParsed` encoding | vote accounts only (v4 vote state) | Accounts Agave does not parse fall back to base64, as in Agave. Accounts Agave does parse (stake, token, sysvar, config, nonce, BPF loader, lookup table) return an error instead of unparsed data. |
 
@@ -58,8 +59,7 @@ current stake. This patch does not change that.
 | Method | Why |
 |---|---|
 | `getInflationReward` | No per-epoch reward history. |
-| `getStakeMinimumDelegation` | The answer comes from executing the on-chain stake program. |
-| `getHighestSnapshotSlot` | The tile is not told which snapshots are on disk. |
+| `getHighestSnapshotSlot` | The tile is not told which snapshots are on disk; replay announces a snapshot only to the snapshot writer. |
 | `simulateTransaction` | Needs a transaction executor in the RPC tile. |
 | `requestAirdrop` | Needs a faucet. |
 

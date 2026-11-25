@@ -4715,7 +4715,34 @@ getSlotLeaders( fd_rpc_tile_t *         ctx,
   fd_http_server_printf( ctx->http, "],\"id\":%s}\n", id_cstr );
   return STAGE_JSON( ctx );
 }
-UNIMPLEMENTED(getStakeMinimumDelegation)
+/* The minimum delegation is decided by the stake program deployed on
+   the cluster (a BPF program since the core-BPF migration), not by a
+   feature gate: the same feature set answers 1 lamport on one cluster
+   and 1 SOL on another.  Answering properly needs that program
+   executed, which this tile cannot do.  So this answers from a table
+   of clusters whose value was read off an Agave node, keyed by genesis
+   hash, and is an error on any other cluster. */
+static fd_http_server_response_t
+getStakeMinimumDelegation( fd_rpc_tile_t *         ctx,
+                           char const *            id_cstr,
+                           fd_rpc_params_t const * params ) {
+  fd_http_server_response_t response;
+  if( FD_UNLIKELY( !fd_rpc_validate_params( ctx, id_cstr, params, 0, 1, &response ) ) ) return response;
+  ulong bank_idx = ULONG_MAX;
+  if( FD_UNLIKELY( !fd_rpc_cfg_bank( ctx, id_cstr, &params->v[ 0 ], &bank_idx, &response ) ) ) return response;
+
+  static struct { char const * genesis; ulong lamports; } const known[] = {
+    { "9mi4SxvrMwaErcAN9r8wAAsX8YTKedGNogzQCuhTZ7Nz", 1000000000UL }, /* Alpenglow community cluster, Agave 4.5.0-beta.0, 2026-11 */
+  };
+  if( FD_LIKELY( ctx->has_genesis_hash ) ) {
+    FD_BASE58_ENCODE_32_BYTES( ctx->genesis_hash->uc, genesis_b58 );
+    for( ulong i=0UL; i<sizeof(known)/sizeof(known[ 0 ]); i++ ) {
+      if( strcmp( genesis_b58, known[ i ].genesis ) ) continue;
+      return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"result\":{\"context\":{\"apiVersion\":\"%s\",\"slot\":%lu},\"value\":%lu},\"id\":%s}\n", FD_RPC_AGAVE_API_VERSION, ctx->banks[ bank_idx ].slot, known[ i ].lamports, id_cstr );
+    }
+  }
+  return fd_rpc_err_msg( ctx, id_cstr, -32065, "Firedancer Error: the stake minimum delegation of this cluster is not known to this node" );
+}
 static fd_http_server_response_t
 getSupply( fd_rpc_tile_t *         ctx,
            char const *            id_cstr,
