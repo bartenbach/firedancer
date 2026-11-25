@@ -42,7 +42,7 @@ not been reviewed by the Firedancer team.
 | `getSignaturesForAddress` | recent transaction window | Matches addresses written in the transaction itself. **A transaction that only reaches the address through a lookup table is not found.** `limit`, `before`, `until` are supported. Each call walks the whole window. |
 | `getStakeMinimumDelegation` | a built-in table | The real answer comes from running the cluster's stake program, which the tile cannot do. It answers from a table of clusters whose value was read off an Agave node, keyed by genesis hash. The table has one entry: the Alpenglow community cluster (1 SOL). **On any other cluster it returns an error.** |
 | `sendTransaction` | UDP to upcoming leaders | The transaction is parsed, its signatures verified and, unless `skipPreflight`, its blockhash checked. It is then sent as a UDP datagram to the TPU port of the leaders of the next 4 rotations and resent every rotation until it is seen in a block or 150 slots pass. **There is no simulation**: a transaction that would fail on chain is still sent. A leader that advertises no TPU UDP port (Agave takes QUIC only) is skipped, and so is this node itself when it is the leader. `maxRetries`, `preflightCommitment` and `minContextSlot` are ignored. At most 256 transactions are kept for resending. |
-| `jsonParsed` encoding | vote accounts only (v4 vote state) | Accounts Agave does not parse fall back to base64, as in Agave. Accounts Agave does parse (stake, token, sysvar, config, nonce, BPF loader, lookup table) return an error instead of unparsed data. |
+| `jsonParsed` encoding | account data | Parsed for vote accounts (v4 vote state), stake accounts, and plain SPL token mints (82 bytes) and accounts (165 bytes) of either token program. Accounts Agave does not parse fall back to base64, as in Agave. Accounts Agave does parse but this does not (sysvars, config, nonce, BPF loader, lookup tables, Token-2022 accounts with extensions, token multisigs) return an error instead of unparsed data. `rentEpoch` is always printed as 18446744073709551615, where Agave prints 0 for some genesis accounts. |
 
 ### Already in the base branch (not part of this patch)
 
@@ -116,6 +116,13 @@ current stake. This patch does not change that.
 - `getSignatureStatuses` matched Agave for successful transactions.
   The cluster produced no failed transactions during the check, so the
   failed-transaction path has not been seen working.
+- Parsed stake, token and vote output was compared with Agave over
+  whole programs: all 12 token accounts, all 76 vote accounts, 27,730
+  delegated and 4,285 undelegated stake accounts. They matched apart
+  from fields that changed between the two calls and `rentEpoch` on
+  one genesis account. No Token-2022 accounts, frozen or delegated
+  token accounts, or wrapped-SOL accounts exist on the cluster, so
+  those branches are unverified.
 - Agave on the test cluster does not serve `getBlock` or
   `getTransaction`. They were checked for internal consistency
   (blockhash chain, height, time, each signature's slot) and against

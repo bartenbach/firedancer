@@ -2224,7 +2224,8 @@ fd_rpc_owner_is_token_program_early( char const * owner_b58 ) {
 }
 
 /* fd_rpc_encode_account_parsed prints an account in Agave's jsonParsed
-   form.  Only vote accounts (v4 vote state) are parsed.  Returns 1 if
+   form.  Vote accounts (v4 vote state), stake accounts and plain SPL
+   token mints and accounts are parsed.  Returns 1 if
    the account object was printed, 0 if this is an account Agave does
    not parse either (the caller falls back to base64, as Agave does),
    -1 if Agave would parse it and this tile cannot. */
@@ -2235,15 +2236,104 @@ fd_rpc_encode_account_parsed( fd_rpc_tile_t * ctx,
                               uchar const *   owner,
                               ulong           lamports,
                               int             executable ) {
+  FD_BASE58_ENCODE_32_BYTES( owner, owner_b58 );
+
+  if( !memcmp( owner, fd_solana_stake_program_id.uc, 32UL ) ) {
+    /* StakeStateV2: u32 state, then Meta { rent_exempt_reserve,
+       authorized { staker, withdrawer }, lockup { unix_timestamp,
+       epoch, custodian } } at 4, then Stake { delegation { voter,
+       stake, activation_epoch, deactivation_epoch, (unused f64) },
+       credits_observed } at 124. */
+    if( FD_UNLIKELY( sz<4UL ) ) return -1;
+    uint state = FD_LOAD( uint, d );
+    if( FD_UNLIKELY( state>3U || ( (state==1U || state==2U) && sz<196UL ) ) ) return -1;
+    fd_http_server_printf( ctx->http, "{\"data\":{\"parsed\":{" );
+    if( state==1U || state==2U ) {
+      FD_BASE58_ENCODE_32_BYTES( d+12UL, staker_b58     );
+      FD_BASE58_ENCODE_32_BYTES( d+44UL, withdrawer_b58 );
+      FD_BASE58_ENCODE_32_BYTES( d+92UL, custodian_b58  );
+      fd_http_server_printf( ctx->http, "\"info\":{\"meta\":{\"authorized\":{\"staker\":\"%s\",\"withdrawer\":\"%s\"},\"lockup\":{\"custodian\":\"%s\",\"epoch\":%lu,\"unixTimestamp\":%ld},\"rentExemptReserve\":\"%lu\"},",
+                             staker_b58, withdrawer_b58, custodian_b58, FD_LOAD( ulong, d+84UL ), FD_LOAD( long, d+76UL ), FD_LOAD( ulong, d+4UL ) );
+      if( state==2U ) {
+        FD_BASE58_ENCODE_32_BYTES( d+124UL, voter_b58 );
+        fd_http_server_printf( ctx->http, "\"stake\":{\"creditsObserved\":%lu,\"delegation\":{\"activationEpoch\":\"%lu\",\"deactivationEpoch\":\"%lu\",\"stake\":\"%lu\",\"voter\":\"%s\"}}},",
+                               FD_LOAD( ulong, d+188UL ), FD_LOAD( ulong, d+164UL ), FD_LOAD( ulong, d+172UL ), FD_LOAD( ulong, d+156UL ), voter_b58 );
+      } else {
+        fd_http_server_printf( ctx->http, "\"stake\":null}," );
+      }
+    }
+    char const * type = state==0U ? "uninitialized" : state==1U ? "initialized" : state==2U ? "delegated" : "rewardsPool";
+    fd_http_server_printf( ctx->http, "\"type\":\"%s\"},\"program\":\"stake\",\"space\":%lu},\"executable\":%s,\"lamports\":%lu,\"owner\":\"%s\",\"rentEpoch\":18446744073709551615,\"space\":%lu}",
+                           type, sz, executable ? "true" : "false", lamports, owner_b58, sz );
+    return 1;
+  }
+
+  if( fd_rpc_owner_is_token_program_early( owner_b58 ) ) {
+    /* Plain SPL token mints (82 bytes) and accounts (165 bytes), of
+       either token program.  Token-2022 accounts with extensions and
+       multisigs are not parsed. */
+    char const * program = !strcmp( owner_b58, "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" ) ? "spl-token" : "spl-token-2022";
+    if( sz==82UL ) {
+      fd_http_server_printf( ctx->http, "{\"data\":{\"parsed\":{\"info\":{\"decimals\":%u,", (uint)d[ 44 ] );
+      if( FD_LOAD( uint, d+46UL ) ) { FD_BASE58_ENCODE_32_BYTES( d+50UL, k ); fd_http_server_printf( ctx->http, "\"freezeAuthority\":\"%s\",", k ); }
+      else                            fd_http_server_printf( ctx->http, "\"freezeAuthority\":null," );
+      fd_http_server_printf( ctx->http, "\"isInitialized\":%s,", d[ 45 ] ? "true" : "false" );
+      if( FD_LOAD( uint, d ) ) { FD_BASE58_ENCODE_32_BYTES( d+4UL, k ); fd_http_server_printf( ctx->http, "\"mintAuthority\":\"%s\",", k ); }
+      else                       fd_http_server_printf( ctx->http, "\"mintAuthority\":null," );
+      fd_http_server_printf( ctx->http, "\"supply\":\"%lu\"},\"type\":\"mint\"},\"program\":\"%s\",\"space\":%lu},\"executable\":%s,\"lamports\":%lu,\"owner\":\"%s\",\"rentEpoch\":18446744073709551615,\"space\":%lu}",
+                             FD_LOAD( ulong, d+36UL ), program, sz, executable ? "true" : "false", lamports, owner_b58, sz );
+      return 1;
+    }
+    if( FD_UNLIKELY( sz!=165UL ) ) return -1;
+
+    /* Copy what is needed out of the account first: reading the mint
+       for its decimals reuses the buffer d may point into. */
+    uchar mint[ 32 ], tok_owner[ 32 ], delegate[ 32 ], close_auth[ 32 ];
+    memcpy( mint, d, 32UL ); memcpy( tok_owner, d+32UL, 32UL ); memcpy( delegate, d+76UL, 32UL ); memcpy( close_auth, d+133UL, 32UL );
+    ulong amount        = FD_LOAD( ulong, d+64UL  );
+    uint  has_delegate  = FD_LOAD( uint,  d+72UL  );
+    uchar state         = d[ 108 ];
+    uint  is_native     = FD_LOAD( uint,  d+109UL );
+    ulong native_rent   = FD_LOAD( ulong, d+113UL );
+    ulong delegated_amt = FD_LOAD( ulong, d+121UL );
+    uint  has_close     = FD_LOAD( uint,  d+129UL );
+
+    ulong bank_idx = ctx->processed_idx!=ULONG_MAX ? ctx->processed_idx : ctx->finalized_idx;
+    if( FD_UNLIKELY( bank_idx==ULONG_MAX ) ) return -1;
+    ulong m_lamports; int m_exec; uchar m_owner[ 32UL ]; ulong m_len;
+    fd_accdb_read_one_nocache( ctx->accdb, ctx->banks[ bank_idx ].accdb_fork_id, mint, &m_lamports, &m_exec, m_owner, ctx->scratch.accdb_data_buf, &m_len );
+    if( FD_UNLIKELY( !m_lamports || m_len<82UL || memcmp( m_owner, owner, 32UL ) ) ) return -1;
+    uchar decimals = ctx->scratch.accdb_data_buf[ 44 ];
+
+    FD_BASE58_ENCODE_32_BYTES( mint,      mint_b58      );
+    FD_BASE58_ENCODE_32_BYTES( tok_owner, tok_owner_b58 );
+    fd_http_server_printf( ctx->http, "{\"data\":{\"parsed\":{\"info\":{" );
+    if( has_close ) { FD_BASE58_ENCODE_32_BYTES( close_auth, k ); fd_http_server_printf( ctx->http, "\"closeAuthority\":\"%s\",", k ); }
+    if( has_delegate ) {
+      FD_BASE58_ENCODE_32_BYTES( delegate, k );
+      fd_http_server_printf( ctx->http, "\"delegate\":\"%s\",\"delegatedAmount\":", k );
+      fd_rpc_print_ui_amount( ctx, delegated_amt, decimals );
+      fd_http_server_printf( ctx->http, "," );
+    }
+    fd_http_server_printf( ctx->http, "\"isNative\":%s,\"mint\":\"%s\",\"owner\":\"%s\",", is_native ? "true" : "false", mint_b58, tok_owner_b58 );
+    if( is_native ) {
+      fd_http_server_printf( ctx->http, "\"rentExemptReserve\":" );
+      fd_rpc_print_ui_amount( ctx, native_rent, decimals );
+      fd_http_server_printf( ctx->http, "," );
+    }
+    fd_http_server_printf( ctx->http, "\"state\":\"%s\",\"tokenAmount\":", state==1 ? "initialized" : state==2 ? "frozen" : "uninitialized" );
+    fd_rpc_print_ui_amount( ctx, amount, decimals );
+    fd_http_server_printf( ctx->http, "},\"type\":\"account\"},\"program\":\"%s\",\"space\":%lu},\"executable\":%s,\"lamports\":%lu,\"owner\":\"%s\",\"rentEpoch\":18446744073709551615,\"space\":%lu}",
+                           program, sz, executable ? "true" : "false", lamports, owner_b58, sz );
+    return 1;
+  }
+
   if( memcmp( owner, fd_solana_vote_program_id.uc, 32UL ) ) {
-    FD_BASE58_ENCODE_32_BYTES( owner, owner_b58 );
-    if( !memcmp( owner, fd_solana_stake_program_id.uc,                 32UL ) ||
-        !memcmp( owner, fd_solana_config_program_id.uc,                32UL ) ||
+    if( !memcmp( owner, fd_solana_config_program_id.uc,                32UL ) ||
         !memcmp( owner, fd_sysvar_owner_id.uc,                         32UL ) ||
         !memcmp( owner, fd_solana_bpf_loader_upgradeable_program_id.uc, 32UL ) ||
         !memcmp( owner, fd_solana_address_lookup_table_program_id.uc,  32UL ) ||
-        ( !memcmp( owner, fd_solana_system_program_id.uc, 32UL ) && sz==80UL ) || /* nonce */
-        fd_rpc_owner_is_token_program_early( owner_b58 ) ) return -1;
+        ( !memcmp( owner, fd_solana_system_program_id.uc, 32UL ) && sz==80UL ) ) return -1; /* nonce */
     return 0;
   }
 
@@ -2314,7 +2404,6 @@ fd_rpc_encode_account_parsed( fd_rpc_tile_t * ctx,
     fd_http_server_printf( ctx->http, "%s{\"confirmationCount\":%u,\"latency\":%u,\"slot\":%lu}", i ? "," : "",
                            FD_LOAD( uint, votes+i*13UL+9UL ), (uint)votes[ i*13UL ], FD_LOAD( ulong, votes+i*13UL+1UL ) );
   }
-  FD_BASE58_ENCODE_32_BYTES( owner, owner_b58 );
   fd_http_server_printf( ctx->http, "]},\"type\":\"vote\"},\"program\":\"vote\",\"space\":%lu},\"executable\":%s,\"lamports\":%lu,\"owner\":\"%s\",\"rentEpoch\":18446744073709551615,\"space\":%lu}",
                          sz, executable ? "true" : "false", lamports, owner_b58, sz );
   return 1;
@@ -2344,7 +2433,7 @@ fd_rpc_encode_account_data( fd_rpc_tile_t *             ctx,
     if( FD_UNLIKELY( parsed<0 ) ) {
       FD_BASE58_ENCODE_32_BYTES( acct_owner, owner_b58 );
       fd_http_server_unstage( ctx->http );
-      *err_response = PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32065,\"message\":\"Firedancer Error: jsonParsed is only supported for vote accounts (v4 vote state), not for accounts of program %s\"},\"id\":%s}\n", owner_b58, id_cstr );
+      *err_response = PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32065,\"message\":\"Firedancer Error: jsonParsed is supported for vote (v4), stake and plain SPL token accounts; this account of program %s is not one of those\"},\"id\":%s}\n", owner_b58, id_cstr );
       return 0;
     }
     encoding_cstr = "base64"; /* a program Agave does not parse either */
