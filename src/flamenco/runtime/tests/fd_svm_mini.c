@@ -504,7 +504,7 @@ fd_svm_mini_reset( fd_svm_mini_t *        mini,
   FD_TEST( shmem );
 
   /* Re-truncate memfd */
-  FD_TEST( 0==ftruncate( accdb_fd, 0 ) );
+  if( !mini->skip_fd_truncate ) FD_TEST( 0==ftruncate( accdb_fd, 0 ) );
 
   /* Re-initialize accdb join in place */
   fd_accdb_t * accdb = fd_accdb_join( fd_accdb_new( mini->accdb_join_mem, shmem, accdb_fd, 0UL, NULL, NULL, 0UL, 1 ) );

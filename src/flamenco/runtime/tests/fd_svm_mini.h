@@ -47,6 +47,7 @@ struct fd_svm_mini {
 
   /* Saved accdb init params for reset */
   int                  accdb_fd;
+  int                  skip_fd_truncate; /* reset does not ftruncate accdb_fd: set by embedders that run sandboxed */
   void *               accdb_shmem_mem;
   void *               accdb_join_mem;
   ulong                accdb_max_accounts;

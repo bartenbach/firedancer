@@ -40,7 +40,9 @@ not been reviewed by the Firedancer team.
 | `getTransaction` | recent transaction window | Encodings `json`, `base64`, `base58` (no `jsonParsed`). `meta` has the result, fee, compute units, lamport balances before and after, and the addresses loaded from lookup tables. `logMessages`, `innerInstructions`, `preTokenBalances`, `postTokenBalances` and `rewards` are always null. Lookup-table addresses are read from the table as it is now, not as it was at the transaction's slot. Failed-instruction errors as for `getSignatureStatuses`. |
 | `getBlock` | recent transaction window | `transactionDetails` `full`, `signatures` or `none` (not `accounts`). Transactions as for `getTransaction`. `rewards` is always null. A block is served only while every one of its transactions is in the window; otherwise "Block not available". |
 | `getSignaturesForAddress` | recent transaction window | Matches addresses written in the transaction itself. **A transaction that only reaches the address through a lookup table is not found.** `limit`, `before`, `until` are supported. Each call walks the whole window. |
-| `getStakeMinimumDelegation` | a built-in table | The real answer comes from running the cluster's stake program, which the tile cannot do. It answers from a table of clusters whose value was read off an Agave node, keyed by genesis hash. The table has one entry: the Alpenglow community cluster (1 SOL). **On any other cluster it returns an error.** |
+| `simulateTransaction` | a private runtime inside the RPC tile | See "The transaction simulator" below. `sigVerify`, `replaceRecentBlockhash`, `accounts` (base64 only), `encoding` base58/base64. Returns `err`, `logs`, `unitsConsumed`, `returnData`, `fee`, `loadedAccountsDataSize`, `loadedAddresses`, lamport and token balances before and after, and the requested accounts. `innerInstructions` is always null. A transaction that already landed is simulated again rather than reported as `AlreadyProcessed`. |
+| `getStakeMinimumDelegation` | the simulator | Simulates the stake program's `GetMinimumDelegation` instruction and returns what the program answers, as Agave does. |
+| `getHighestSnapshotSlot` | the snapshot writer's messages | The newest full snapshot the node has on disk and the newest incremental built on it. Only on a node that writes snapshots (the RPC tile reads `snapmk_out`); otherwise "No snapshot". **Not seen returning a value**: the check node does not write snapshots. |
 | `sendTransaction` | UDP to upcoming leaders | The transaction is parsed, its signatures verified and, unless `skipPreflight`, its blockhash checked. It is then sent as a UDP datagram to the TPU port of the leaders of the next 4 rotations and resent every rotation until it is seen in a block or 150 slots pass. **There is no simulation**: a transaction that would fail on chain is still sent. A leader that advertises no TPU UDP port (Agave takes QUIC only) is skipped, and so is this node itself when it is the leader. `maxRetries`, `preflightCommitment` and `minContextSlot` are ignored. At most 256 transactions are kept for resending. |
 | `jsonParsed` encoding | account data | Parsed for vote accounts (v4 vote state), stake accounts, and plain SPL token mints (82 bytes) and accounts (165 bytes) of either token program. Accounts Agave does not parse fall back to base64, as in Agave. Accounts Agave does parse but this does not (sysvars, config, nonce, BPF loader, lookup tables, Token-2022 accounts with extensions, token multisigs) return an error instead of unparsed data. `rentEpoch` is always printed as 18446744073709551615, where Agave prints 0 for some genesis accounts. |
 
@@ -58,9 +60,7 @@ current stake. This patch does not change that.
 
 | Method | Why |
 |---|---|
-| `getInflationReward` | No per-epoch reward history. |
-| `getHighestSnapshotSlot` | The tile is not told which snapshots are on disk; replay announces a snapshot only to the snapshot writer. |
-| `simulateTransaction` | Needs a transaction executor in the RPC tile. |
+| `getInflationReward` | No per-epoch reward history. (Agave on the test cluster does not answer it either.) |
 | `requestAirdrop` | Needs a faucet. |
 
 ### Things to know before running it
@@ -84,6 +84,28 @@ current stake. This patch does not change that.
 - **Blocks this node produces as leader have not been checked.** The
   window is fed by replay. The check node was not a leader, so whether
   a node's own blocks reach the window is unknown.
+- **The transaction simulator.** `simulateTransaction` does not use the
+  validator's execution path. The RPC tile holds a second, private
+  runtime (accounts database, program cache, status cache, bank) built
+  from `fd_svm_mini`, the environment Firedancer's own runtime tests
+  use; that file moves from the test library into `fd_flamenco` for
+  this. For each call the tile resets the private runtime, copies in
+  the bank's sysvars and recent blockhashes, the transaction's
+  accounts, the programdata of any upgradeable program among them and
+  whatever its lookup tables resolve to, runs the transaction with the
+  live feature set, and reads off the result. Nothing is shared with
+  replay or the exec tiles, so a simulation cannot change what the
+  validator executes or commits.
+  - It reserves about 5.4 GB of address space, paged in lazily; what
+    is actually used depends on the programs and accounts simulated.
+  - The first simulation after start took 2.6 s; later ones well under
+    100 ms including the network round trip.
+  - It runs in the tile's sandbox with no new system calls allowed.
+  - The private bank carries the feature set, rent, epoch schedule,
+    slot and blockhashes of the live bank, and nothing else of it. A
+    program that depends on other bank state (stake or vote program
+    instructions that read epoch stakes, for instance) may behave
+    differently than on chain. That has not been explored.
 - **The patch is not confined to the RPC tile.** Besides one wiring
   line in `topology.c`, it adds transaction balances to the message
   the execution tiles send replay (`fd_execrp_tile.c`, `fd_execrp.h`)
@@ -116,6 +138,17 @@ current stake. This patch does not change that.
 - `getSignatureStatuses` matched Agave for successful transactions.
   The cluster produced no failed transactions during the check, so the
   failed-transaction path has not been seen working.
+- `simulateTransaction` was compared with Agave on 14 cases: a system
+  transfer (ok, more than the balance, to a new account, unknown fee
+  payer, stale blockhash, bad signature with `sigVerify`), two
+  instructions with the second failing, an SPL token transfer through
+  the on-chain token program (ok and failing), the stake program's
+  `GetMinimumDelegation` (return data), requested accounts, too many
+  requested accounts, and base58 input. 13 matched field for field
+  including logs, compute units and loaded data size; the other
+  differed only in `rentEpoch` of the system program account. Not
+  tried: v0 transactions with lookup tables, v1 transactions, programs
+  that make cross-program calls, large programs, Token-2022.
 - Parsed stake, token and vote output was compared with Agave over
   whole programs: all 12 token accounts, all 76 vote accounts, 27,730
   delegated and 4,285 undelegated stake accounts. They matched apart
@@ -131,6 +164,7 @@ current stake. This patch does not change that.
   sampled. Every sampled block held one transaction, legacy or v1: v0
   transactions, lookup tables, memos and multi-transaction blocks have
   not been seen.
+- `getStakeMinimumDelegation` returned 1 SOL, as Agave does there.
 - The `test_rpc_tile` and `test_execrp_tile` unit tests pass.
   `test_replay_tile` and `test_sched` could not be run on the test
   machine (no huge pages).

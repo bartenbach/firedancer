@@ -1011,6 +1011,8 @@ fd_topo_initialize( config_t * config ) {
        Unreliable: the rpc tile must never backpressure replay_out,
        which dedup and pack also read. */
     fd_topob_tile_in( topo, "rpc",    0UL, "metric_in", "replay_out",   0UL, FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
+    /* snapshots found, created and deleted, for getHighestSnapshotSlot */
+    if( snapmk_enabled ) fd_topob_tile_in( topo, "rpc", 0UL, "metric_in", "snapmk_out", 0UL, FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
   }
 
   if( FD_UNLIKELY( solcap_enabled ) ) {
