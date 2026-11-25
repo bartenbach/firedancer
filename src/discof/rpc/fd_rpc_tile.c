@@ -2446,14 +2446,91 @@ fd_rpc_encode_account_parsed( fd_rpc_tile_t * ctx,
     return 1;
   }
 
-  if( memcmp( owner, fd_solana_vote_program_id.uc, 32UL ) ) {
-    if( !memcmp( owner, fd_solana_config_program_id.uc,                32UL ) ||
-        !memcmp( owner, fd_sysvar_owner_id.uc,                         32UL ) ||
-        !memcmp( owner, fd_solana_bpf_loader_upgradeable_program_id.uc, 32UL ) ||
-        !memcmp( owner, fd_solana_address_lookup_table_program_id.uc,  32UL ) ||
-        ( !memcmp( owner, fd_solana_system_program_id.uc, 32UL ) && sz==80UL ) ) return -1; /* nonce */
-    return 0;
+# define FD_RPC_PARSED_TAIL( type, program ) \
+    fd_http_server_printf( ctx->http, ",\"type\":\"%s\"},\"program\":\"%s\",\"space\":%lu},\"executable\":%s,\"lamports\":%lu,\"owner\":\"%s\",\"rentEpoch\":18446744073709551615,\"space\":%lu}", \
+                           (type), (program), sz, executable ? "true" : "false", lamports, owner_b58, sz )
+
+  if( !memcmp( owner, fd_solana_system_program_id.uc, 32UL ) && sz==80UL ) {
+    /* nonce account: version, state, authority, durable nonce, fee */
+    if( FD_UNLIKELY( FD_LOAD( uint, d+4UL )!=1U ) ) return -1;
+    FD_BASE58_ENCODE_32_BYTES( d+8UL,  authority_b58 );
+    FD_BASE58_ENCODE_32_BYTES( d+40UL, nonce_b58     );
+    fd_http_server_printf( ctx->http, "{\"data\":{\"parsed\":{\"info\":{\"authority\":\"%s\",\"blockhash\":\"%s\",\"feeCalculator\":{\"lamportsPerSignature\":\"%lu\"}}", authority_b58, nonce_b58, FD_LOAD( ulong, d+72UL ) );
+    FD_RPC_PARSED_TAIL( "initialized", "nonce" );
+    return 1;
   }
+
+  if( !memcmp( owner, fd_solana_address_lookup_table_program_id.uc, 32UL ) ) {
+    /* type, deactivation slot, last extended slot, start index,
+       optional authority, padding; addresses from byte 56 */
+    if( FD_UNLIKELY( sz<56UL || FD_LOAD( uint, d )!=1U ) ) return -1;
+    fd_http_server_printf( ctx->http, "{\"data\":{\"parsed\":{\"info\":{\"addresses\":[" );
+    for( ulong i=0UL; 56UL+32UL*(i+1UL)<=sz; i++ ) {
+      FD_BASE58_ENCODE_32_BYTES( d+56UL+32UL*i, a_b58 );
+      fd_http_server_printf( ctx->http, "%s\"%s\"", i ? "," : "", a_b58 );
+    }
+    fd_http_server_printf( ctx->http, "]," );
+    if( d[ 21 ] ) { FD_BASE58_ENCODE_32_BYTES( d+22UL, auth_b58 ); fd_http_server_printf( ctx->http, "\"authority\":\"%s\",", auth_b58 ); }
+    fd_http_server_printf( ctx->http, "\"deactivationSlot\":\"%lu\",\"lastExtendedSlot\":\"%lu\",\"lastExtendedSlotStartIndex\":%u}", FD_LOAD( ulong, d+4UL ), FD_LOAD( ulong, d+12UL ), (uint)d[ 20 ] );
+    FD_RPC_PARSED_TAIL( "lookupTable", "address-lookup-table" );
+    return 1;
+  }
+
+  if( !memcmp( owner, fd_solana_bpf_loader_upgradeable_program_id.uc, 32UL ) ) {
+    uint state = sz>=4UL ? FD_LOAD( uint, d ) : 0U;
+    if( state==2U && sz>=36UL ) {
+      FD_BASE58_ENCODE_32_BYTES( d+4UL, pd_b58 );
+      fd_http_server_printf( ctx->http, "{\"data\":{\"parsed\":{\"info\":{\"programData\":\"%s\"}", pd_b58 );
+      FD_RPC_PARSED_TAIL( "program", "bpf-upgradeable-loader" );
+      return 1;
+    }
+    if( state==3U && sz>=45UL ) {
+      /* slot, optional upgrade authority, then the program bytes */
+      fd_http_server_printf( ctx->http, "{\"data\":{\"parsed\":{\"info\":{" );
+      if( d[ 12 ] ) { FD_BASE58_ENCODE_32_BYTES( d+13UL, auth_b58 ); fd_http_server_printf( ctx->http, "\"authority\":\"%s\",", auth_b58 ); }
+      else            fd_http_server_printf( ctx->http, "\"authority\":null," );
+      fd_http_server_printf( ctx->http, "\"data\":[\"" );
+      ulong   enc_sz = FD_BASE64_ENC_SZ( sz-45UL );
+      uchar * enc    = fd_http_server_append_start( ctx->http, enc_sz );
+      if( FD_UNLIKELY( !enc ) ) { fd_http_server_unstage( ctx->http ); return -1; }
+      fd_http_server_append_end( ctx->http, fd_base64_encode( (char *)enc, d+45UL, sz-45UL ) );
+      fd_http_server_printf( ctx->http, "\",\"base64\"],\"slot\":%lu}", FD_LOAD( ulong, d+4UL ) );
+      FD_RPC_PARSED_TAIL( "programData", "bpf-upgradeable-loader" );
+      return 1;
+    }
+    return -1; /* buffer or uninitialized */
+  }
+
+  if( !memcmp( owner, fd_solana_config_program_id.uc, 32UL ) ) {
+    /* [short vec of (key, signer)][u64 length][JSON text].  Agave parses
+       validator info records and leaves other config accounts as
+       base64; so does this. */
+    static uchar const validator_info_id[ 32 ] = { 0x07,0x51,0x97,0x01,0x74,0x48,0xf2,0xac,0x5d,0xc2,0x3c,0x9e,0xbc,0x7a,0xc7,0x8c,
+                                                   0x0a,0x27,0x25,0x7a,0xc6,0x14,0x45,0x8d,0xe0,0xa4,0xf1,0x6f,0x80,0x00,0x00,0x00 };
+    if( sz<1UL || (d[ 0 ] & 0x80) ) return 0;
+    ulong key_cnt = d[ 0 ];
+    ulong off     = 1UL+33UL*key_cnt;
+    if( !key_cnt || off+8UL>sz || memcmp( d+1UL, validator_info_id, 32UL ) ) return 0;
+    ulong json_len = FD_LOAD( ulong, d+off ); off += 8UL;
+    if( json_len>sz-off ) return 0;
+    /* embed the record only if it is one well formed JSON object */
+    fd_jtok_t j[1]; char const * raw; ulong raw_sz;
+    fd_jtok_init( j, (char const *)d+off, json_len );
+    if( fd_jtok_peek( j )!=FD_JTOK_OBJ ) return 0;
+    fd_jtok_raw( j, &raw, &raw_sz );
+    if( fd_jtok_err( j ) ) return 0;
+    fd_http_server_printf( ctx->http, "{\"data\":{\"parsed\":{\"info\":{\"configData\":%.*s,\"keys\":[", (int)raw_sz, raw );
+    for( ulong i=0UL; i<key_cnt; i++ ) {
+      FD_BASE58_ENCODE_32_BYTES( d+1UL+33UL*i, k_b58 );
+      fd_http_server_printf( ctx->http, "%s{\"pubkey\":\"%s\",\"signer\":%s}", i ? "," : "", k_b58, d[ 1UL+33UL*i+32UL ] ? "true" : "false" );
+    }
+    fd_http_server_printf( ctx->http, "]}" );
+    FD_RPC_PARSED_TAIL( "validatorInfo", "config" );
+    return 1;
+  }
+# undef FD_RPC_PARSED_TAIL
+
+  if( memcmp( owner, fd_solana_vote_program_id.uc, 32UL ) ) return 0;
 
   /* bincode v4 vote state, see fd_rpc_vote_v4_last_vote for the layout */
   if( FD_UNLIKELY( sz<4UL || FD_LOAD( uint, d )!=fd_vote_state_versioned_enum_v4 ) ) return -1;
@@ -2551,7 +2628,7 @@ fd_rpc_encode_account_data( fd_rpc_tile_t *             ctx,
     if( FD_UNLIKELY( parsed<0 ) ) {
       FD_BASE58_ENCODE_32_BYTES( acct_owner, owner_b58 );
       fd_http_server_unstage( ctx->http );
-      *err_response = PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32065,\"message\":\"Firedancer Error: jsonParsed is supported for vote (v4), stake, sysvar and plain SPL token accounts; this account of program %s is not one of those\"},\"id\":%s}\n", owner_b58, id_cstr );
+      *err_response = PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32065,\"message\":\"Firedancer Error: jsonParsed could not parse this account of program %s (unsupported state or layout)\"},\"id\":%s}\n", owner_b58, id_cstr );
       return 0;
     }
     encoding_cstr = "base64"; /* a program Agave does not parse either */
@@ -5754,6 +5831,7 @@ simulateTransaction( fd_rpc_tile_t *         ctx,
   if( fd_rpc_cfg_member( config, "encoding", v ) && v->kind==FD_RPC_VAL_STR ) fd_rpc_val_cstr( v, enc, sizeof(enc) );
   int sig_verify      = fd_rpc_cfg_member( config, "sigVerify",              v ) && v->kind==FD_RPC_VAL_BOOL && v->raw_sz==4UL;
   int replace_bh      = fd_rpc_cfg_member( config, "replaceRecentBlockhash", v ) && v->kind==FD_RPC_VAL_BOOL && v->raw_sz==4UL;
+  int want_inner      = fd_rpc_cfg_member( config, "innerInstructions",      v ) && v->kind==FD_RPC_VAL_BOOL && v->raw_sz==4UL;
   if( FD_UNLIKELY( sig_verify && replace_bh ) ) return fd_rpc_err_msg( ctx, id_cstr, -32602, "sigVerify may not be used with replaceRecentBlockhash" );
 
   static char  txt[ 2UL*FD_TXN_MTU_V0 ];
@@ -5850,7 +5928,30 @@ simulateTransaction( fd_rpc_tile_t *         ctx,
   fd_rpc_print_sim_err( ctx, r );
   if( r->fee_charged ) fd_http_server_printf( ctx->http, ",\"fee\":%lu", r->fee );
   else                 fd_http_server_printf( ctx->http, ",\"fee\":null" );
-  fd_http_server_printf( ctx->http, ",\"innerInstructions\":null,\"loadedAccountsDataSize\":%lu,\"loadedAddresses\":{\"readonly\":[", r->loaded_accounts_data_size );
+  if( !want_inner ) {
+    fd_http_server_printf( ctx->http, ",\"innerInstructions\":null" );
+  } else {
+    /* The runtime's trace lists every instruction in execution order.
+       Stack height 1 is a top level instruction; whatever follows it
+       at a greater height was invoked from it. */
+    fd_http_server_printf( ctx->http, ",\"innerInstructions\":[" );
+    ulong top = ULONG_MAX, groups = 0UL; int open = 0;
+    for( ulong i=0UL; ; i++ ) {
+      fd_instr_info_t const * ix = fd_rpc_sim_trace( ctx->sim, i );
+      if( !ix ) break;
+      if( ix->stack_height<=1 ) { top = top==ULONG_MAX ? 0UL : top+1UL; if( open ) { fd_http_server_printf( ctx->http, "]}" ); open = 0; } continue; }
+      if( !open ) { fd_http_server_printf( ctx->http, "%s{\"index\":%lu,\"instructions\":[", groups++ ? "," : "", top ); open = 1; }
+      else          fd_http_server_printf( ctx->http, "," );
+      fd_http_server_printf( ctx->http, "{\"accounts\":[" );
+      for( ulong k=0UL; k<ix->acct_cnt; k++ ) fd_http_server_printf( ctx->http, "%s%u", k ? "," : "", (uint)ix->accounts[ k ].index_in_transaction );
+      fd_http_server_printf( ctx->http, "],\"data\":\"" );
+      fd_rpc_print_base58( ctx, ix->data, fd_ulong_min( ix->data_sz, FD_TXN_MTU_V0 ) );
+      fd_http_server_printf( ctx->http, "\",\"programIdIndex\":%u,\"stackHeight\":%u}", (uint)ix->program_id, (uint)ix->stack_height );
+    }
+    if( open ) fd_http_server_printf( ctx->http, "]}" );
+    fd_http_server_printf( ctx->http, "]" );
+  }
+  fd_http_server_printf( ctx->http, ",\"loadedAccountsDataSize\":%lu,\"loadedAddresses\":{\"readonly\":[", r->loaded_accounts_data_size );
   /* accounts past the static ones were loaded from lookup tables:
      writable first, then read-only */
   {

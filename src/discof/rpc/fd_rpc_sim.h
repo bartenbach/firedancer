@@ -103,6 +103,13 @@ fd_rpc_sim_account( fd_rpc_sim_t *  sim,
                     ulong *         data_len,
                     ulong *         pre_lamports );
 
+/* fd_rpc_sim_trace returns the i-th instruction the transaction ran,
+   in execution order, top level and inner alike (stack_height 1 is top
+   level), or NULL past the end.  Valid until fd_rpc_sim_end. */
+fd_instr_info_t const *
+fd_rpc_sim_trace( fd_rpc_sim_t const * sim,
+                  ulong                i );
+
 void
 fd_rpc_sim_end( fd_rpc_sim_t * sim );
 

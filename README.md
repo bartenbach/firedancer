@@ -40,11 +40,11 @@ not been reviewed by the Firedancer team.
 | `getTransaction` | recent transaction window | Encodings `json`, `base64`, `base58` (no `jsonParsed`). `meta` has the result, fee, compute units, lamport balances before and after, and the addresses loaded from lookup tables. `logMessages`, `innerInstructions`, `preTokenBalances`, `postTokenBalances` and `rewards` are always null. Lookup-table addresses are read from the table as it is now, not as it was at the transaction's slot. Failed-instruction errors as for `getSignatureStatuses`. |
 | `getBlock` | recent transaction window | `transactionDetails` `full`, `signatures` or `none` (not `accounts`). Transactions as for `getTransaction`. `rewards` is always null. A block is served only while every one of its transactions is in the window; otherwise "Block not available". |
 | `getSignaturesForAddress` | recent transaction window | Matches addresses written in the transaction itself. **A transaction that only reaches the address through a lookup table is not found.** `limit`, `before`, `until` are supported. Each call walks the whole window. |
-| `simulateTransaction` | a private runtime inside the RPC tile | See "The transaction simulator" below. `sigVerify`, `replaceRecentBlockhash`, `accounts` (base64 only), `encoding` base58/base64. Returns `err`, `logs`, `unitsConsumed`, `returnData`, `fee`, `loadedAccountsDataSize`, `loadedAddresses`, lamport and token balances before and after, and the requested accounts. `innerInstructions` is always null. A transaction that already landed is simulated again rather than reported as `AlreadyProcessed`. |
+| `simulateTransaction` | a private runtime inside the RPC tile | See "The transaction simulator" below. `sigVerify`, `replaceRecentBlockhash`, `accounts` (base64 only), `encoding` base58/base64. Returns `err`, `logs`, `unitsConsumed`, `returnData`, `fee`, `loadedAccountsDataSize`, `loadedAddresses`, lamport and token balances before and after, the requested accounts, and `innerInstructions` when asked for. Inner instructions are given in compiled form (account indexes, base58 data); Agave gives them parsed for programs it knows. A transaction that already landed is simulated again rather than reported as `AlreadyProcessed`. |
 | `getStakeMinimumDelegation` | the simulator | Simulates the stake program's `GetMinimumDelegation` instruction and returns what the program answers, as Agave does. |
 | `getHighestSnapshotSlot` | the snapshot writer's messages | The newest full snapshot the node has on disk and the newest incremental built on it. Only on a node that writes snapshots (`[layout] enable_snapshot_production = true`, which the Firedancer defaults mark as unsupported); otherwise "No snapshot". With it on, the check node reported the same full snapshot slot as Agave and its incremental slot followed each new file. |
 | `sendTransaction` | UDP to upcoming leaders | The transaction is parsed, its signatures verified and, unless `skipPreflight`, its blockhash checked. It is then sent as a UDP datagram to the TPU port of the leaders of the next 4 rotations and resent every rotation until it is seen in a block or 150 slots pass. **There is no simulation**: a transaction that would fail on chain is still sent. A leader that advertises no TPU UDP port (Agave takes QUIC only) is skipped, and so is this node itself when it is the leader. `maxRetries`, `preflightCommitment` and `minContextSlot` are ignored. At most 256 transactions are kept for resending. |
-| `jsonParsed` encoding | account data | Parsed for vote accounts (v4 vote state), stake accounts, plain SPL token mints (82 bytes) and accounts (165 bytes) of either token program, and the sysvars clock, epochSchedule, rent, lastRestartSlot, epochRewards, recentBlockhashes, slotHashes, slotHistory and stakeHistory. Accounts Agave does not parse fall back to base64, as in Agave. Accounts Agave does parse but this does not (config, nonce, BPF loader, lookup tables, Token-2022 accounts with extensions, token multisigs) return an error instead of unparsed data. `rentEpoch` is always printed as 18446744073709551615, where Agave prints 0 for accounts not rewritten since genesis. A sysvar is parsed only where its address is known to the encoder (`getAccountInfo`, `getMultipleAccounts`, `getProgramAccounts`). |
+| `jsonParsed` encoding | account data | Parsed: vote accounts (v4 vote state), stake accounts, plain SPL token mints (82 bytes) and accounts (165 bytes) of either token program, nonce accounts, address lookup tables, upgradeable-loader program and programData accounts, validator info records, and the sysvars clock, epochSchedule, rent, lastRestartSlot, epochRewards, recentBlockhashes, slotHashes, slotHistory and stakeHistory. Accounts Agave does not parse fall back to base64, as in Agave. Not parsed, and returned as an error rather than as unparsed data: Token-2022 accounts with extensions, token multisigs, loader buffer accounts, uninitialized nonce accounts, pre-v4 vote states. `rentEpoch` is always printed as 18446744073709551615, where Agave prints 0 for accounts not rewritten since genesis. A sysvar is parsed only where its address is known to the encoder (`getAccountInfo`, `getMultipleAccounts`, `getProgramAccounts`). |
 
 ### Already in the base branch (not part of this patch)
 
@@ -147,8 +147,16 @@ current stake. This patch does not change that.
   requested accounts, and base58 input. 13 matched field for field
   including logs, compute units and loaded data size; the other
   differed only in `rentEpoch` of the system program account. Not
-  tried: v0 transactions with lookup tables, v1 transactions, programs
-  that make cross-program calls, large programs, Token-2022.
+  tried: v0 transactions with lookup tables, large programs,
+  Token-2022.
+- Nonce, lookup table, program, programData and validator info
+  parsing matched Agave on every such account on the cluster (one
+  nonce account and one lookup table, both created for the purpose; 26
+  loader accounts; 52 validator info records).
+- A real lookup-table extend transaction (v1 format, with a call into
+  the system program) was simulated on both: result, logs, compute
+  units and balances matched; inner instructions carried the same
+  instruction in the two different forms.
 - Parsed sysvars were compared with Agave at the same finalized slot:
   all nine matched, including the million-bit slot history, apart
   from `rentEpoch` on three of them.

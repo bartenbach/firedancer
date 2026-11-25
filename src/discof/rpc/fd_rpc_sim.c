@@ -256,6 +256,14 @@ fd_rpc_sim_account( fd_rpc_sim_t *  sim,
   return 1;
 }
 
+fd_instr_info_t const *
+fd_rpc_sim_trace( fd_rpc_sim_t const * sim,
+                  ulong                i ) {
+  fd_runtime_t const * runtime = sim->mini->runtime;
+  if( FD_UNLIKELY( !sim->executed || i>=runtime->instr.trace_length || i>=FD_MAX_INSTRUCTION_TRACE_LENGTH ) ) return NULL;
+  return &runtime->instr.trace[ i ];
+}
+
 void
 fd_rpc_sim_end( fd_rpc_sim_t * sim ) {
   if( FD_UNLIKELY( !sim->executed ) ) return;
