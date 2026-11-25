@@ -47,6 +47,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <stdlib.h>
 
 #define ZSTD_STATIC_LINKING_ONLY
 #include <zstd.h>
@@ -2216,8 +2217,16 @@ fd_rpc_print_ui_amount_fields( fd_rpc_tile_t * ctx,
     s[ len ] = '\0';
   }
   double ui = (double)amount / pow( 10.0, (double)decimals ); /* one division, as Agave does */
-  fd_http_server_printf( ctx->http, "\"amount\":\"%lu\",\"decimals\":%u,\"uiAmount\":%.*g,\"uiAmountString\":\"%s\"",
-                         amount, (uint)decimals, 17, ui, s );
+  /* shortest text that reads back as the same double, with ".0" on a
+     whole number, as Agave prints floats */
+  char ui_cstr[ 40 ];
+  for( int prec=1; prec<=17; prec++ ) {
+    snprintf( ui_cstr, sizeof(ui_cstr), "%.*g", prec, ui );
+    if( strtod( ui_cstr, NULL )==ui ) break;
+  }
+  if( !strpbrk( ui_cstr, ".eEn" ) ) strcat( ui_cstr, ".0" );
+  fd_http_server_printf( ctx->http, "\"amount\":\"%lu\",\"decimals\":%u,\"uiAmount\":%s,\"uiAmountString\":\"%s\"",
+                         amount, (uint)decimals, ui_cstr, s );
 }
 
 static void
@@ -4466,6 +4475,12 @@ getSignatureStatuses( fd_rpc_tile_t *         ctx,
   ulong next_slot;
   if( FD_UNLIKELY( !fd_rpc_slot_history_load( ctx, tip, &next_slot ) ) ) return fd_rpc_err_msg( ctx, id_cstr, -32065, "Firedancer Error: slot history unavailable" );
 
+  /* Like Agave, a plain query only covers the recent status cache (the
+     last 300 slots); older transactions need searchTransactionHistory,
+     which here means the whole recent transaction window. */
+  fd_rpc_val_t sv[1];
+  int search_history = fd_rpc_cfg_member( &params->v[ 1 ], "searchTransactionHistory", sv ) && sv->kind==FD_RPC_VAL_BOOL && sv->raw_sz==4UL;
+
   fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"result\":{\"context\":{\"apiVersion\":\"%s\",\"slot\":%lu},\"value\":[", FD_RPC_AGAVE_API_VERSION, tip->slot );
   fd_jtok_t j[1];
   ulong n = 0UL;
@@ -4484,7 +4499,7 @@ getSignatureStatuses( fd_rpc_tile_t *         ctx,
     }
     fd_rpc_txn_rec_t const * rec = fd_rpc_txn_query( ctx, sig, tip, next_slot );
     if( n>1UL ) fd_http_server_printf( ctx->http, "," );
-    if( !rec ) { fd_http_server_printf( ctx->http, "null" ); continue; }
+    if( !rec || ( !search_history && tip->slot>rec->slot+300UL ) ) { fd_http_server_printf( ctx->http, "null" ); continue; }
 
     char const * level = rec->slot<=finalized ? "finalized" : rec->slot<=confirmed ? "confirmed" : "processed";
     fd_http_server_printf( ctx->http, "{\"confirmationStatus\":\"%s\",", level );
@@ -4650,7 +4665,21 @@ fd_rpc_print_txn( fd_rpc_tile_t *          ctx,
       fd_http_server_printf( ctx->http, "\",\"programIdIndex\":%u,\"stackHeight\":1}", (uint)ix->program_id );
     }
     fd_http_server_printf( ctx->http, "]" );
-    if( txn->transaction_version!=FD_TXN_VLEGACY ) {
+    if( txn->transaction_version==FD_TXN_V1 ) {
+      /* v1 has no lookup tables; it carries its compute budget in the
+         header, each field present only if its mask bit is set */
+      uint          mask = fd_uint_load_4( p+4UL );
+      uchar const * cv   = p+txn->v1_txn_config_values_off;
+      fd_http_server_printf( ctx->http, ",\"transactionConfig\":{" );
+      ulong fee = 0UL; int has_fee = 0;
+      if( mask & 1U ) { fee = FD_LOAD( ulong, cv ); cv += 8UL; has_fee = 1; }
+      if( (mask>>2)&1U ) { fd_http_server_printf( ctx->http, "\"computeUnitLimit\":%u,", FD_LOAD( uint, cv ) ); cv += 4UL; } else fd_http_server_printf( ctx->http, "\"computeUnitLimit\":null," );
+      uint lads = 0U; int has_lads = 0;
+      if( (mask>>3)&1U ) { lads = FD_LOAD( uint, cv ); cv += 4UL; has_lads = 1; }
+      if( (mask>>4)&1U ) fd_http_server_printf( ctx->http, "\"heapSize\":%u,", FD_LOAD( uint, cv ) ); else fd_http_server_printf( ctx->http, "\"heapSize\":null," );
+      if( has_lads ) fd_http_server_printf( ctx->http, "\"loadedAccountsDataSizeLimit\":%u,", lads ); else fd_http_server_printf( ctx->http, "\"loadedAccountsDataSizeLimit\":null," );
+      if( has_fee ) fd_http_server_printf( ctx->http, "\"priorityFee\":%lu}", fee ); else fd_http_server_printf( ctx->http, "\"priorityFee\":null}" );
+    } else if( txn->transaction_version!=FD_TXN_VLEGACY ) {
       fd_txn_acct_addr_lut_t const * luts = fd_txn_get_address_tables_const( txn );
       fd_http_server_printf( ctx->http, ",\"addressTableLookups\":[" );
       for( ulong i=0UL; i<txn->addr_table_lookup_cnt; i++ ) {

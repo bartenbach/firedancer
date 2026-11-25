@@ -36,7 +36,7 @@ not been reviewed by the Firedancer team.
 | `getSupply` | full account scan | Everything is reported as circulating; the non-circulating list is empty. |
 | `getTokenAccountBalance`, `getTokenSupply` | account read | |
 | `getTokenAccountsByOwner`, `getTokenAccountsByDelegate`, `getTokenLargestAccounts` | full account scan | No `jsonParsed`. |
-| `getSignatureStatuses` | recent transaction window | See "The recent transaction window" below. A failed transaction is reported as failed, but when an instruction failed the error is `{"InstructionError":[null,null]}`: which instruction and why is not known to the tile. `confirmations` is the number of slots since the transaction's slot, not Agave's count. `searchTransactionHistory` is ignored. |
+| `getSignatureStatuses` | recent transaction window | See "The recent transaction window" below. A failed transaction is reported as failed, but when an instruction failed the error is `{"InstructionError":[null,null]}`: which instruction and why is not known to the tile. `confirmations` is the number of slots since the transaction's slot, not Agave's count. Without `searchTransactionHistory` only the last 300 slots are searched, as in Agave; with it, the whole window. |
 | `getTransaction` | recent transaction window | Encodings `json`, `base64`, `base58` (no `jsonParsed`). `meta` has the result, fee, compute units, lamport balances before and after, and the addresses loaded from lookup tables. `logMessages`, `innerInstructions`, `preTokenBalances`, `postTokenBalances` and `rewards` are always null. Lookup-table addresses are read from the table as it is now, not as it was at the transaction's slot. Failed-instruction errors as for `getSignatureStatuses`. |
 | `getBlock` | recent transaction window | `transactionDetails` `full`, `signatures` or `none` (not `accounts`). Transactions as for `getTransaction`. `rewards` is always null. A block is served only while every one of its transactions is in the window; otherwise "Block not available". |
 | `getSignaturesForAddress` | recent transaction window | Matches addresses written in the transaction itself. **A transaction that only reaches the address through a lookup table is not found.** `limit`, `before`, `until` are supported. Each call walks the whole window. |
@@ -130,8 +130,8 @@ current stake. This patch does not change that.
 - The 4.5 CLI sends **v1 transactions** (message first, signatures
   last, fee settings in the header). `getFeeForMessage`,
   `sendTransaction` and the history calls handle them. The `json`
-  rendering of a v1 transaction (`"version":1`, with the same message
-  fields as v0) has nothing to be compared against and is unverified.
+  rendering of a v1 transaction matches Agave's (checked once Agave's
+  transaction history was switched on).
 - Twenty read-only `solana` CLI commands (`validators`,
   `block-production`, `stakes`, `vote-account`, `supply`, `block`,
   `largest-accounts`, ...) ran against the patched node without error.
