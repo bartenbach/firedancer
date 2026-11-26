@@ -1011,6 +1011,11 @@ fd_topo_initialize( config_t * config ) {
        Unreliable: the rpc tile must never backpressure replay_out,
        which dedup and pack also read. */
     fd_topob_tile_in( topo, "rpc",    0UL, "metric_in", "replay_out",   0UL, FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
+    /* logs, inner instructions and return data of landed transactions,
+       for getTransaction and getBlock.  Unreliable for the same reason. */
+    FOR(execrp_tile_cnt) fd_topob_link( topo, "execrp_rpc", "execrp_replay", 512UL, sizeof(fd_execrp_txn_meta_t), 1UL )->permit_no_producers = 0;
+    FOR(execrp_tile_cnt) fd_topob_tile_out( topo, "execrp", i, "execrp_rpc", i );
+    FOR(execrp_tile_cnt) fd_topob_tile_in( topo, "rpc", 0UL, "metric_in", "execrp_rpc", i, FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
     /* snapshots found, created and deleted, for getHighestSnapshotSlot */
     if( snapmk_enabled ) fd_topob_tile_in( topo, "rpc", 0UL, "metric_in", "snapmk_out", 0UL, FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
   }

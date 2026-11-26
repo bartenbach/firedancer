@@ -13,6 +13,8 @@
 #include "../../ballet/blake3/fd_blake3.h" /* for FD_BLAKE3_XN_MAX */
 #include "../../flamenco/runtime/tests/fd_dump_pb.h"
 #include "../../flamenco/progcache/fd_progcache_user.h"
+#include "../../flamenco/runtime/fd_system_ids.h"
+#include "../../ballet/base58/fd_base58.h"
 #include "../../flamenco/log_collector/fd_log_collector_base.h"
 #include "../../disco/events/generated/fd_event_gen.h"
 #include "../../flamenco/events/fd_event_runtime.h"
@@ -52,6 +54,8 @@ struct fd_execrp_tile {
   /* link-related data structures. */
   link_ctx_t            replay_in[ 1 ];
   link_ctx_t            execrp_replay_out[ 1 ];
+  link_ctx_t            execrp_rpc_out[ 1 ]; /* idx ULONG_MAX if the topology has no RPC server */
+  fd_pubkey_t           token_2022_id;
 
   fd_ed25519_verifier_t * verifier;
   fd_footer_cache_t *     footer_cache;
@@ -199,6 +203,10 @@ publish_txn_finalized_msg( fd_execrp_tile_t *  ctx,
   msg->txn_exec->is_fees_only    = ctx->txn_out.err.is_fees_only;
   msg->txn_exec->is_noop         = ctx->txn_out.err.is_noop;
   msg->txn_exec->txn_err         = ctx->txn_out.err.txn_err;
+  msg->txn_exec->exec_err        = ctx->txn_out.err.exec_err;
+  msg->txn_exec->exec_err_kind   = ctx->txn_out.err.exec_err_kind;
+  msg->txn_exec->exec_err_idx    = ctx->txn_out.err.exec_err_idx;
+  msg->txn_exec->custom_err      = ctx->txn_out.err.custom_err;
 
   msg->txn_exec->tick_load_start        = ctx->txn_out.details.load_start_ticks;
   msg->txn_exec->tick_check_start       = ctx->txn_out.details.check_start_ticks;
@@ -321,6 +329,66 @@ returnable_frag( fd_execrp_tile_t *  ctx,
           }
           if( !ok && cnt ) ctx->bal_post[ 0 ] = fd_ulong_sat_sub( ctx->bal_pre[ 0 ], fd_ulong_sat_add( ctx->txn_out.details.execution_fee, ctx->txn_out.details.priority_fee ) );
           if( complete ) ctx->bal_cnt = cnt;
+        }
+
+        /* Logs, instruction trace and return data for the RPC server. */
+        if( FD_UNLIKELY( ctx->execrp_rpc_out->idx!=ULONG_MAX && ctx->txn_out.err.is_committable && !ctx->txn_out.err.is_noop ) ) {
+          fd_execrp_txn_meta_t * meta = fd_chunk_to_laddr( ctx->execrp_rpc_out->mem, ctx->execrp_rpc_out->chunk );
+          fd_txn_t const *       txn  = TXN( ctx->txn_in.txn );
+          memcpy( meta->sig, (uchar const *)ctx->txn_in.txn->payload+txn->signature_off, 64UL );
+          meta->slot = ctx->bank->f.slot;
+
+          ulong inner_sz = 0UL; int truncated = 0;
+          /* a fees-only transaction never ran: the trace and the log
+             buffer still hold the previous transaction's */
+          int   ran       = !ctx->txn_out.err.is_fees_only;
+          ulong trace_cnt = ran ? fd_ulong_min( ctx->runtime->instr.trace_length, FD_MAX_INSTRUCTION_TRACE_LENGTH ) : 0UL;
+          for( ulong i=0UL; i<trace_cnt; i++ ) {
+            fd_instr_info_t const * ix = &ctx->runtime->instr.trace[ i ];
+            ulong acct_cnt = fd_ulong_min( ix->acct_cnt, 255UL );
+            ulong need     = 5UL+acct_cnt+(ulong)ix->data_sz;
+            if( FD_UNLIKELY( inner_sz+need>FD_EXECRP_TXN_META_INNER_MAX ) ) { truncated = 1; break; }
+            uchar * o = meta->inner+inner_sz;
+            o[ 0 ] = ix->stack_height;
+            o[ 1 ] = ix->program_id;
+            o[ 2 ] = (uchar)acct_cnt;
+            FD_STORE( ushort, o+3UL, ix->data_sz );
+            for( ulong k=0UL; k<acct_cnt; k++ ) o[ 5UL+k ] = (uchar)ix->accounts[ k ].index_in_transaction;
+            memcpy( o+5UL+acct_cnt, ix->data, ix->data_sz );
+            inner_sz += need;
+          }
+          meta->inner_sz        = (uint)inner_sz;
+          meta->inner_truncated = (uchar)truncated;
+
+          fd_compute_budget_details_t const * cb = &ctx->txn_out.details.compute_budget;
+          meta->has_cu      = (uchar)ran;
+          meta->cu_consumed = ran && cb->compute_unit_limit>=cb->compute_meter ? (uint)( cb->compute_unit_limit-cb->compute_meter ) : 0U;
+
+          int has_token = !ctx->txn_out.accounts.is_setup;
+          for( ulong i=0UL; !has_token && i<ctx->txn_out.accounts.cnt; i++ ) {
+            fd_acc_t const * acc = ctx->txn_out.accounts.account[ i ];
+            uchar const *    key = ctx->txn_out.accounts.keys[ i ].uc;
+            has_token = !acc ||
+                        !memcmp( key,        fd_solana_spl_token_id.uc, 32UL ) || !memcmp( key,        ctx->token_2022_id.uc, 32UL ) ||
+                        !memcmp( acc->owner, fd_solana_spl_token_id.uc, 32UL ) || !memcmp( acc->owner, ctx->token_2022_id.uc, 32UL );
+          }
+          meta->has_token = (uchar)has_token;
+
+          ulong return_sz = ran ? ctx->txn_out.details.return_data.len : 0UL;
+          meta->has_return = (uchar)( return_sz>0UL && return_sz<=FD_EXECRP_TXN_META_RETURN_MAX );
+          meta->return_sz  = meta->has_return ? (uint)return_sz : 0U;
+          if( meta->has_return ) {
+            memcpy( meta->return_program, ctx->txn_out.details.return_data.program_id.uc, 32UL );
+            memcpy( meta->return_data,    ctx->txn_out.details.return_data.data,          return_sz );
+          }
+
+          ulong log_sz = ran ? fd_ulong_min( ctx->log_collector.buf_sz, FD_EXECRP_TXN_META_LOG_MAX ) : 0UL;
+          memcpy( meta->log, ctx->log_collector.buf, log_sz );
+          meta->log_sz = (uint)log_sz;
+
+          ulong sz = offsetof( fd_execrp_txn_meta_t, log )+log_sz;
+          fd_stem_publish( stem, ctx->execrp_rpc_out->idx, 0UL, ctx->execrp_rpc_out->chunk, sz, 0UL, 0UL, 0UL );
+          ctx->execrp_rpc_out->chunk = fd_dcache_compact_next( ctx->execrp_rpc_out->chunk, sz, ctx->execrp_rpc_out->chunk0, ctx->execrp_rpc_out->wmark );
         }
 
         if( FD_LIKELY( ctx->txn_out.err.is_committable ) ) {
@@ -555,6 +623,16 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->replay_in->wmark  = fd_dcache_compact_wmark( ctx->replay_in->mem, replay_in_link->dcache, replay_in_link->mtu );
   ctx->replay_in->chunk  = ctx->replay_in->chunk0;
 
+  FD_TEST( fd_base58_decode_32( "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb", ctx->token_2022_id.uc ) );
+  ctx->execrp_rpc_out->idx = fd_topo_find_tile_out_link( topo, tile, "execrp_rpc", ctx->tile_idx );
+  if( ctx->execrp_rpc_out->idx!=ULONG_MAX ) {
+    fd_topo_link_t const * rpc_link = &topo->links[ tile->out_link_id[ ctx->execrp_rpc_out->idx ] ];
+    ctx->execrp_rpc_out->mem    = topo->workspaces[ topo->objs[ rpc_link->dcache_obj_id ].wksp_id ].wksp;
+    ctx->execrp_rpc_out->chunk0 = fd_dcache_compact_chunk0( ctx->execrp_rpc_out->mem, rpc_link->dcache );
+    ctx->execrp_rpc_out->wmark  = fd_dcache_compact_wmark( ctx->execrp_rpc_out->mem, rpc_link->dcache, rpc_link->mtu );
+    ctx->execrp_rpc_out->chunk  = ctx->execrp_rpc_out->chunk0;
+  }
+
   ctx->execrp_replay_out->idx = fd_topo_find_tile_out_link( topo, tile, "execrp_replay", ctx->tile_idx );
   if( FD_LIKELY( ctx->execrp_replay_out->idx!=ULONG_MAX ) ) {
     fd_topo_link_t const * execrp_replay_link = &topo->links[ tile->out_link_id[ ctx->execrp_replay_out->idx ] ];
@@ -643,6 +721,8 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->runtime->status_cache             = ctx->txncache;
   memset( &ctx->runtime->log, 0, sizeof(ctx->runtime->log) );
   ctx->runtime->log.log_collector        = &ctx->log_collector;
+  /* program logs are only collected if the RPC server wants them */
+  ctx->runtime->log.enable_log_collector = ctx->execrp_rpc_out->idx!=ULONG_MAX;
   ctx->runtime->log.dumping_mem          = _dumping;
   ctx->runtime->log.tracing_mem          = NULL;
   ctx->runtime->log.capture_ctx          = ctx->capture_ctx;
@@ -695,7 +775,7 @@ populate_allowed_fds( fd_topo_t const *      topo FD_PARAM_UNUSED,
   return out_cnt;
 }
 
-#define STEM_BURST (1UL)
+#define STEM_BURST (2UL)
 
 /* replay_execrp credits are returned per frag, so housekeeping only
    needs to keep up with the execrp_replay out link. */

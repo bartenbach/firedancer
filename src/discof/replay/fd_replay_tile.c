@@ -625,7 +625,7 @@ publish_replay_out( fd_replay_tile_t *  ctx,
                     ulong               sig,
                     ulong               sz ) {
   ulong tspub = fd_frag_meta_ts_comp( fd_tickcount() );
-  if( FD_UNLIKELY( sig!=REPLAY_SIG_TXN_EXECUTED && sig!=REPLAY_SIG_SLOT_STATES ) ) {
+  if( FD_UNLIKELY( sig!=REPLAY_SIG_TXN_EXECUTED && sig!=REPLAY_SIG_SLOT_STATES && sig!=REPLAY_SIG_REWARDS ) ) {
     fd_replay_out_link_t * out = sig==REPLAY_SIG_MISSING_FEC ? ctx->rotor_out : ctx->slot_out;
     if( FD_LIKELY( out->idx!=ULONG_MAX ) ) { /* backtest has no rotor */
       fd_memcpy( fd_chunk_to_laddr( out->mem, out->chunk ), fd_chunk_to_laddr_const( ctx->replay_out->mem, ctx->replay_out->chunk ), sz );
@@ -1408,9 +1408,15 @@ publish_txn_executed( fd_replay_tile_t *  ctx,
   txn_executed->priority_fee = txn_info->priority_fee;
   txn_executed->tips = txn_info->tips;
   txn_executed->bal_cnt = 0UL;
+  txn_executed->has_exec_err = 0;
   if( FD_LIKELY( ctx->txn_bal_cache[ txn_idx % FD_REPLAY_TXN_BAL_CACHE_CNT ].txn_idx==txn_idx ) ) {
     ulong bal_cnt = ctx->txn_bal_cache[ txn_idx % FD_REPLAY_TXN_BAL_CACHE_CNT ].cnt;
     txn_executed->bal_cnt = bal_cnt;
+    txn_executed->has_exec_err  = 1;
+    txn_executed->exec_err      = ctx->txn_bal_cache[ txn_idx % FD_REPLAY_TXN_BAL_CACHE_CNT ].exec_err;
+    txn_executed->exec_err_kind = ctx->txn_bal_cache[ txn_idx % FD_REPLAY_TXN_BAL_CACHE_CNT ].exec_err_kind;
+    txn_executed->exec_err_idx  = ctx->txn_bal_cache[ txn_idx % FD_REPLAY_TXN_BAL_CACHE_CNT ].exec_err_idx;
+    txn_executed->custom_err    = ctx->txn_bal_cache[ txn_idx % FD_REPLAY_TXN_BAL_CACHE_CNT ].custom_err;
     fd_memcpy( txn_executed->pre_lamports,  ctx->txn_bal_cache[ txn_idx % FD_REPLAY_TXN_BAL_CACHE_CNT ].pre,  bal_cnt*sizeof(ulong) );
     fd_memcpy( txn_executed->post_lamports, ctx->txn_bal_cache[ txn_idx % FD_REPLAY_TXN_BAL_CACHE_CNT ].post, bal_cnt*sizeof(ulong) );
     ctx->txn_bal_cache[ txn_idx % FD_REPLAY_TXN_BAL_CACHE_CNT ].txn_idx = ULONG_MAX;
@@ -3484,6 +3490,27 @@ after_credit( fd_replay_tile_t *  ctx,
   states->cnt = fd_sched_slot_states_drain( ctx->sched, states->states );
   if( FD_UNLIKELY( states->cnt ) ) publish_replay_out( ctx, stem, REPLAY_SIG_SLOT_STATES, sizeof(fd_replay_slot_states_t) );
 
+  /* Drain queued epoch rewards, one batch per call. */
+  fd_reward_log_t * rlog = ctx->reward_log;
+  if( FD_UNLIKELY( rlog->head!=rlog->tail ) ) {
+    fd_replay_rewards_t * msg = fd_chunk_to_laddr( ctx->replay_out->mem, ctx->replay_out->chunk );
+    ulong cnt = fd_ulong_min( rlog->tail-rlog->head, FD_REPLAY_REWARDS_BATCH_MAX );
+    msg->seq     = rlog->head;
+    msg->dropped = rlog->dropped;
+    msg->cnt     = cnt;
+    for( ulong i=0UL; i<cnt; i++ ) {
+      fd_reward_rec_t const * rec = &rlog->recs[ (rlog->head+i) & (rlog->max-1UL) ];
+      memcpy( msg->recs[ i ].pubkey, rec->pubkey, 32UL );
+      msg->recs[ i ].slot          = rec->slot;
+      msg->recs[ i ].lamports_pre  = rec->lamports_pre;
+      msg->recs[ i ].lamports_post = rec->lamports_post;
+      msg->recs[ i ].kind          = rec->kind;
+      msg->recs[ i ].pad           = 0U;
+    }
+    rlog->head += cnt;
+    publish_replay_out( ctx, stem, REPLAY_SIG_REWARDS, sizeof(fd_replay_rewards_t) );
+  }
+
   if( FD_UNLIKELY( ctx->halt_replay && !ctx->is_leader ) ) return;
   if( FD_UNLIKELY( !ctx->is_booted || !ctx->wfs_complete ) ) return;
 
@@ -3631,6 +3658,10 @@ process_exec_task_done( fd_replay_tile_t *          ctx,
         ulong bal_cnt = fd_ulong_min( (ulong)msg->txn_exec->bal_cnt, MAX_TX_ACCOUNT_LOCKS );
         ctx->txn_bal_cache[ txn_idx % FD_REPLAY_TXN_BAL_CACHE_CNT ].txn_idx = txn_idx;
         ctx->txn_bal_cache[ txn_idx % FD_REPLAY_TXN_BAL_CACHE_CNT ].cnt     = bal_cnt;
+        ctx->txn_bal_cache[ txn_idx % FD_REPLAY_TXN_BAL_CACHE_CNT ].exec_err      = msg->txn_exec->exec_err;
+        ctx->txn_bal_cache[ txn_idx % FD_REPLAY_TXN_BAL_CACHE_CNT ].exec_err_kind = msg->txn_exec->exec_err_kind;
+        ctx->txn_bal_cache[ txn_idx % FD_REPLAY_TXN_BAL_CACHE_CNT ].exec_err_idx  = msg->txn_exec->exec_err_idx;
+        ctx->txn_bal_cache[ txn_idx % FD_REPLAY_TXN_BAL_CACHE_CNT ].custom_err    = msg->txn_exec->custom_err;
         fd_memcpy( ctx->txn_bal_cache[ txn_idx % FD_REPLAY_TXN_BAL_CACHE_CNT ].pre,  msg->txn_exec->pre_lamports,  bal_cnt*sizeof(ulong) );
         fd_memcpy( ctx->txn_bal_cache[ txn_idx % FD_REPLAY_TXN_BAL_CACHE_CNT ].post, msg->txn_exec->post_lamports, bal_cnt*sizeof(ulong) );
       }
@@ -4731,6 +4762,12 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->lthash_rec->max  = FD_SCHED_LTHASH_START_WRITES_MAX;
   ctx->lthash_rec->keys = lthash_rec_keys;
   for( ulong i=0UL; i<FD_REPLAY_TXN_BAL_CACHE_CNT; i++ ) ctx->txn_bal_cache[ i ].txn_idx = ULONG_MAX;
+  ctx->reward_log->recs    = ctx->reward_log_recs;
+  ctx->reward_log->max     = FD_REPLAY_REWARD_LOG_MAX;
+  ctx->reward_log->head    = 0UL;
+  ctx->reward_log->tail    = 0UL;
+  ctx->reward_log->dropped = 0UL;
+  fd_reward_log_tl         = ctx->reward_log;
   ulong execrp_result_obj_id = fd_pod_query_ulong( topo->props, "execrp_result", ULONG_MAX );
   FD_TEST( execrp_result_obj_id!=ULONG_MAX );
   ctx->execrp_result = fd_topo_obj_laddr( topo, execrp_result_obj_id );
@@ -5014,7 +5051,7 @@ during_housekeeping( fd_replay_tile_t * ctx ) {
    slot dead plus one txn_executed per transaction.  Every
    after_credit path that publishes returns nonzero, which skips the
    input poll, except REPLAY_SIG_SLOT_STATES, which adds one to each. */
-#define STEM_BURST (fd_ulong_max( 5UL, FD_EXECRP_SIGVERIFY_SIG_PARA+2UL ))
+#define STEM_BURST (fd_ulong_max( 6UL, FD_EXECRP_SIGVERIFY_SIG_PARA+3UL ))
 
 /* Housekeeping interval in ticks, tuned independently of output-link
    depths. */

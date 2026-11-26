@@ -36,10 +36,13 @@ not been reviewed by the Firedancer team.
 | `getSupply` | full account scan | Everything is reported as circulating; the non-circulating list is empty. |
 | `getTokenAccountBalance`, `getTokenSupply` | account read | |
 | `getTokenAccountsByOwner`, `getTokenAccountsByDelegate`, `getTokenLargestAccounts` | full account scan | No `jsonParsed`. |
-| `getSignatureStatuses` | recent transaction window | See "The recent transaction window" below. A failed transaction is reported as failed, but when an instruction failed the error is `{"InstructionError":[null,null]}`: which instruction and why is not known to the tile. `confirmations` is the number of slots since the transaction's slot, not Agave's count. Without `searchTransactionHistory` only the last 300 slots are searched, as in Agave; with it, the whole window. |
-| `getTransaction` | recent transaction window | Encodings `json`, `base64`, `base58` (no `jsonParsed`). `meta` has the result, fee, compute units, lamport balances before and after, and the addresses loaded from lookup tables. `logMessages`, `innerInstructions`, `preTokenBalances`, `postTokenBalances` and `rewards` are always null. Lookup-table addresses are read from the table as it is now, not as it was at the transaction's slot. Failed-instruction errors as for `getSignatureStatuses`. |
-| `getBlock` | recent transaction window | `transactionDetails` `full`, `signatures` or `none` (not `accounts`). Transactions as for `getTransaction`. `rewards` is always null. A block is served only while every one of its transactions is in the window; otherwise "Block not available". |
+| `getSignatureStatuses` | recent transaction window | See "The recent transaction window" below. A failed transaction carries the failed instruction and its error, as Agave prints it. Without `searchTransactionHistory` only the last 300 slots are searched, as in Agave; with it, the whole window. |
+| `getTransaction` | recent transaction window, plus what the exec tiles report | Encodings `json`, `base64`, `base58`. **No `jsonParsed`.** `meta` has the result, fee, `computeUnitsConsumed`, `costUnits`, lamport balances before and after, loaded addresses, `logMessages`, `innerInstructions` and `returnData`. **Token balances are not reported**: `preTokenBalances` and `postTokenBalances` are `[]` when no token program or token-owned account is involved and `null` otherwise. Logs and inner instructions are `null` for a transaction whose report the tile missed or no longer keeps (see "Logs and inner instructions" below). |
+| `getBlock` | recent transaction window | `transactionDetails` `full`, `signatures` or `none` (**not `accounts`**). Transactions as for `getTransaction`. **Block rewards are not reported**: `rewards` is `[]` for a block that collected no fees and paid no epoch rewards, `null` otherwise (Agave lists the fee reward and, at the start of an epoch, the vote and stake rewards). A block is served only while every one of its transactions is in the window; otherwise "Block not available". |
 | `getSignaturesForAddress` | recent transaction window | Matches addresses written in the transaction itself. **A transaction that only reaches the address through a lookup table is not found.** `limit`, `before`, `until` are supported. Each call walks the whole window. |
+| `getInflationReward` | rewards recorded as replay pays them | See "Epoch rewards" below. Up to 32 addresses, the previous epoch by default or `epoch`. Only the two most recent reward epochs, and only if the node was running when they were paid; otherwise "Block not available". `commission` and `blockRewardAmount` are always null. |
+| `signatureSubscribe`, `signatureUnsubscribe` (websocket) | recent transaction window | One notification when the transaction reaches the requested commitment, then the subscription ends. A transaction that is already there is notified on the next slot. `enableReceivedNotification` is ignored. At most 256 pending subscriptions in total; the oldest is dropped beyond that. |
+| `accountSubscribe`, `accountUnsubscribe` (websocket) | account read on every commitment change | The account is re-read each time the subscribed commitment level moves and a notification is sent if it changed. Encodings as `getAccountInfo`. At most 256 subscriptions in total. |
 | `simulateTransaction` | a private runtime inside the RPC tile | See "The transaction simulator" below. `sigVerify`, `replaceRecentBlockhash`, `accounts` (base64 only), `encoding` base58/base64. Returns `err`, `logs`, `unitsConsumed`, `returnData`, `fee`, `loadedAccountsDataSize`, `loadedAddresses`, lamport and token balances before and after, the requested accounts, and `innerInstructions` when asked for. Inner instructions are given in compiled form (account indexes, base58 data); Agave gives them parsed for programs it knows. A transaction that already landed is simulated again rather than reported as `AlreadyProcessed`. |
 | `getStakeMinimumDelegation` | the simulator | Simulates the stake program's `GetMinimumDelegation` instruction and returns what the program answers, as Agave does. |
 | `getHighestSnapshotSlot` | the snapshot writer's messages | The newest full snapshot the node has on disk and the newest incremental built on it. Only on a node that writes snapshots (`[layout] enable_snapshot_production = true`, which the Firedancer defaults mark as unsupported); otherwise "No snapshot". With it on, the check node reported the same full snapshot slot as Agave and its incremental slot followed each new file. |
@@ -60,7 +63,10 @@ current stake. This patch does not change that.
 
 | Method | Why |
 |---|---|
-| `getInflationReward` | No per-epoch reward history. (Agave on the test cluster does not answer it either.) |
+| `getTransaction`, `getBlock` with `jsonParsed` | Needs an instruction parser for every program Agave knows. |
+| `getBlock` with `transactionDetails: "accounts"` | Not written. |
+| Token balances and block rewards in transaction history | See the `getTransaction` and `getBlock` rows. |
+| `logsSubscribe`, `programSubscribe`, `blockSubscribe`, `rootSubscribe` and the other websocket subscriptions | Not written. Only slot, vote, signature and account subscriptions exist. |
 | `requestAirdrop` | Needs a faucet. |
 
 ### Things to know before running it
@@ -75,7 +81,7 @@ current stake. This patch does not change that.
 - **The recent transaction window.** `getTransaction`, `getBlock`,
   `getSignaturesForAddress` and `getSignatureStatuses` answer from the
   last 131,072 transactions this node replayed, held in memory (about
-  320 MB in the RPC tile). There is no history from before the node
+  330 MB in the RPC tile). There is no history from before the node
   started, none survives a restart, and nothing older than the window
   is known. The RPC tile reads replay's per-transaction messages from
   the `replay_out` link unreliably, so it cannot backpressure replay,
@@ -106,14 +112,42 @@ current stake. This patch does not change that.
     program that depends on other bank state (stake or vote program
     instructions that read epoch stakes, for instance) may behave
     differently than on chain. That has not been explored.
-- **The patch is not confined to the RPC tile.** Besides one wiring
-  line in `topology.c`, it adds transaction balances to the message
-  the execution tiles send replay (`fd_execrp_tile.c`, `fd_execrp.h`)
-  and to the message replay publishes (`fd_replay_tile.c`). Those
-  changes copy data out; they do not change what is executed or
+- **The patch is not confined to the RPC tile.** It also changes:
+  - the execution tiles (`fd_execrp_tile.c`, `fd_execrp.h`): each
+    reports a transaction's balances and failed-instruction detail to
+    replay, and publishes its logs, instruction trace and return data
+    on a new `execrp_rpc` link that only the RPC tile reads;
+  - **program log collection is switched on in the execution tiles**
+    whenever the RPC tile is in the topology. Stock Firedancer runs
+    with it off. Its cost on a busy cluster has not been measured;
+  - replay (`fd_replay_tile.c`): passes the above along and publishes
+    epoch rewards in batches;
+  - the runtime (`fd_rewards.c`, `fd_rewards.h`, `fd_accdb_svm.c`): a
+    thread-local hook that records each vote and stake reward as it is
+    credited. It is NULL, and does nothing, in every tile but replay;
+  - `topology.c`: the links.
+
+  These changes copy data out; they do not change what is executed or
   committed. The node ran in step with the cluster with them in place,
-  but this is the execution path of a validator: review it before
-  running it on anything that matters.
+  and Firedancer's own reward and execution unit tests pass, but this
+  is the execution path of a validator: review it before running it on
+  anything that matters.
+- **Logs and inner instructions.** Kept in a 256 MB ring in the RPC
+  tile (paged in as it fills), matched to a transaction by signature
+  and slot. They come over an unreliable link, so a transaction the
+  tile was too slow to read has `null` logs. Transactions in blocks
+  this node produced itself as leader go through a different execution
+  tile and have none. Inner instructions are in compiled form (account
+  indexes, base58 data), which is what Agave returns for the `json`,
+  `base64` and `base58` encodings.
+- **Epoch rewards.** Two tables of 4 million entries each (about 270 MB
+  each, paged in as they fill) hold the rewards of the two most recent
+  epochs. Like the transaction window they are memory only: after a
+  restart the node answers "Block not available" for an epoch until it
+  has watched one being paid from the start. If the tile misses a batch
+  the whole epoch is marked incomplete and answers the same error
+  rather than a wrong `null`. A vote account whose reward was zero
+  comes back `null` where Agave returns an entry with amount 0.
 - **A scan is not a point-in-time view.** Accounts written while a scan
   runs may or may not be included.
 - **How it was checked.** Each call was issued to an Agave 4.5.0-beta.0
@@ -135,9 +169,24 @@ current stake. This patch does not change that.
 - Twenty read-only `solana` CLI commands (`validators`,
   `block-production`, `stakes`, `vote-account`, `supply`, `block`,
   `largest-accounts`, ...) ran against the patched node without error.
-- `getSignatureStatuses` matched Agave for successful transactions.
-  The cluster produced no failed transactions during the check, so the
-  failed-transaction path has not been seen working.
+- Transaction history was compared with an Agave node that records
+  history, on five fresh transactions (three transfers, a lookup
+  table extend with an inner call, and a nonce withdrawal that fails
+  with `InsufficientFunds`). `getTransaction` matched field for field
+  in `json` and `base64`, including logs, inner instructions, compute
+  units and the error of the failed one; so did
+  `getSignatureStatuses` and `getSignaturesForAddress`. `getBlock`
+  matched except for `rewards`. Every transaction was in the v1
+  format with a single signer; v0 transactions, lookup tables in use,
+  return data in a landed transaction and blocks with many
+  transactions have not been seen.
+- **An earlier version of this patch printed the block cost as
+  `computeUnitsConsumed`.** That is fixed: the cost is `costUnits` and
+  `computeUnitsConsumed` is what the programs used.
+- Websocket: with `signatureSubscribe` (three commitment levels) and
+  `accountSubscribe` (base64 and jsonParsed) open on both nodes, one
+  transfer produced the same notifications from each. Unsubscribe and
+  the error replies matched too.
 - `simulateTransaction` was compared with Agave on 14 cases: a system
   transfer (ok, more than the balance, to a new account, unknown fee
   payer, stale blockhash, bad signature with `sigVerify`), two
@@ -167,16 +216,9 @@ current stake. This patch does not change that.
   one genesis account. No Token-2022 accounts, frozen or delegated
   token accounts, or wrapped-SOL accounts exist on the cluster, so
   those branches are unverified.
-- Agave on the test cluster does not serve `getBlock` or
-  `getTransaction`. They were checked for internal consistency
-  (blockhash chain, height, time, each signature's slot) and against
-  another operator's independent Firedancer RPC gateway, where full
-  blocks and transactions matched field for field on the blocks
-  sampled. Every sampled block held one transaction, legacy or v1: v0
-  transactions, lookup tables, memos and multi-transaction blocks have
-  not been seen.
 - `getStakeMinimumDelegation` returned 1 SOL, as Agave does there.
-- The `test_rpc_tile` and `test_execrp_tile` unit tests pass.
+- The `test_rpc_tile`, `test_execrp_tile`, `test_svm_mini`,
+  `test_inflation_rewards` and `test_accdb_svm` unit tests pass.
   `test_replay_tile` and `test_sched` could not be run on the test
   machine (no huge pages).
 - The patch adds no unit tests of its own.

@@ -99,6 +99,55 @@ fd_rewards_get_reward_distribution_num_blocks( fd_epoch_schedule_t const * epoch
                                                ulong                       total_stake_accounts,
                                                ulong                       stake_account_stores_per_block );
 
+/* Reward log.  A tile that wants to know which accounts were paid an
+   epoch reward (the RPC server answers getInflationReward from it)
+   points fd_reward_log_tl at a log.  Every vote and stake reward the
+   runtime then credits on this thread is appended to it.  NULL (the
+   default) disables it. */
+
+#define FD_REWARD_KIND_VOTE  (0U)
+#define FD_REWARD_KIND_STAKE (1U)
+
+struct fd_reward_rec {
+  uchar pubkey[ 32 ];
+  ulong slot;          /* slot of the block that paid the reward */
+  ulong lamports_pre;
+  ulong lamports_post;
+  uint  kind;          /* FD_REWARD_KIND_* */
+  uint  pad;
+};
+typedef struct fd_reward_rec fd_reward_rec_t;
+
+struct fd_reward_log {
+  fd_reward_rec_t * recs;    /* ring of max records, max a power of 2 */
+  ulong             max;
+  ulong             head;    /* cumulative count consumed by the owner */
+  ulong             tail;    /* cumulative count appended */
+  ulong             dropped; /* cumulative count that did not fit */
+};
+typedef struct fd_reward_log fd_reward_log_t;
+
+extern FD_TL fd_reward_log_t * fd_reward_log_tl;
+
+static inline void
+fd_reward_log_push( uint          kind,
+                    uchar const * pubkey,
+                    ulong         slot,
+                    ulong         lamports_pre,
+                    ulong         lamports_post ) {
+  fd_reward_log_t * log = fd_reward_log_tl;
+  if( FD_LIKELY( !log ) ) return;
+  if( FD_UNLIKELY( log->tail-log->head>=log->max ) ) { log->dropped++; return; }
+  fd_reward_rec_t * rec = &log->recs[ log->tail & (log->max-1UL) ];
+  memcpy( rec->pubkey, pubkey, 32UL );
+  rec->slot          = slot;
+  rec->lamports_pre  = lamports_pre;
+  rec->lamports_post = lamports_post;
+  rec->kind          = kind;
+  rec->pad           = 0U;
+  log->tail++;
+}
+
 struct fd_commission_split {
   ulong voter_portion;
   ulong staker_portion;

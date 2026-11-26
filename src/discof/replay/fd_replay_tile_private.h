@@ -19,6 +19,7 @@
 #include "../../flamenco/progcache/fd_progcache.h"
 #include "../../flamenco/alpenglow/fd_alpenglow.h"
 #include "../../flamenco/runtime/fd_bank.h"
+#include "../../flamenco/rewards/fd_rewards.h"
 #include "../../flamenco/runtime/fd_txncache.h"
 #include "../../flamenco/runtime/tests/fd_dump_pb.h"
 #include "../../disco/events/generated/fd_event_gen.h"
@@ -244,9 +245,20 @@ struct fd_replay_tile {
   struct {
     ulong txn_idx; /* ULONG_MAX if empty */
     ulong cnt;
+    int   exec_err;
+    int   exec_err_kind;
+    uint  exec_err_idx;
+    uint  custom_err;
     ulong pre [ MAX_TX_ACCOUNT_LOCKS ];
     ulong post[ MAX_TX_ACCOUNT_LOCKS ];
   } txn_bal_cache[ FD_REPLAY_TXN_BAL_CACHE_CNT ];
+
+  /* Epoch rewards credited by the runtime, queued until after_credit
+     has published them on replay_out (a block pays a few thousand at
+     once, far more than one stem burst).  See fd_rewards.h. */
+# define FD_REPLAY_REWARD_LOG_MAX (32768UL)
+  fd_reward_log_t reward_log[ 1 ];
+  fd_reward_rec_t reward_log_recs[ FD_REPLAY_REWARD_LOG_MAX ];
 
   /* Signing payload of each exec tile's footer cert verify task */
   uchar cert_payload   [ FD_SCHED_MAX_EXEC_TILE_CNT ][ FD_ALPENGLOW_CERT_PAYLOAD_MAX ];

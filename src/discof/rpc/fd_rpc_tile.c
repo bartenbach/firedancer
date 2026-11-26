@@ -6,6 +6,7 @@
 #include "../../ballet/base64/fd_base64.h"
 #include "fd_rpc_sim.h"
 #include "../backup/fd_snapmk_tile.h"
+#include "../replay/fd_execrp.h"
 #include "../../flamenco/rewards/fd_epoch_inflation_account.h"
 #include "../../ballet/txn/fd_txn_v1.h"
 #include "../../ballet/ed25519/fd_ed25519.h"
@@ -47,6 +48,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <sys/mman.h>
 #include <stdlib.h>
 
 #define ZSTD_STATIC_LINKING_ONLY
@@ -74,6 +76,7 @@
 #define IN_KIND_VOTOR       (6)
 #define IN_KIND_REPLAY_TXN   (7)
 #define IN_KIND_SNAPMK       (8)
+#define IN_KIND_EXECRP_META  (9)
 
 /* From bzip2 docs:
       To guarantee that the compressed data will fit in its buffer,
@@ -407,6 +410,50 @@ struct bank_info {
 
 typedef struct bank_info bank_info_t;
 
+struct fd_rpc_meta_ent {
+  uchar sig[ 64 ];
+  ulong slot;
+  uint  log_sz;
+  uint  inner_sz;
+  uint  return_sz;
+  uchar has_return;
+  uchar inner_truncated;
+  uchar has_token;
+  uchar has_cu;
+  uint  cu_consumed;
+  uchar return_program[ 32 ];
+  /* inner_sz, log_sz and return_sz bytes follow, in that order */
+};
+typedef struct fd_rpc_meta_ent fd_rpc_meta_ent_t;
+
+/* Epoch reward store.  One open addressed table per reward epoch, the
+   two most recent epochs are kept.  An account can appear more than
+   once if competing blocks paid it; the query picks the entry whose
+   block is on the queried fork.  The memory is anonymous and only
+   paged in as it fills. */
+
+#define FD_RPC_REWARD_EPOCH_CNT (2UL)
+#define FD_RPC_REWARD_ENT_CNT   (1UL<<22)
+#define FD_RPC_REWARD_ENT_MAX   (3UL<<20) /* stop filling at 75% load */
+
+struct fd_rpc_reward_ent {
+  uchar pubkey[ 32 ];
+  ulong slot;          /* 0 if the entry is unused */
+  ulong amount;
+  ulong post_balance;
+};
+typedef struct fd_rpc_reward_ent fd_rpc_reward_ent_t;
+
+struct fd_rpc_reward_epoch {
+  ulong                 epoch;      /* epoch the rewards were earned in, ULONG_MAX if unused */
+  ulong                 cnt;
+  int                   incomplete; /* some rewards of this epoch were not seen */
+  ulong                 slot_lo;    /* first and last slot a reward of this epoch was paid in */
+  ulong                 slot_hi;
+  fd_rpc_reward_ent_t * ents;       /* NULL if the memory could not be reserved */
+};
+typedef struct fd_rpc_reward_epoch fd_rpc_reward_epoch_t;
+
 struct fd_rpc_cluster_node {
   int valid;
   fd_pubkey_t identity;
@@ -590,6 +637,11 @@ struct fd_rpc_txn_rec {
   ulong  slot;
   uint   index_in_slot;
   int    txn_err;      /* FD_RUNTIME_TXN_ERR_*, 0 on success */
+  int    has_exec_err; /* the four fields below are known */
+  int    exec_err;     /* failed instruction, if txn_err is INSTRUCTION_ERROR */
+  int    exec_err_kind;
+  uint   exec_err_idx;
+  uint   custom_err;
   ulong  fee;          /* signature fee plus priority fee, lamports */
   uint   compute_units;
   ushort payload_sz;
@@ -608,6 +660,8 @@ struct fd_rpc_block_meta {
   ulong block_height;
   ulong txn_cnt;      /* ULONG_MAX if replay did not report it */
   uchar block_hash[ 32 ];
+  int   has_leader;   /* fee_reward is known */
+  ulong fee_reward;   /* fees the block collected, 0 if none */
 };
 typedef struct fd_rpc_block_meta fd_rpc_block_meta_t;
 
@@ -658,6 +712,33 @@ struct fd_rpc_tile {
      incrementing counter. */
   ulong   ws_sub_id_vote;
   ulong   ws_sub_id_slot;
+
+  /* signatureSubscribe: one entry per pending subscription.  An entry
+     is dropped once its notification has gone out, when it is
+     unsubscribed, or when its connection closes.  If the table is
+     full the oldest entry is replaced. */
+# define FD_RPC_WS_SIG_SUB_MAX (256UL)
+  struct {
+    ulong sub_id;   /* subscription id plus one, 0 if unused */
+    ulong ws_conn_id;
+    int   level;    /* 0 processed, 1 confirmed, 2 finalized */
+    uchar sig[ 64 ];
+  } ws_sig_subs[ FD_RPC_WS_SIG_SUB_MAX ];
+  ulong ws_sig_sub_cnt;
+
+  /* accountSubscribe: the account is re-read whenever the subscribed
+     commitment level moves and a notification goes out if it changed. */
+# define FD_RPC_WS_ACCT_SUB_MAX (256UL)
+  struct {
+    ulong sub_id;   /* subscription id plus one, 0 if unused */
+    ulong ws_conn_id;
+    int   level;    /* 0 processed, 1 confirmed, 2 finalized */
+    int   primed;   /* last_hash is valid */
+    ulong last_hash;
+    uchar pubkey[ 32 ];
+    char  encoding[ 16 ];
+  } ws_acct_subs[ FD_RPC_WS_ACCT_SUB_MAX ];
+  ulong ws_acct_sub_cnt;
   ulong   ws_sub_id_next;
 
   fd_rpc_cluster_node_dlist_t * cluster_nodes_dlist;
@@ -762,6 +843,26 @@ struct fd_rpc_tile {
   fd_sha512_t           sha[ 1 ];
   fd_rpc_send_pending_t send_pending[ FD_RPC_SEND_PENDING_MAX ];
   ulong                 send_datagram_cnt;                    /* datagrams handed to the kernel */
+
+  /* Logs, inner instructions and return data of landed transactions,
+     as the exec tiles report them.  A byte ring of variable size
+     entries (fd_rpc_meta_ent_t followed by the inner trace, the log
+     buffer and the return data; an entry never wraps) and a table from
+     signature to the entry's absolute offset plus one.  An entry is
+     gone once the ring has written RING_SZ bytes past its start. */
+# define FD_RPC_META_RING_SZ   (1UL<<28)
+# define FD_RPC_META_TABLE_CNT (1UL<<18)
+  uchar *              meta_ring;      /* NULL if the memory could not be reserved */
+  ulong                meta_head;      /* absolute offset of the next entry */
+  ulong                meta_table[ FD_RPC_META_TABLE_CNT ];
+  fd_execrp_txn_meta_t meta_msg[ 1 ];  /* copy of the frag being ingested */
+
+  /* Epoch rewards, for getInflationReward.  See fd_rpc_reward_ingest. */
+  fd_rpc_reward_epoch_t reward_epochs[ FD_RPC_REWARD_EPOCH_CNT ];
+  ulong                 reward_seq_next;   /* next expected record index, ULONG_MAX before the first batch */
+  ulong                 reward_dropped;    /* replay's drop count as of the last batch */
+  ulong                 reward_boot_slot;  /* first slot this tile saw complete, ULONG_MAX if none */
+  fd_replay_rewards_t   reward_msg[ 1 ];   /* copy of the batch being ingested */
 
   ulong               txn_rec_next;                           /* total transactions recorded; ring position is % CNT */
   fd_rpc_txn_rec_t    txn_recs[ FD_RPC_TXN_REC_CNT ];
@@ -941,6 +1042,18 @@ fd_rpc_ws_unsubscribe( fd_rpc_tile_t * ctx,
                        ulong           ws_conn_id ) {
   if( sub_id==ctx->ws_sub_id_slot && fd_rpc_ws_subscriber_slot_remove( ctx, ws_conn_id ) ) return 1;
   if( sub_id==ctx->ws_sub_id_vote && fd_rpc_ws_subscriber_vote_remove( ctx, ws_conn_id ) ) return 1;
+  for( ulong i=0UL; i<FD_RPC_WS_SIG_SUB_MAX; i++ ) {
+    if( ctx->ws_sig_subs[ i ].sub_id!=sub_id+1UL || ctx->ws_sig_subs[ i ].ws_conn_id!=ws_conn_id ) continue;
+    ctx->ws_sig_subs[ i ].sub_id = 0UL;
+    ctx->ws_sig_sub_cnt--;
+    return 1;
+  }
+  for( ulong i=0UL; i<FD_RPC_WS_ACCT_SUB_MAX; i++ ) {
+    if( ctx->ws_acct_subs[ i ].sub_id!=sub_id+1UL || ctx->ws_acct_subs[ i ].ws_conn_id!=ws_conn_id ) continue;
+    ctx->ws_acct_subs[ i ].sub_id = 0UL;
+    ctx->ws_acct_sub_cnt--;
+    return 1;
+  }
   return 0;
 }
 
@@ -1136,7 +1249,7 @@ before_frag( fd_rpc_tile_t *   ctx,
            sig!=REPLAY_SIG_ROOT_ADVANCED  && sig!=REPLAY_SIG_DROP_BANK_REF;
   }
 
-  if( ctx->in_kind[ in_idx ]==IN_KIND_REPLAY_TXN ) return sig!=REPLAY_SIG_TXN_EXECUTED;
+  if( ctx->in_kind[ in_idx ]==IN_KIND_REPLAY_TXN ) return sig!=REPLAY_SIG_TXN_EXECUTED && sig!=REPLAY_SIG_REWARDS;
   if( ctx->in_kind[ in_idx ]==IN_KIND_SNAPMK ) return sig!=FD_SNAPMK_MSG_FOUND && sig!=FD_SNAPMK_MSG_CREATED && sig!=FD_SNAPMK_MSG_DELETED;
 
   if( ctx->in_kind[ in_idx ]==IN_KIND_VOTOR ) return sig!=FD_VOTOR_SIG_CERTED;
@@ -1191,6 +1304,134 @@ fd_rpc_txn_seq_live( fd_rpc_tile_t const * ctx,
 /* fd_rpc_txn_commit publishes the record the caller just filled in at
    ring position txn_rec_next. */
 static void
+fd_rpc_meta_ingest( fd_rpc_tile_t *              ctx,
+                    fd_execrp_txn_meta_t const * msg,
+                    ulong                        msg_sz ) {
+  if( FD_UNLIKELY( !ctx->meta_ring ) ) return;
+  ulong log_sz = msg->log_sz, inner_sz = msg->inner_sz, return_sz = msg->has_return ? msg->return_sz : 0UL;
+  if( FD_UNLIKELY( inner_sz>FD_EXECRP_TXN_META_INNER_MAX || return_sz>FD_EXECRP_TXN_META_RETURN_MAX ||
+                   log_sz>FD_EXECRP_TXN_META_LOG_MAX || offsetof( fd_execrp_txn_meta_t, log )+log_sz>msg_sz ) ) return;
+  ulong ent_sz = fd_ulong_align_up( sizeof(fd_rpc_meta_ent_t)+inner_sz+log_sz+return_sz, 8UL );
+  ulong pos    = ctx->meta_head & (FD_RPC_META_RING_SZ-1UL);
+  if( FD_UNLIKELY( pos+ent_sz>FD_RPC_META_RING_SZ ) ) { ctx->meta_head += FD_RPC_META_RING_SZ-pos; pos = 0UL; }
+  fd_rpc_meta_ent_t * ent = (fd_rpc_meta_ent_t *)( ctx->meta_ring+pos );
+  memcpy( ent->sig, msg->sig, 64UL );
+  ent->slot            = msg->slot;
+  ent->log_sz          = (uint)log_sz;
+  ent->inner_sz        = (uint)inner_sz;
+  ent->return_sz       = (uint)return_sz;
+  ent->has_return      = msg->has_return;
+  ent->inner_truncated = msg->inner_truncated;
+  ent->has_token       = msg->has_token;
+  ent->has_cu          = msg->has_cu;
+  ent->cu_consumed     = msg->cu_consumed;
+  memcpy( ent->return_program, msg->return_program, 32UL );
+  uchar * body = (uchar *)( ent+1 );
+  memcpy( body,                 msg->inner,       inner_sz  );
+  memcpy( body+inner_sz,        msg->log,         log_sz    );
+  memcpy( body+inner_sz+log_sz, msg->return_data, return_sz );
+
+  /* Index it: the signature's own slot if there is one, else a free or
+     expired slot nearby, else the home slot. */
+  ulong home = fd_ulong_hash( fd_ulong_load_8( msg->sig ) ^ fd_ulong_load_8( msg->sig+8UL ) ) & (FD_RPC_META_TABLE_CNT-1UL);
+  ulong pick = home; int found = 0;
+  for( ulong k=0UL; k<8UL && !found; k++ ) {
+    ulong idx = (home+k) & (FD_RPC_META_TABLE_CNT-1UL);
+    ulong off = ctx->meta_table[ idx ];
+    if( !off || off-1UL+FD_RPC_META_RING_SZ<ctx->meta_head ) { pick = idx; found = 1; }
+    else if( !memcmp( ctx->meta_ring+((off-1UL)&(FD_RPC_META_RING_SZ-1UL)), msg->sig, 64UL ) ) { pick = idx; found = 1; }
+  }
+  ctx->meta_table[ pick ] = ctx->meta_head+1UL;
+  ctx->meta_head += ent_sz;
+}
+
+/* fd_rpc_meta_query returns what the exec tiles reported for the
+   transaction with this signature, or NULL if nothing is kept. */
+static fd_rpc_meta_ent_t const *
+fd_rpc_meta_query( fd_rpc_tile_t const * ctx,
+                   uchar const *         sig ) {
+  if( FD_UNLIKELY( !ctx->meta_ring ) ) return NULL;
+  ulong home = fd_ulong_hash( fd_ulong_load_8( sig ) ^ fd_ulong_load_8( sig+8UL ) ) & (FD_RPC_META_TABLE_CNT-1UL);
+  for( ulong k=0UL; k<8UL; k++ ) {
+    ulong off = ctx->meta_table[ (home+k) & (FD_RPC_META_TABLE_CNT-1UL) ];
+    if( !off || off-1UL+FD_RPC_META_RING_SZ<ctx->meta_head+sizeof(fd_execrp_txn_meta_t) ) continue; /* never used, or (about to be) overwritten */
+    fd_rpc_meta_ent_t const * ent = (fd_rpc_meta_ent_t const *)( ctx->meta_ring+((off-1UL)&(FD_RPC_META_RING_SZ-1UL)) );
+    if( !memcmp( ent->sig, sig, 64UL ) ) return ent;
+  }
+  return NULL;
+}
+
+/* fd_rpc_reward_table returns the table holding the rewards earned in
+   epoch, or NULL.  With create set, the table of the oldest epoch is
+   recycled if there is none yet. */
+static fd_rpc_reward_epoch_t *
+fd_rpc_reward_table( fd_rpc_tile_t * ctx,
+                     ulong           epoch,
+                     int             create ) {
+  fd_rpc_reward_epoch_t * oldest = NULL;
+  for( ulong i=0UL; i<FD_RPC_REWARD_EPOCH_CNT; i++ ) {
+    fd_rpc_reward_epoch_t * t = &ctx->reward_epochs[ i ];
+    if( t->epoch==epoch ) return t;
+    if( !oldest || t->epoch==ULONG_MAX || ( oldest->epoch!=ULONG_MAX && t->epoch<oldest->epoch ) ) oldest = t;
+  }
+  if( !create || !oldest->ents ) return NULL;
+  if( oldest->epoch!=ULONG_MAX && oldest->epoch>epoch ) return NULL; /* older than everything kept */
+  if( oldest->cnt ) memset( oldest->ents, 0, FD_RPC_REWARD_ENT_CNT*sizeof(fd_rpc_reward_ent_t) );
+  oldest->epoch   = epoch;
+  oldest->cnt     = 0UL;
+  oldest->slot_lo = ULONG_MAX;
+  oldest->slot_hi = 0UL;
+  /* Rewards earned in epoch are paid from the first slot of the next
+     one.  If this tile was not up before that, some were missed. */
+  ulong pay_slot0 = fd_epoch_slot0( &ctx->epoch_schedule, epoch+1UL );
+  oldest->incomplete = !( ctx->reward_boot_slot<pay_slot0 );
+  return oldest;
+}
+
+/* fd_rpc_reward_gap is called when reward records were lost.  Which
+   epoch they belonged to is not known, so every table is marked. */
+static void
+fd_rpc_reward_gap( fd_rpc_tile_t * ctx ) {
+  for( ulong i=0UL; i<FD_RPC_REWARD_EPOCH_CNT; i++ ) ctx->reward_epochs[ i ].incomplete = 1;
+  ctx->reward_seq_next = ULONG_MAX;
+}
+
+static void
+fd_rpc_reward_ingest( fd_rpc_tile_t *             ctx,
+                      fd_replay_rewards_t const * msg ) {
+  if( FD_UNLIKELY( !ctx->has_epoch_schedule || msg->cnt>FD_REPLAY_REWARDS_BATCH_MAX ) ) { fd_rpc_reward_gap( ctx ); return; }
+  if( FD_UNLIKELY( ( ctx->reward_seq_next!=ULONG_MAX && msg->seq!=ctx->reward_seq_next ) || msg->dropped!=ctx->reward_dropped ) ) fd_rpc_reward_gap( ctx );
+  ctx->reward_seq_next = msg->seq+msg->cnt;
+  ctx->reward_dropped  = msg->dropped;
+
+  for( ulong i=0UL; i<msg->cnt; i++ ) {
+    ulong slot = msg->recs[ i ].slot;
+    if( FD_UNLIKELY( !slot ) ) continue;
+    /* Agave records no reward for a stake account that was paid nothing */
+    if( msg->recs[ i ].kind==1U && msg->recs[ i ].lamports_post==msg->recs[ i ].lamports_pre ) continue;
+    ulong pay_epoch = fd_slot_to_epoch( &ctx->epoch_schedule, slot, NULL );
+    if( FD_UNLIKELY( !pay_epoch ) ) continue;
+    fd_rpc_reward_epoch_t * t = fd_rpc_reward_table( ctx, pay_epoch-1UL, 1 );
+    if( FD_UNLIKELY( !t ) ) continue;
+    t->slot_lo = fd_ulong_min( t->slot_lo, slot );
+    t->slot_hi = fd_ulong_max( t->slot_hi, slot );
+    if( FD_UNLIKELY( t->cnt>=FD_RPC_REWARD_ENT_MAX ) ) { t->incomplete = 1; continue; }
+    ulong idx = fd_ulong_hash( FD_LOAD( ulong, msg->recs[ i ].pubkey ) ^ FD_LOAD( ulong, msg->recs[ i ].pubkey+8UL ) ) & (FD_RPC_REWARD_ENT_CNT-1UL);
+    int   dup = 0;
+    while( t->ents[ idx ].slot ) {
+      if( FD_UNLIKELY( t->ents[ idx ].slot==slot && !memcmp( t->ents[ idx ].pubkey, msg->recs[ i ].pubkey, 32UL ) ) ) { dup = 1; break; }
+      idx = (idx+1UL) & (FD_RPC_REWARD_ENT_CNT-1UL);
+    }
+    if( FD_UNLIKELY( dup ) ) continue;
+    memcpy( t->ents[ idx ].pubkey, msg->recs[ i ].pubkey, 32UL );
+    t->ents[ idx ].slot         = slot;
+    t->ents[ idx ].amount       = msg->recs[ i ].lamports_post-msg->recs[ i ].lamports_pre;
+    t->ents[ idx ].post_balance = msg->recs[ i ].lamports_post;
+    t->cnt++;
+  }
+}
+
+static void
 fd_rpc_txn_commit( fd_rpc_tile_t * ctx ) {
   ulong seq = ctx->txn_rec_next++;
   uchar const * sig = ctx->txn_recs[ seq % FD_RPC_TXN_REC_CNT ].sig;
@@ -1211,6 +1452,16 @@ fd_rpc_txn_query( fd_rpc_tile_t *     ctx,
                   uchar const *       sig,
                   bank_info_t const * tip,
                   ulong               next_slot ); /* defined with the handlers */
+
+/* fd_rpc_ws_sig_check sends the notification of every signature
+   subscription whose transaction has reached its commitment level. */
+static void
+fd_rpc_ws_sig_check( fd_rpc_tile_t * ctx );
+
+/* fd_rpc_ws_acct_check notifies every account subscription whose
+   account changed at its commitment level. */
+static void
+fd_rpc_ws_acct_check( fd_rpc_tile_t * ctx );
 
 /* fd_rpc_send_to_leaders sends a transaction to the TPU UDP port of
    the leaders of the next few rotations starting at from_slot, as
@@ -1291,6 +1542,11 @@ fd_rpc_block_meta_record( fd_rpc_tile_t *                    ctx,
   m->txn_cnt      = ( msg->vote_success==ULONG_MAX || msg->vote_failed==ULONG_MAX || msg->nonvote_success==ULONG_MAX || msg->nonvote_failed==ULONG_MAX ) ? ULONG_MAX
                   : msg->vote_success+msg->vote_failed+msg->nonvote_success+msg->nonvote_failed;
   memcpy( m->block_hash, msg->block_hash.uc, 32UL );
+
+  /* Whether any fees were paid: a block without fees has no fee
+     reward, which is all that is said about block rewards. */
+  m->has_leader = msg->transaction_fee!=ULONG_MAX && msg->priority_fee!=ULONG_MAX;
+  m->fee_reward = m->has_leader ? msg->transaction_fee+msg->priority_fee+msg->tips : 0UL;
 }
 
 static void
@@ -1324,6 +1580,7 @@ returnable_frag( fd_rpc_tile_t *     ctx,
 
         FD_TEST( slot_completed->bank_idx<ctx->max_live_slots );
         bank_info_t * bank = &ctx->banks[ slot_completed->bank_idx ];
+        if( FD_UNLIKELY( ctx->reward_boot_slot==ULONG_MAX ) ) ctx->reward_boot_slot = slot_completed->slot;
         bank->slot = slot_completed->slot;
         bank->accdb_fork_id = slot_completed->accdb_fork_id;
         bank->epoch = slot_completed->epoch;
@@ -1370,6 +1627,8 @@ returnable_frag( fd_rpc_tile_t *     ctx,
            anyways. */
         if( FD_LIKELY( ctx->processed_idx!=ULONG_MAX ) ) fd_stem_publish( stem, ctx->replay_out->idx, ctx->processed_idx, 0UL, 0UL, 0UL, 0UL, 0UL );
         ctx->processed_idx = slot_completed->bank_idx;
+        if( FD_UNLIKELY( ctx->ws_sig_sub_cnt ) ) fd_rpc_ws_sig_check( ctx );
+        if( FD_UNLIKELY( ctx->ws_acct_sub_cnt ) ) fd_rpc_ws_acct_check( ctx );
         break;
       }
       case REPLAY_SIG_OC_ADVANCED: {
@@ -1377,6 +1636,8 @@ returnable_frag( fd_rpc_tile_t *     ctx,
         if( FD_LIKELY( ctx->confirmed_idx!=ULONG_MAX ) ) fd_stem_publish( stem, ctx->replay_out->idx, ctx->confirmed_idx, 0UL, 0UL, 0UL, 0UL, 0UL );
         FD_TEST( msg->bank_idx<ctx->max_live_slots );
         ctx->confirmed_idx = msg->bank_idx;
+        if( FD_UNLIKELY( ctx->ws_sig_sub_cnt ) ) fd_rpc_ws_sig_check( ctx );
+        if( FD_UNLIKELY( ctx->ws_acct_sub_cnt ) ) fd_rpc_ws_acct_check( ctx );
         break;
       }
       case REPLAY_SIG_ROOT_ADVANCED: {
@@ -1389,6 +1650,8 @@ returnable_frag( fd_rpc_tile_t *     ctx,
         ctx->confirmed_idx = msg->bank_idx;
 
         if( FD_LIKELY( ctx->cluster_confirmed_slot!=ULONG_MAX ) ) fd_rpc_cluster_finalized( ctx, msg->slot );
+        if( FD_UNLIKELY( ctx->ws_sig_sub_cnt ) ) fd_rpc_ws_sig_check( ctx );
+        if( FD_UNLIKELY( ctx->ws_acct_sub_cnt ) ) fd_rpc_ws_acct_check( ctx );
         break;
       }
       case REPLAY_SIG_DROP_BANK_REF: {
@@ -1447,6 +1710,21 @@ returnable_frag( fd_rpc_tile_t *     ctx,
     ctx->ns_per_slot = msg->ns_per_slot;
     ctx->features     = msg->features;
     ctx->has_features = 1;
+  } else if( ctx->in_kind[ in_idx ]==IN_KIND_EXECRP_META ) {
+    /* Unreliable link: copy, then check the frag was not overwritten. */
+    if( FD_LIKELY( sz>=offsetof( fd_execrp_txn_meta_t, log ) && sz<=sizeof(fd_execrp_txn_meta_t) ) ) {
+      memcpy( ctx->meta_msg, fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk ), sz );
+      FD_COMPILER_MFENCE();
+      ulong seq_now = fd_frag_meta_seq_query( ctx->in_mcache[ in_idx ]+fd_mcache_line_idx( seq, ctx->in_depth[ in_idx ] ) );
+      if( FD_LIKELY( seq_now==seq ) ) fd_rpc_meta_ingest( ctx, ctx->meta_msg, sz );
+    }
+  } else if( ctx->in_kind[ in_idx ]==IN_KIND_REPLAY_TXN && sig==REPLAY_SIG_REWARDS ) {
+    /* Unreliable link: copy, then check the frag was not overwritten. */
+    memcpy( ctx->reward_msg, fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk ), sizeof(fd_replay_rewards_t) );
+    FD_COMPILER_MFENCE();
+    ulong seq_now = fd_frag_meta_seq_query( ctx->in_mcache[ in_idx ]+fd_mcache_line_idx( seq, ctx->in_depth[ in_idx ] ) );
+    if( FD_LIKELY( seq_now==seq ) ) fd_rpc_reward_ingest( ctx, ctx->reward_msg );
+    else                            fd_rpc_reward_gap( ctx );
   } else if( ctx->in_kind[ in_idx ]==IN_KIND_REPLAY_TXN ) {
     /* This link is unreliable: copy what is needed, then check the frag
        was not overwritten underneath us before using the copy. */
@@ -1465,6 +1743,11 @@ returnable_frag( fd_rpc_tile_t *     ctx,
       rec->slot          = msg->slot;
       rec->index_in_slot = (uint)msg->index_in_slot;
       rec->txn_err       = msg->txn_err;
+      rec->has_exec_err  = msg->has_exec_err;
+      rec->exec_err      = msg->exec_err;
+      rec->exec_err_kind = msg->exec_err_kind;
+      rec->exec_err_idx  = msg->exec_err_idx;
+      rec->custom_err    = msg->custom_err;
       rec->fee           = msg->transaction_fee+msg->priority_fee;
       rec->compute_units = msg->compute_units_consumed;
       rec->payload_sz    = (ushort)payload_sz;
@@ -3626,7 +3909,84 @@ getInflationRate( fd_rpc_tile_t *         ctx,
   return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"result\":{\"epoch\":%lu,\"foundation\":%.17g,\"total\":%.17g,\"validator\":%.17g},\"id\":%s}\n",
                       bank->epoch, foundation, total, total-foundation, id_cstr );
 }
-UNIMPLEMENTED(getInflationReward) // TODO: Used by solana-exporter
+static fd_http_server_response_t
+getInflationReward( fd_rpc_tile_t *         ctx,
+                    char const *            id_cstr,
+                    fd_rpc_params_t const * params ) {
+  fd_http_server_response_t response;
+  if( FD_UNLIKELY( !fd_rpc_validate_params( ctx, id_cstr, params, 1, 2, &response ) ) ) return response;
+  fd_rpc_val_t const * addrs = &params->v[ 0 ];
+  if( FD_UNLIKELY( addrs->kind!=FD_RPC_VAL_SEQ ) ) return fd_rpc_err_invalid( ctx, id_cstr, "type", addrs, "a sequence" );
+
+  ulong bank_idx = ULONG_MAX;
+  if( FD_UNLIKELY( !fd_rpc_validate_config( ctx, id_cstr, &params->v[ 1 ], "struct RpcEpochConfig", 1, 0, 0, 1, &bank_idx, NULL, NULL, NULL, NULL, &response ) ) ) return response;
+  if( FD_UNLIKELY( !ctx->has_epoch_schedule ) ) return fd_rpc_err_msg( ctx, id_cstr, -32065, "Firedancer Error: banks uninitialized" );
+  bank_info_t const * bank = &ctx->banks[ bank_idx ];
+
+  /* Default: the epoch before the one the queried bank is in. */
+  ulong epoch = bank->epoch ? bank->epoch-1UL : 0UL;
+  fd_rpc_val_t ev[1];
+  if( fd_rpc_cfg_member( &params->v[ 1 ], "epoch", ev ) && ev->kind!=FD_RPC_VAL_NULL ) {
+    if( FD_UNLIKELY( ev->kind!=FD_RPC_VAL_INT || ev->neg ) ) return fd_rpc_err_invalid( ctx, id_cstr, "type", ev, "u64" );
+    epoch = ev->u;
+  }
+
+  /* Agave checks every address before it looks for the rewards. */
+  {
+    ulong addr_cnt = 0UL;
+    fd_jtok_t j[1];
+    fd_jtok_arr_enter( fd_jtok_init( j, addrs->raw, addrs->raw_sz ) );
+    while( fd_jtok_arr_next( j ) ) {
+      fd_rpc_val_t v[1]; fd_rpc_val_read( j, v );
+      fd_pubkey_t  key;
+      if( FD_UNLIKELY( !fd_rpc_validate_address( ctx, id_cstr, v, &key, &response ) ) ) return response;
+      if( FD_UNLIKELY( ++addr_cnt>32UL ) ) return fd_rpc_err_msg( ctx, id_cstr, -32602, "Too many inputs provided; max 32" );
+    }
+  }
+
+  /* Rewards earned in epoch are paid at the start of the next one.
+     Agave reads them back out of those blocks, and fails the request
+     if it does not have the first one. */
+  ulong pay_slot0 = fd_epoch_slot0( &ctx->epoch_schedule, epoch+1UL );
+  ulong next_slot;
+  if( FD_UNLIKELY( !fd_rpc_slot_history_load( ctx, bank, &next_slot ) ) ) return fd_rpc_err_msg( ctx, id_cstr, -32065, "Firedancer Error: slot history unavailable" );
+  fd_rpc_reward_epoch_t const * t = epoch+1UL<=bank->epoch ? fd_rpc_reward_table( ctx, epoch, 0 ) : NULL;
+  if( FD_UNLIKELY( pay_slot0<fd_rpc_slot_history_oldest( next_slot ) ) ) {
+    return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":%d,\"message\":\"Block %lu cleaned up, does not exist on node. First available block: %lu\"},\"id\":%s}\n",
+                        FD_RPC_ERROR_BLOCK_CLEANED_UP, pay_slot0, fd_rpc_slot_history_oldest( next_slot ), id_cstr );
+  }
+  if( FD_UNLIKELY( !t || t->incomplete ) ) {
+    return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":%d,\"message\":\"Block not available for slot %lu\"},\"id\":%s}\n", FD_RPC_ERROR_BLOCK_NOT_AVAILABLE, pay_slot0, id_cstr );
+  }
+
+  fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"result\":[" );
+  fd_jtok_t j[1];
+  ulong n = 0UL;
+  fd_jtok_arr_enter( fd_jtok_init( j, addrs->raw, addrs->raw_sz ) );
+  while( fd_jtok_arr_next( j ) ) {
+    fd_rpc_val_t v[1]; fd_rpc_val_read( j, v );
+    char  key_cstr[ 64 ];
+    uchar key[ 32 ];
+    if( FD_UNLIKELY( !fd_rpc_val_cstr( v, key_cstr, sizeof(key_cstr) ) || !fd_base58_decode_32( key_cstr, key ) ) ) {
+      fd_http_server_unstage( ctx->http );
+      return fd_rpc_err_msg( ctx, id_cstr, -32602, "Invalid param: Invalid" );
+    }
+    if( n++ ) fd_http_server_printf( ctx->http, "," );
+    fd_rpc_reward_ent_t const * hit = NULL;
+    ulong idx = fd_ulong_hash( FD_LOAD( ulong, key ) ^ FD_LOAD( ulong, key+8UL ) ) & (FD_RPC_REWARD_ENT_CNT-1UL);
+    for( ; t->ents[ idx ].slot; idx = (idx+1UL) & (FD_RPC_REWARD_ENT_CNT-1UL) ) {
+      fd_rpc_reward_ent_t const * e = &t->ents[ idx ];
+      if( memcmp( e->pubkey, key, 32UL ) ) continue;
+      /* only a block on the queried fork counts */
+      if( e->slot==bank->slot || fd_rpc_slot_history_has( ctx, next_slot, e->slot ) ) { hit = e; break; }
+    }
+    if( !hit ) { fd_http_server_printf( ctx->http, "null" ); continue; }
+    fd_http_server_printf( ctx->http, "{\"amount\":%lu,\"blockRewardAmount\":null,\"commission\":null,\"effectiveSlot\":%lu,\"epoch\":%lu,\"postBalance\":%lu}",
+                           hit->amount, hit->slot, epoch, hit->post_balance );
+  }
+  fd_http_server_printf( ctx->http, "],\"id\":%s}\n", id_cstr );
+  return STAGE_JSON( ctx );
+}
 
 static fd_http_server_response_t
 getLatestBlockhash( fd_rpc_tile_t *         ctx,
@@ -4421,6 +4781,9 @@ fd_rpc_txn_query( fd_rpc_tile_t *     ctx,
    it does not say which instruction or what its error was, so those
    two are printed as null. */
 static void
+fd_rpc_print_exec_err( fd_rpc_tile_t * ctx, int txn_err, int exec_err, int exec_err_kind, uint exec_err_idx, uint custom_err );
+
+static void
 fd_rpc_print_txn_err( fd_rpc_tile_t * ctx,
                       int             txn_err ) {
   char const * name;
@@ -4456,6 +4819,43 @@ fd_rpc_print_txn_err( fd_rpc_tile_t * ctx,
   }
   if( name ) fd_http_server_printf( ctx->http, "\"%s\"", name );
   else       fd_http_server_printf( ctx->http, "{\"InstructionError\":[null,null]}" );
+}
+
+/* Error of a recorded transaction.  The failed instruction is only
+   known if replay passed it along. */
+static void
+fd_rpc_print_rec_err( fd_rpc_tile_t *          ctx,
+                      fd_rpc_txn_rec_t const * rec ) {
+  if( rec->txn_err==FD_RUNTIME_TXN_ERR_INSTRUCTION_ERROR && rec->has_exec_err ) {
+    fd_rpc_print_exec_err( ctx, rec->txn_err, rec->exec_err, rec->exec_err_kind, rec->exec_err_idx, rec->custom_err );
+  } else {
+    fd_rpc_print_txn_err( ctx, rec->txn_err );
+  }
+}
+
+static void
+fd_rpc_ws_sig_check( fd_rpc_tile_t * ctx ) {
+  if( FD_UNLIKELY( ctx->processed_idx==ULONG_MAX || ctx->confirmed_idx==ULONG_MAX || ctx->finalized_idx==ULONG_MAX ) ) return;
+  bank_info_t const * tip = &ctx->banks[ ctx->processed_idx ];
+  ulong next_slot;
+  if( FD_UNLIKELY( !fd_rpc_slot_history_load( ctx, tip, &next_slot ) ) ) return;
+  ulong level_slot[ 3 ] = { tip->slot, ctx->banks[ ctx->confirmed_idx ].slot, ctx->banks[ ctx->finalized_idx ].slot };
+  for( ulong i=0UL; i<FD_RPC_WS_SIG_SUB_MAX; i++ ) {
+    if( !ctx->ws_sig_subs[ i ].sub_id ) continue;
+    fd_rpc_txn_rec_t const * rec = fd_rpc_txn_query( ctx, ctx->ws_sig_subs[ i ].sig, tip, next_slot );
+    if( !rec || rec->slot>level_slot[ ctx->ws_sig_subs[ i ].level ] ) continue;
+    ulong ws_conn_id = ctx->ws_sig_subs[ i ].ws_conn_id;
+    fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"method\":\"signatureNotification\",\"params\":{\"result\":{\"context\":{\"slot\":%lu},\"value\":{\"err\":", rec->slot );
+    if( !rec->txn_err ) fd_http_server_printf( ctx->http, "null" );
+    else                fd_rpc_print_rec_err( ctx, rec );
+    fd_http_server_printf( ctx->http, "}},\"subscription\":%lu}}\n", ctx->ws_sig_subs[ i ].sub_id-1UL );
+    /* a signature subscription ends with its one notification */
+    ctx->ws_sig_subs[ i ].sub_id = 0UL;
+    ctx->ws_sig_sub_cnt--;
+    if( FD_UNLIKELY( fd_http_server_ws_send( ctx->http, ws_conn_id ) ) ) {
+      fd_http_server_ws_close( ctx->http, ws_conn_id, FD_HTTP_SERVER_CONNECTION_CLOSE_TOO_SLOW );
+    }
+  }
 }
 
 static fd_http_server_response_t
@@ -4510,9 +4910,9 @@ getSignatureStatuses( fd_rpc_tile_t *         ctx,
       fd_http_server_printf( ctx->http, "\"err\":null,\"slot\":%lu,\"status\":{\"Ok\":null}}", rec->slot );
     } else {
       fd_http_server_printf( ctx->http, "\"err\":" );
-      fd_rpc_print_txn_err( ctx, rec->txn_err );
+      fd_rpc_print_rec_err( ctx, rec );
       fd_http_server_printf( ctx->http, ",\"slot\":%lu,\"status\":{\"Err\":", rec->slot );
-      fd_rpc_print_txn_err( ctx, rec->txn_err );
+      fd_rpc_print_rec_err( ctx, rec );
       fd_http_server_printf( ctx->http, "}}" );
     }
   }
@@ -4565,13 +4965,13 @@ fd_rpc_print_json_text( fd_rpc_tile_t * ctx,
 }
 
 static void
-fd_rpc_print_txn_status( fd_rpc_tile_t * ctx,
-                         int             txn_err ) {
-  if( !txn_err ) { fd_http_server_printf( ctx->http, "\"err\":null,\"status\":{\"Ok\":null}" ); return; }
+fd_rpc_print_txn_status( fd_rpc_tile_t *          ctx,
+                         fd_rpc_txn_rec_t const * rec ) {
+  if( !rec->txn_err ) { fd_http_server_printf( ctx->http, "\"err\":null,\"status\":{\"Ok\":null}" ); return; }
   fd_http_server_printf( ctx->http, "\"err\":" );
-  fd_rpc_print_txn_err( ctx, txn_err );
+  fd_rpc_print_rec_err( ctx, rec );
   fd_http_server_printf( ctx->http, ",\"status\":{\"Err\":" );
-  fd_rpc_print_txn_err( ctx, txn_err );
+  fd_rpc_print_rec_err( ctx, rec );
   fd_http_server_printf( ctx->http, "}" );
 }
 
@@ -4700,15 +5100,77 @@ fd_rpc_print_txn( fd_rpc_tile_t *          ctx,
      Logs, inner instructions and token balances are not reported and
      are null, which is also what Agave prints when it did not record
      them.  Balances are empty lists if replay had none to report. */
-  fd_http_server_printf( ctx->http, "\"meta\":{\"computeUnitsConsumed\":%u,", rec->compute_units );
-  fd_rpc_print_txn_status( ctx, rec->txn_err );
-  fd_http_server_printf( ctx->http, ",\"fee\":%lu,\"innerInstructions\":null,\"loadedAddresses\":", rec->fee );
+  fd_rpc_meta_ent_t const * meta = fd_rpc_meta_query( ctx, rec->sig );
+  if( meta && meta->slot!=rec->slot ) meta = NULL;
+  /* costUnits is what the transaction cost the block; the compute
+     units its programs used are only known from the exec tile. */
+  if( meta && meta->has_cu ) fd_http_server_printf( ctx->http, "\"meta\":{\"computeUnitsConsumed\":%u,\"costUnits\":%u,", meta->cu_consumed, rec->compute_units );
+  else                       fd_http_server_printf( ctx->http, "\"meta\":{\"computeUnitsConsumed\":null,\"costUnits\":%u,", rec->compute_units );
+  fd_rpc_print_txn_status( ctx, rec );
+  /* Logs, inner instructions and return data come from the exec tile
+     that ran the transaction, matched by signature and slot.  null if
+     nothing was kept (a block this node produced itself, an entry that
+     aged out, or a message the tile missed). */
+  uchar const * meta_body = meta ? (uchar const *)( meta+1 ) : NULL;
+  if( !meta || meta->inner_truncated ) {
+    fd_http_server_printf( ctx->http, ",\"fee\":%lu,\"innerInstructions\":null,\"loadedAddresses\":", rec->fee );
+  } else {
+    /* Same walk as simulateTransaction: an instruction at stack height
+       1 is a top level one, what follows deeper was invoked from it. */
+    fd_http_server_printf( ctx->http, ",\"fee\":%lu,\"innerInstructions\":[", rec->fee );
+    ulong top = ULONG_MAX, groups = 0UL, off = 0UL; int open = 0;
+    while( off+5UL<=meta->inner_sz ) {
+      uchar const * e = meta_body+off;
+      ulong acct_cnt = e[ 2 ], data_sz = FD_LOAD( ushort, e+3UL );
+      if( FD_UNLIKELY( off+5UL+acct_cnt+data_sz>meta->inner_sz ) ) break;
+      off += 5UL+acct_cnt+data_sz;
+      if( e[ 0 ]<=1 ) { top = top==ULONG_MAX ? 0UL : top+1UL; if( open ) { fd_http_server_printf( ctx->http, "]}" ); open = 0; } continue; }
+      if( !open ) { fd_http_server_printf( ctx->http, "%s{\"index\":%lu,\"instructions\":[", groups++ ? "," : "", top ); open = 1; }
+      else          fd_http_server_printf( ctx->http, "," );
+      fd_http_server_printf( ctx->http, "{\"accounts\":[" );
+      for( ulong k=0UL; k<acct_cnt; k++ ) fd_http_server_printf( ctx->http, "%s%u", k ? "," : "", (uint)e[ 5UL+k ] );
+      fd_http_server_printf( ctx->http, "],\"data\":\"" );
+      fd_rpc_print_base58( ctx, e+5UL+acct_cnt, data_sz );
+      fd_http_server_printf( ctx->http, "\",\"programIdIndex\":%u,\"stackHeight\":%u}", (uint)e[ 1 ], (uint)e[ 0 ] );
+    }
+    if( open ) fd_http_server_printf( ctx->http, "]}" );
+    fd_http_server_printf( ctx->http, "],\"loadedAddresses\":" );
+  }
   fd_rpc_print_loaded_addresses( ctx, info, txn, p );
-  fd_http_server_printf( ctx->http, ",\"logMessages\":null,\"postBalances\":[" );
+  if( !meta ) {
+    fd_http_server_printf( ctx->http, ",\"logMessages\":null" );
+  } else {
+    /* log collector: [tag][len, 1 or 2 bytes][text] per message */
+    fd_http_server_printf( ctx->http, ",\"logMessages\":[" );
+    uchar const * log = meta_body+meta->inner_sz;
+    ulong off = 0UL, logs = 0UL;
+    while( off+2UL<=meta->log_sz ) {
+      ulong len = (ulong)( log[ off+1UL ] & 0x7F );
+      ulong hdr = 2UL;
+      if( log[ off+1UL ] & 0x80 ) { if( off+3UL>meta->log_sz ) break; len |= (ulong)log[ off+2UL ]<<7; hdr = 3UL; }
+      if( off+hdr+len>meta->log_sz ) break;
+      fd_http_server_printf( ctx->http, "%s\"", logs++ ? "," : "" );
+      fd_rpc_print_json_text( ctx, log+off+hdr, len );
+      fd_http_server_printf( ctx->http, "\"" );
+      off += hdr+len;
+    }
+    fd_http_server_printf( ctx->http, "]" );
+  }
+  fd_http_server_printf( ctx->http, ",\"postBalances\":[" );
   for( ulong i=0UL; i<rec->bal_cnt; i++ ) fd_http_server_printf( ctx->http, "%s%lu", i ? "," : "", rec->post_lamports[ i ] );
-  fd_http_server_printf( ctx->http, "],\"postTokenBalances\":null,\"preBalances\":[" );
+  /* Token balances are not reported.  They are known to be empty if
+     no token program and no token-owned account is involved. */
+  char const * tok = meta && !meta->has_token ? "[]" : "null";
+  fd_http_server_printf( ctx->http, "],\"postTokenBalances\":%s,\"preBalances\":[", tok );
   for( ulong i=0UL; i<rec->bal_cnt; i++ ) fd_http_server_printf( ctx->http, "%s%lu", i ? "," : "", rec->pre_lamports[ i ] );
-  fd_http_server_printf( ctx->http, "],\"preTokenBalances\":null,\"rewards\":null}," );
+  fd_http_server_printf( ctx->http, "],\"preTokenBalances\":%s", tok );
+  if( meta && meta->has_return ) {
+    static char b64[ FD_BASE64_ENC_SZ( FD_EXECRP_TXN_META_RETURN_MAX )+1UL ];
+    ulong n = fd_base64_encode( b64, meta_body+meta->inner_sz+meta->log_sz, meta->return_sz );
+    FD_BASE58_ENCODE_32_BYTES( meta->return_program, prog_b58 );
+    fd_http_server_printf( ctx->http, ",\"returnData\":{\"data\":[\"%.*s\",\"base64\"],\"programId\":\"%s\"}", (int)n, b64, prog_b58 );
+  }
+  fd_http_server_printf( ctx->http, ",\"rewards\":[]}," );
   if( txn->transaction_version==FD_TXN_VLEGACY ) fd_http_server_printf( ctx->http, "\"version\":\"legacy\"" );
   else                                           fd_http_server_printf( ctx->http, "\"version\":%u", (uint)txn->transaction_version );
   return 1;
@@ -4765,8 +5227,8 @@ getTransaction( fd_rpc_tile_t *         ctx,
   }
 
   fd_rpc_block_time_t const * bt = fd_rpc_block_time_query( ctx, rec->slot );
-  if( bt ) fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"result\":{\"blockTime\":%ld,\"slot\":%lu,", bt->unix_timestamp, rec->slot );
-  else     fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"result\":{\"blockTime\":null,\"slot\":%lu,", rec->slot );
+  if( bt ) fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"result\":{\"blockTime\":%ld,\"slot\":%lu,\"transactionIndex\":%u,", bt->unix_timestamp, rec->slot, rec->index_in_slot );
+  else     fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"result\":{\"blockTime\":null,\"slot\":%lu,\"transactionIndex\":%u,", rec->slot, rec->index_in_slot );
   if( FD_UNLIKELY( !fd_rpc_print_txn( ctx, info, rec, enc ) ) ) {
     fd_http_server_unstage( ctx->http );
     return fd_rpc_err_msg( ctx, id_cstr, -32065, "Firedancer Error: stored transaction is unreadable" );
@@ -4835,7 +5297,7 @@ getSignaturesForAddress( fd_rpc_tile_t *         ctx,
     else     fd_http_server_printf( ctx->http, "\"blockTime\":null," );
     fd_http_server_printf( ctx->http, "\"confirmationStatus\":\"%s\",", rec->slot<=finalized ? "finalized" : "confirmed" );
     if( !rec->txn_err ) fd_http_server_printf( ctx->http, "\"err\":null," );
-    else { fd_http_server_printf( ctx->http, "\"err\":" ); fd_rpc_print_txn_err( ctx, rec->txn_err ); fd_http_server_printf( ctx->http, "," ); }
+    else { fd_http_server_printf( ctx->http, "\"err\":" ); fd_rpc_print_rec_err( ctx, rec ); fd_http_server_printf( ctx->http, "," ); }
 
     /* memo: the data of every memo program instruction, as Agave formats it */
     uchar txn_buf[ FD_TXN_MAX_SZ ] __attribute__((aligned(alignof(fd_txn_t))));
@@ -4853,7 +5315,7 @@ getSignaturesForAddress( fd_rpc_tile_t *         ctx,
       }
     }
     fd_http_server_printf( ctx->http, has_memo ? "\"," : "\"memo\":null," );
-    fd_http_server_printf( ctx->http, "\"signature\":\"%s\",\"slot\":%lu}", sig_b58, rec->slot );
+    fd_http_server_printf( ctx->http, "\"signature\":\"%s\",\"slot\":%lu,\"transactionIndex\":%u}", sig_b58, rec->slot, rec->index_in_slot );
     printed++;
   }
   fd_http_server_printf( ctx->http, "],\"id\":%s}\n", id_cstr );
@@ -4943,7 +5405,25 @@ getBlock( fd_rpc_tile_t *         ctx,
   FD_BASE58_ENCODE_32_BYTES( parent->block_hash, prev_b58      );
   fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"result\":{\"blockHeight\":%lu,\"blockTime\":%ld,\"blockhash\":\"%s\",\"parentSlot\":%lu,\"previousBlockhash\":\"%s\"",
                          meta->block_height, bt->unix_timestamp, blockhash_b58, meta->parent_slot, prev_b58 );
-  if( want_rewards ) fd_http_server_printf( ctx->http, ",\"rewards\":null" );
+  if( want_rewards ) {
+    /* A block that paid no fees and no epoch rewards has an empty
+       list.  Anything else is not reported. */
+    int epoch_rewards = 0;
+    for( ulong i=0UL; i<FD_RPC_REWARD_EPOCH_CNT; i++ ) {
+      fd_rpc_reward_epoch_t const * t = &ctx->reward_epochs[ i ];
+      if( t->epoch!=ULONG_MAX && t->slot_lo<=slot && slot<=t->slot_hi ) epoch_rewards = 1;
+    }
+    int near_epoch_start = !ctx->has_epoch_schedule || slot-fd_epoch_slot0( &ctx->epoch_schedule, fd_slot_to_epoch( &ctx->epoch_schedule, slot, NULL ) )<4096UL;
+    if( epoch_rewards || !meta->has_leader || ( near_epoch_start && !fd_rpc_reward_table( ctx, fd_slot_to_epoch( &ctx->epoch_schedule, slot, NULL )-1UL, 0 ) ) ) {
+      fd_http_server_printf( ctx->http, ",\"rewards\":null" );
+    } else if( !meta->fee_reward ) {
+      fd_http_server_printf( ctx->http, ",\"rewards\":[]" );
+    } else {
+      /* Who collects the fee reward depends on the vote account's
+         collector settings, which this tile does not track. */
+      fd_http_server_printf( ctx->http, ",\"rewards\":null" );
+    }
+  }
   if( want_sigs ) {
     fd_http_server_printf( ctx->http, ",\"signatures\":[" );
     for( ulong i=0UL; i<cnt; i++ ) {
@@ -5297,6 +5777,127 @@ slotSubscribe( fd_rpc_tile_t *         ctx,
   fd_rpc_ws_subscriber_slot_add( ctx, ws_conn_id );
 
   return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"result\":%lu,\"id\":%s}\n", ctx->ws_sub_id_slot, id_cstr );
+}
+
+static void
+fd_rpc_ws_acct_check( fd_rpc_tile_t * ctx ) {
+  if( FD_UNLIKELY( ctx->processed_idx==ULONG_MAX || ctx->confirmed_idx==ULONG_MAX || ctx->finalized_idx==ULONG_MAX ) ) return;
+  ulong level_idx[ 3 ] = { ctx->processed_idx, ctx->confirmed_idx, ctx->finalized_idx };
+  for( ulong i=0UL; i<FD_RPC_WS_ACCT_SUB_MAX; i++ ) {
+    if( !ctx->ws_acct_subs[ i ].sub_id ) continue;
+    bank_info_t const * info = &ctx->banks[ level_idx[ ctx->ws_acct_subs[ i ].level ] ];
+    ulong lamports; int executable; uchar owner[ 32UL ]; ulong data_len;
+    fd_accdb_read_one_nocache( ctx->accdb, info->accdb_fork_id, ctx->ws_acct_subs[ i ].pubkey,
+                               &lamports, &executable, owner, ctx->scratch.accdb_data_buf, &data_len );
+    if( !lamports ) { data_len = 0UL; executable = 0; memset( owner, 0, 32UL ); }
+    ulong h = fd_hash( lamports ^ (ulong)executable, owner, 32UL ) ^ fd_hash( data_len, ctx->scratch.accdb_data_buf, data_len );
+    if( !ctx->ws_acct_subs[ i ].primed ) { ctx->ws_acct_subs[ i ].primed = 1; ctx->ws_acct_subs[ i ].last_hash = h; continue; }
+    if( h==ctx->ws_acct_subs[ i ].last_hash ) continue;
+    ctx->ws_acct_subs[ i ].last_hash = h;
+
+    ulong ws_conn_id = ctx->ws_acct_subs[ i ].ws_conn_id;
+    fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"method\":\"accountNotification\",\"params\":{\"result\":{\"context\":{\"slot\":%lu},\"value\":", info->slot );
+    fd_http_server_response_t err_response;
+    ctx->encode_key = ctx->ws_acct_subs[ i ].pubkey;
+    int encoded = fd_rpc_encode_account_data( ctx, ctx->scratch.accdb_data_buf, data_len, owner, lamports, executable, ctx->ws_acct_subs[ i ].encoding, 0UL, ULONG_MAX, "null", &err_response );
+    ctx->encode_key = NULL;
+    if( FD_UNLIKELY( !encoded ) ) { fd_http_server_unstage( ctx->http ); continue; } /* e.g. too large for base58 */
+    fd_http_server_printf( ctx->http, "},\"subscription\":%lu}}\n", ctx->ws_acct_subs[ i ].sub_id-1UL );
+    if( FD_UNLIKELY( fd_http_server_ws_send( ctx->http, ws_conn_id ) ) ) {
+      fd_http_server_ws_close( ctx->http, ws_conn_id, FD_HTTP_SERVER_CONNECTION_CLOSE_TOO_SLOW );
+    }
+  }
+}
+
+static fd_http_server_response_t
+accountSubscribe( fd_rpc_tile_t *         ctx,
+                  char const *            id_cstr,
+                  fd_rpc_params_t const * params,
+                  ulong                   ws_conn_id ) {
+  fd_http_server_response_t response;
+  if( FD_UNLIKELY( !fd_rpc_validate_params( ctx, id_cstr, params, 1, 2, &response ) ) ) return response;
+  if( FD_UNLIKELY( ws_conn_id==ULONG_MAX ) ) {
+    return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32601,\"message\":\"Method not found\"},\"id\":%s}\n", id_cstr );
+  }
+  FD_CHECK_CRIT( ws_conn_id < ctx->http->max_ws_conns, "OOB ws_conn_id" );
+
+  fd_pubkey_t address;
+  if( FD_UNLIKELY( !fd_rpc_validate_address( ctx, id_cstr, &params->v[ 0 ], &address, &response ) ) ) return response;
+
+  int  level = 2;
+  char encoding[ 16 ] = "binary";
+  fd_rpc_val_t cv[1];
+  if( fd_rpc_cfg_member( &params->v[ 1 ], "commitment", cv ) ) {
+    char c[ 16 ];
+    if( FD_LIKELY( fd_rpc_val_cstr( cv, c, sizeof(c) ) ) ) level = !strcmp( c, "processed" ) ? 0 : !strcmp( c, "confirmed" ) ? 1 : 2;
+  }
+  if( fd_rpc_cfg_member( &params->v[ 1 ], "encoding", cv ) ) {
+    char e[ 16 ];
+    if( FD_UNLIKELY( !fd_rpc_val_cstr( cv, e, sizeof(e) ) ||
+                     ( strcmp( e, "binary" ) && strcmp( e, "base58" ) && strcmp( e, "base64" ) && strcmp( e, "base64+zstd" ) && strcmp( e, "jsonParsed" ) ) ) ) {
+      fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32602,\"message\":\"Invalid params: unknown variant `" );
+      if( cv->kind==FD_RPC_VAL_STR ) fd_rpc_print_str( ctx, &cv->str );
+      fd_http_server_printf( ctx->http, "`, expected one of `binary`, `base58`, `base64`, `jsonParsed`, `base64+zstd`.\"},\"id\":%s}\n", id_cstr );
+      return STAGE_JSON( ctx );
+    }
+    strcpy( encoding, e );
+  }
+
+  ulong pick = 0UL;
+  for( ulong i=0UL; i<FD_RPC_WS_ACCT_SUB_MAX; i++ ) {
+    if( !ctx->ws_acct_subs[ i ].sub_id ) { pick = i; break; }
+    if( ctx->ws_acct_subs[ i ].sub_id<ctx->ws_acct_subs[ pick ].sub_id ) pick = i;
+  }
+  if( !ctx->ws_acct_subs[ pick ].sub_id ) ctx->ws_acct_sub_cnt++;
+  ulong sub_id = ctx->ws_sub_id_next++;
+  ctx->ws_acct_subs[ pick ].sub_id     = sub_id+1UL;
+  ctx->ws_acct_subs[ pick ].ws_conn_id = ws_conn_id;
+  ctx->ws_acct_subs[ pick ].level      = level;
+  ctx->ws_acct_subs[ pick ].primed     = 0;
+  memcpy( ctx->ws_acct_subs[ pick ].pubkey, address.uc, 32UL );
+  strcpy( ctx->ws_acct_subs[ pick ].encoding, encoding );
+  return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"result\":%lu,\"id\":%s}\n", sub_id, id_cstr );
+}
+
+static fd_http_server_response_t
+signatureSubscribe( fd_rpc_tile_t *         ctx,
+                    char const *            id_cstr,
+                    fd_rpc_params_t const * params,
+                    ulong                   ws_conn_id ) {
+  fd_http_server_response_t response;
+  if( FD_UNLIKELY( !fd_rpc_validate_params( ctx, id_cstr, params, 1, 2, &response ) ) ) return response;
+  if( FD_UNLIKELY( ws_conn_id==ULONG_MAX ) ) {
+    return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32601,\"message\":\"Method not found\"},\"id\":%s}\n", id_cstr );
+  }
+  FD_CHECK_CRIT( ws_conn_id < ctx->http->max_ws_conns, "OOB ws_conn_id" );
+
+  char  sig_cstr[ 96 ];
+  uchar sig[ 64 ];
+  if( FD_UNLIKELY( !fd_rpc_val_cstr( &params->v[ 0 ], sig_cstr, sizeof(sig_cstr) ) || !fd_base58_decode_64( sig_cstr, sig ) ) ) {
+    return fd_rpc_err_msg( ctx, id_cstr, -32602, "Invalid Request: Invalid signature provided" );
+  }
+  int level = 2;
+  fd_rpc_val_t cv[1];
+  if( fd_rpc_cfg_member( &params->v[ 1 ], "commitment", cv ) ) {
+    char c[ 16 ];
+    if( FD_LIKELY( fd_rpc_val_cstr( cv, c, sizeof(c) ) ) ) level = !strcmp( c, "processed" ) ? 0 : !strcmp( c, "confirmed" ) ? 1 : 2;
+  }
+
+  /* a free entry, else the oldest one */
+  ulong pick = 0UL;
+  for( ulong i=0UL; i<FD_RPC_WS_SIG_SUB_MAX; i++ ) {
+    if( !ctx->ws_sig_subs[ i ].sub_id ) { pick = i; break; }
+    if( ctx->ws_sig_subs[ i ].sub_id<ctx->ws_sig_subs[ pick ].sub_id ) pick = i;
+  }
+  if( !ctx->ws_sig_subs[ pick ].sub_id ) ctx->ws_sig_sub_cnt++;
+  ulong sub_id = ctx->ws_sub_id_next++;
+  ctx->ws_sig_subs[ pick ].sub_id     = sub_id+1UL;
+  ctx->ws_sig_subs[ pick ].ws_conn_id = ws_conn_id;
+  ctx->ws_sig_subs[ pick ].level      = level;
+  memcpy( ctx->ws_sig_subs[ pick ].sig, sig, 64UL );
+  /* A transaction that is already there is notified on the next slot,
+     after this reply. */
+  return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"result\":%lu,\"id\":%s}\n", sub_id, id_cstr );
 }
 
 static fd_http_server_response_t
@@ -5831,13 +6432,23 @@ static void
 fd_rpc_print_sim_err( fd_rpc_tile_t *             ctx,
                       fd_rpc_sim_result_t const * r ) {
   if( !r->txn_err ) { fd_http_server_printf( ctx->http, "null" ); return; }
-  if( r->txn_err!=FD_RUNTIME_TXN_ERR_INSTRUCTION_ERROR ) { fd_rpc_print_txn_err( ctx, r->txn_err ); return; }
-  if( r->exec_err_kind==FD_EXECUTOR_ERR_KIND_INSTR && r->exec_err==FD_EXECUTOR_INSTR_ERR_CUSTOM_ERR ) {
-    fd_http_server_printf( ctx->http, "{\"InstructionError\":[%u,{\"Custom\":%u}]}", r->exec_err_idx, r->custom_err );
+  fd_rpc_print_exec_err( ctx, r->txn_err, r->exec_err, r->exec_err_kind, r->exec_err_idx, r->custom_err );
+}
+
+static void
+fd_rpc_print_exec_err( fd_rpc_tile_t * ctx,
+                       int             txn_err,
+                       int             exec_err,
+                       int             exec_err_kind,
+                       uint            exec_err_idx,
+                       uint            custom_err ) {
+  if( txn_err!=FD_RUNTIME_TXN_ERR_INSTRUCTION_ERROR ) { fd_rpc_print_txn_err( ctx, txn_err ); return; }
+  if( exec_err_kind==FD_EXECUTOR_ERR_KIND_INSTR && exec_err==FD_EXECUTOR_INSTR_ERR_CUSTOM_ERR ) {
+    fd_http_server_printf( ctx->http, "{\"InstructionError\":[%u,{\"Custom\":%u}]}", exec_err_idx, custom_err );
   } else {
     /* a VM or syscall fault surfaces as ProgramFailedToComplete */
-    char const * name = r->exec_err_kind==FD_EXECUTOR_ERR_KIND_INSTR ? fd_rpc_instr_err_name( r->exec_err ) : "ProgramFailedToComplete";
-    fd_http_server_printf( ctx->http, "{\"InstructionError\":[%u,\"%s\"]}", r->exec_err_idx, name );
+    char const * name = exec_err_kind==FD_EXECUTOR_ERR_KIND_INSTR ? fd_rpc_instr_err_name( exec_err ) : "ProgramFailedToComplete";
+    fd_http_server_printf( ctx->http, "{\"InstructionError\":[%u,\"%s\"]}", exec_err_idx, name );
   }
 }
 
@@ -6346,6 +6957,10 @@ rpc_json_request( fd_rpc_tile_t * ctx,
   else if( FD_LIKELY( !strcmp( method, "getVoteAccounts"                   ) ) ) response = getVoteAccounts( ctx, id_cstr, params );
   else if( FD_LIKELY( !strcmp( method, "slotSubscribe"                     ) ) ) response = slotSubscribe( ctx, id_cstr, params, ws_conn_id );
   else if( FD_LIKELY( !strcmp( method, "slotUnsubscribe"                   ) ) ) response = slotUnsubscribe( ctx, id_cstr, params, ws_conn_id );
+  else if( FD_LIKELY( !strcmp( method, "signatureSubscribe"                ) ) ) response = signatureSubscribe( ctx, id_cstr, params, ws_conn_id );
+  else if( FD_LIKELY( !strcmp( method, "accountSubscribe"                  ) ) ) response = accountSubscribe( ctx, id_cstr, params, ws_conn_id );
+  else if( FD_LIKELY( !strcmp( method, "accountUnsubscribe"                ) ) ) response = slotUnsubscribe( ctx, id_cstr, params, ws_conn_id );
+  else if( FD_LIKELY( !strcmp( method, "signatureUnsubscribe"              ) ) ) response = slotUnsubscribe( ctx, id_cstr, params, ws_conn_id );
   else if( FD_LIKELY( !strcmp( method, "voteSubscribe"                     ) ) ) response = voteSubscribe( ctx, id_cstr, params, ws_conn_id );
   else if( FD_LIKELY( !strcmp( method, "voteUnsubscribe"                   ) ) ) response = voteUnsubscribe( ctx, id_cstr, params, ws_conn_id );
   else if( FD_LIKELY( !strcmp( method, "isBlockhashValid"                  ) ) ) response = isBlockhashValid( ctx, id_cstr, params );
@@ -6392,6 +7007,12 @@ rpc_ws_close( ulong  ws_conn_id,
   if( FD_UNLIKELY( ws_conn_id>=ctx->http->max_ws_conns ) ) return;
   fd_rpc_ws_subscriber_vote_remove( ctx, ws_conn_id );
   fd_rpc_ws_subscriber_slot_remove( ctx, ws_conn_id );
+  for( ulong i=0UL; i<FD_RPC_WS_SIG_SUB_MAX; i++ ) {
+    if( ctx->ws_sig_subs[ i ].sub_id && ctx->ws_sig_subs[ i ].ws_conn_id==ws_conn_id ) { ctx->ws_sig_subs[ i ].sub_id = 0UL; ctx->ws_sig_sub_cnt--; }
+  }
+  for( ulong i=0UL; i<FD_RPC_WS_ACCT_SUB_MAX; i++ ) {
+    if( ctx->ws_acct_subs[ i ].sub_id && ctx->ws_acct_subs[ i ].ws_conn_id==ws_conn_id ) { ctx->ws_acct_subs[ i ].sub_id = 0UL; ctx->ws_acct_sub_cnt--; }
+  }
 }
 
 static void
@@ -6469,6 +7090,26 @@ privileged_init( fd_topo_t const *      topo,
   /* simulateTransaction runtime: memfds and anonymous memory, so also
      before the sandbox. */
   ctx->sim = fd_rpc_sim_boot();
+
+  /* transaction logs: anonymous memory, paged in as it fills */
+  ctx->meta_head = 0UL;
+  ctx->meta_ring = mmap( NULL, FD_RPC_META_RING_SZ, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0 );
+  if( FD_UNLIKELY( ctx->meta_ring==MAP_FAILED ) ) { FD_LOG_WARNING(( "mmap failed (%i-%s), transaction logs disabled", errno, fd_io_strerror( errno ) )); ctx->meta_ring = NULL; }
+
+  /* getInflationReward store: anonymous memory, paged in as it fills. */
+  ctx->reward_seq_next  = ULONG_MAX;
+  ctx->reward_dropped   = 0UL;
+  ctx->reward_boot_slot = ULONG_MAX;
+  for( ulong i=0UL; i<FD_RPC_REWARD_EPOCH_CNT; i++ ) {
+    void * mem = mmap( NULL, FD_RPC_REWARD_ENT_CNT*sizeof(fd_rpc_reward_ent_t), PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0 );
+    if( FD_UNLIKELY( mem==MAP_FAILED ) ) { FD_LOG_WARNING(( "mmap failed (%i-%s), getInflationReward disabled", errno, fd_io_strerror( errno ) )); mem = NULL; }
+    ctx->reward_epochs[ i ].epoch      = ULONG_MAX;
+    ctx->reward_epochs[ i ].slot_lo    = ULONG_MAX;
+    ctx->reward_epochs[ i ].slot_hi    = 0UL;
+    ctx->reward_epochs[ i ].cnt        = 0UL;
+    ctx->reward_epochs[ i ].incomplete = 1;
+    ctx->reward_epochs[ i ].ents       = mem;
+  }
 
   /* sendTransaction socket.  Opened here, before the sandbox. */
   ctx->udp_fd = socket( AF_INET, SOCK_DGRAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0 );
@@ -6614,6 +7255,7 @@ unprivileged_init( fd_topo_t const *      topo,
     else if( FD_UNLIKELY( !strcmp( link->name, "votor_out"  ) ) ) ctx->in_kind[ i ] = IN_KIND_VOTOR;
     else if( FD_LIKELY( !strcmp( link->name, "replay_out"   ) ) ) ctx->in_kind[ i ] = IN_KIND_REPLAY_TXN;
     else if( FD_LIKELY( !strcmp( link->name, "snapmk_out"   ) ) ) ctx->in_kind[ i ] = IN_KIND_SNAPMK;
+    else if( FD_LIKELY( !strcmp( link->name, "execrp_rpc"   ) ) ) ctx->in_kind[ i ] = IN_KIND_EXECRP_META;
     else FD_LOG_ERR(( "unexpected link name %s", link->name ));
   }
 

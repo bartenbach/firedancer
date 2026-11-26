@@ -177,10 +177,52 @@ struct fd_execrp_txn_exec_done_msg {
      decides anything from these.  bal_cnt is 0 if the accounts were
      not loaded. */
   uchar bal_cnt;
+
+  /* Which instruction failed and how, when txn_err is
+     FD_RUNTIME_TXN_ERR_INSTRUCTION_ERROR.  For RPC only. */
+  int   exec_err;
+  int   exec_err_kind;
+  uint  exec_err_idx;
+  uint  custom_err;
   ulong pre_lamports [ MAX_TX_ACCOUNT_LOCKS ];
   ulong post_lamports[ MAX_TX_ACCOUNT_LOCKS ];
 };
 typedef struct fd_execrp_txn_exec_done_msg fd_execrp_txn_exec_done_msg_t;
+
+/* fd_execrp_txn_meta_t is what an exec tile publishes on its
+   execrp_rpc link (if the topology has one) for every transaction it
+   lands: the program logs, the instruction trace and the return data.
+   It exists only so the RPC server can print them in getTransaction
+   and getBlock; nothing in replay reads it.  Variable size: only the
+   first log_sz bytes of log are sent.
+
+   inner is the runtime's instruction trace, one entry per instruction
+   in execution order (top level ones included):
+     stack_height u8, program_id index u8, acct_cnt u8, data_sz u16,
+     acct_cnt account indexes (u8 each), data_sz bytes of data
+   inner_truncated is set if the trace did not fit. */
+
+#define FD_EXECRP_TXN_META_INNER_MAX  (6144UL)
+#define FD_EXECRP_TXN_META_RETURN_MAX (1024UL)
+#define FD_EXECRP_TXN_META_LOG_MAX    (14000UL) /* FD_LOG_COLLECTOR_MAX + FD_LOG_COLLECTOR_EXTRA */
+
+struct fd_execrp_txn_meta {
+  uchar  sig[ 64 ];
+  ulong  slot;
+  uint   log_sz;       /* fd_log_collector serialization */
+  uint   inner_sz;
+  uint   return_sz;
+  uchar  has_return;
+  uchar  inner_truncated;
+  uchar  has_token;    /* an SPL token program, or an account one of them owns, is among the transaction's accounts */
+  uchar  has_cu;
+  uint   cu_consumed;  /* compute units the programs used (not the block cost) */
+  uchar  return_program[ 32 ];
+  uchar  return_data[ FD_EXECRP_TXN_META_RETURN_MAX ];
+  uchar  inner[ FD_EXECRP_TXN_META_INNER_MAX ];
+  uchar  log[ FD_EXECRP_TXN_META_LOG_MAX ];
+};
+typedef struct fd_execrp_txn_meta fd_execrp_txn_meta_t;
 
 struct fd_execrp_txn_sigverify_done_msg {
   ulong cnt;

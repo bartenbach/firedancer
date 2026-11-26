@@ -1,3 +1,4 @@
+#include "../rewards/fd_rewards.h"
 #include "fd_accdb_svm.h"
 #include "fd_hashes.h"
 #include "fd_bank.h"
@@ -102,6 +103,7 @@ fd_accdb_svm_credit( fd_bank_t *         bank,
   fd_hashes_update_pair( pubkey->uc, acc.owner, lamports_pre, acc.executable, acc.data, acc.data_len,
                                      acc.owner, acc.lamports, acc.executable, acc.data, acc.data_len,
                          bank, capture_ctx );
+  if( FD_UNLIKELY( is_vote_reward ) ) fd_reward_log_push( FD_REWARD_KIND_VOTE, pubkey->uc, bank->f.slot, lamports_pre, acc.lamports );
   if( FD_UNLIKELY( fd_bank_report_runtime_diffs( bank ) ) ) {
     if( FD_UNLIKELY( is_vote_reward ) ) fd_event_runtime_reward_emit( bank, FD_EVENT_RUNTIME_REWARD_KIND_VOTE, acc.pubkey, acc.owner, lamports_pre, acc.lamports, 0UL, 0UL, 0UL );
     else                                fd_event_runtime_block_account( bank, acc.pubkey, acc.owner, acc.owner, lamports_pre, acc.lamports, acc.data_len, acc.data_len, acc.executable );

@@ -116,6 +116,7 @@
 #define REPLAY_SIG_MISSING_FEC    (13)
 #define REPLAY_SIG_NEXT_LEADER    (14)
 #define REPLAY_SIG_SLOT_STATES    (15)
+#define REPLAY_SIG_REWARDS        (16)
 
 /* replay_out mcache seq[i] slots */
 #define REPLAY_SYNC_SEQ  (0UL) /* mcache->seq[0]: recently published seq no */
@@ -266,6 +267,13 @@ struct fd_replay_txn_executed {
   /* Lamport balances of the transaction's accounts before and after,
      in transaction account order.  bal_cnt is 0 if unknown. */
   ulong bal_cnt;
+  /* Failed instruction detail when txn_err is an instruction error;
+     only meaningful if bal_cnt is non-zero or has_exec_err is set. */
+  int   has_exec_err;
+  int   exec_err;
+  int   exec_err_kind;
+  uint  exec_err_idx;
+  uint  custom_err;
   ulong pre_lamports [ MAX_TX_ACCOUNT_LOCKS ];
   ulong post_lamports[ MAX_TX_ACCOUNT_LOCKS ];
 };
@@ -327,6 +335,29 @@ struct fd_replay_slot_states {
 };
 typedef struct fd_replay_slot_states fd_replay_slot_states_t;
 
+/* fd_replay_rewards_t is a batch of the epoch rewards (vote and stake)
+   credited at the start of a block.  It is only published on
+   replay_out, for the RPC server.  seq is the cumulative index of the
+   first record of the batch, so a consumer can tell if it missed
+   one; dropped counts records replay itself had no room to queue. */
+
+#define FD_REPLAY_REWARDS_BATCH_MAX (64UL)
+
+struct fd_replay_rewards {
+  ulong seq;
+  ulong dropped;
+  ulong cnt;
+  struct {
+    uchar pubkey[ 32 ];
+    ulong slot;
+    ulong lamports_pre;
+    ulong lamports_post;
+    uint  kind; /* 0 vote, 1 stake */
+    uint  pad;
+  } recs[ FD_REPLAY_REWARDS_BATCH_MAX ];
+};
+typedef struct fd_replay_rewards fd_replay_rewards_t;
+
 union fd_replay_message {
   fd_replay_slot_completed_t  slot_completed;
   fd_replay_slot_dead_t       slot_dead;
@@ -339,6 +370,7 @@ union fd_replay_message {
   fd_replay_leader_footer_t   leader_footer;
   fd_replay_next_leader_t     next_leader;
   fd_replay_slot_states_t     slot_states;
+  fd_replay_rewards_t         rewards;
 };
 
 typedef union fd_replay_message fd_replay_message_t;

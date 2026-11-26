@@ -24,6 +24,8 @@
 #define FD_DOUBLE_DISINFLATION_TAPER (0.30)
 
 /* https://github.com/anza-xyz/agave/blob/7117ed9653ce19e8b2dea108eff1f3eb6a3378a7/sdk/src/inflation.rs#L85 */
+FD_TL fd_reward_log_t * fd_reward_log_tl = NULL;
+
 static double
 total( fd_inflation_t const * inflation, double year ) {
   double tapered = inflation->initial * pow( (1.0 - inflation->taper), year );
@@ -1265,6 +1267,7 @@ distribute_epoch_reward_to_stake_acc( fd_bank_t *         bank,
     fd_bank_lthash_record( bank, acc->pubkey );
   }
   fd_hashes_capture_account( stake_pubkey->uc, acc->owner, acc->lamports, acc->executable, acc->data, acc->data_len, bank, capture_ctx );
+  fd_reward_log_push( FD_REWARD_KIND_STAKE, acc->pubkey, bank->f.slot, lamports_pre, acc->lamports );
   if( FD_UNLIKELY( fd_bank_report_runtime_diffs( bank ) ) ) {
     fd_event_runtime_reward_emit( bank, FD_EVENT_RUNTIME_REWARD_KIND_STAKE, acc->pubkey, acc->owner,
                                   lamports_pre, acc->lamports, partition_idx, new_credits_observed,
