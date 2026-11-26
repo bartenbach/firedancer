@@ -32,6 +32,9 @@
 #include "../../flamenco/alpenglow/fd_alpenglow.h"
 #include "../../flamenco/accdb/fd_accdb_shmem.h"
 #include "../../flamenco/runtime/fd_system_ids.h"
+#include "../../flamenco/runtime/sysvar/fd_sysvar_stake_history.h"
+#include "../../flamenco/stakes/fd_stakes.h"
+#include "../../flamenco/stakes/fd_stake_types.h"
 #include "../../flamenco/runtime/program/vote/fd_vote_codec.h"
 #include "../../flamenco/runtime/program/vote/fd_vote_codec_tmpl.h"
 #include "../../tango/fseq/fd_fseq.h"
@@ -630,7 +633,7 @@ fd_rpc_mleaders_get_leader_for_slot( fd_multi_epoch_leaders_t const * mleaders,
 #define FD_RPC_TXN_REC_CNT     (1UL<<17)
 #define FD_RPC_TXN_TABLE_CNT   (1UL<<21)
 #define FD_RPC_TXN_PROBE_MAX   (32UL)
-#define FD_RPC_BLOCK_META_CNT  (1UL<<16)
+#define FD_RPC_BLOCK_META_CNT  (1UL<<19) /* as far back as block times go */
 #define FD_RPC_BLOCK_TXN_MAX   (16384UL)
 
 struct fd_rpc_txn_rec {
@@ -805,6 +808,22 @@ struct fd_rpc_tile {
   int                       vote_infos_has_nxt;
   ulong                     vote_infos_slot;
   uchar                     vote_infos_block_hash[ 32 ];
+
+  /* Every vote account and the stake delegated to it, as Agave's
+     getVoteAccounts reports them.  Firedancer keeps no such table
+     outside the runtime, so it is built by walking the accounts
+     (fd_rpc_vote_stakes_refresh) and kept until it can have changed. */
+# define FD_RPC_VOTE_STAKE_MAX  (2UL*MAX_STAKE_WEIGHTS)
+# define FD_RPC_VOTER_TABLE_CNT (4UL*FD_RPC_VOTE_STAKE_MAX) /* power of two not needed */
+  fd_pubkey_t               vote_stake_keys[ FD_RPC_VOTE_STAKE_MAX ];
+  ulong                     vote_stake_amt [ FD_RPC_VOTE_STAKE_MAX ];
+  ulong                     vote_stake_cnt;
+  int                       vote_stake_valid;
+  int                       vote_stake_rewards_active; /* built while epoch rewards were being paid out */
+  ulong                     vote_stake_epoch;
+  long                      vote_stake_ts;
+  struct { uchar key[ 32 ]; ulong stake; int used; } voter_table[ FD_RPC_VOTER_TABLE_CNT ]; /* scratch for the walk */
+  uchar                     stake_history_buf[ FD_SYSVAR_STAKE_HISTORY_BINCODE_SZ ];
   fd_vote_state_versioned_t vote_state[ 1 ];
 
   fd_rpc_block_production_table_t block_production[ 1 ];
@@ -5084,9 +5103,10 @@ fd_rpc_print_txn_msg_tail( fd_rpc_tile_t *  ctx,
 /* jsonParsed instruction decoding.  Agave decodes the instructions of
    a fixed set of programs into named fields and prints everything
    else "partially decoded" (account addresses, base58 data).  Decoded
-   here: the system program, the address lookup table program and the
-   memo programs.  Every other program, and any instruction that does
-   not decode, is printed partially decoded. */
+   here: the system, address lookup table, stake, vote, SPL token,
+   associated token account, BPF loader and memo programs (but not the
+   Token-2022 extension instructions).  Every other program, and any
+   instruction that does not decode, is printed partially decoded. */
 
 #define FD_RPC_IX_KEY( n ) ( (n)<acct_cnt && (ulong)accts[ n ]<key_cnt ? fd_rpc_b58_32( keys[ accts[ n ] ], b58[ n ] ) : NULL )
 
@@ -5095,6 +5115,866 @@ fd_rpc_b58_32( uchar const * key,
                char *        out ) {
   fd_base58_encode_32( key, NULL, out );
   return out;
+}
+
+/* jsonParsed decoding of the stake, vote, SPL token, associated token
+   account and BPF loader programs.  Agave builds each "info" object as
+   a JSON map, which it prints with the keys in alphabetical order, so
+   the fields are collected first and printed sorted. */
+
+#define FD_RPC_PIX_FIELD_MAX (24UL)
+#define FD_RPC_PIX_KEY    (0)  /* a 32 byte address, base58 */
+#define FD_RPC_PIX_U64    (1)
+#define FD_RPC_PIX_I64    (2)
+#define FD_RPC_PIX_STR    (3)  /* a C string that needs no escaping */
+#define FD_RPC_PIX_TEXT   (4)  /* UTF-8 text, escaped */
+#define FD_RPC_PIX_RAW    (5)  /* JSON text, printed as is */
+#define FD_RPC_PIX_B64    (6)
+#define FD_RPC_PIX_NULL   (7)
+#define FD_RPC_PIX_KEYS   (8)  /* the instruction's accounts from index u on */
+#define FD_RPC_PIX_U64STR (9)  /* a number in quotes */
+#define FD_RPC_PIX_TOKAMT (10) /* amount u with len decimals */
+
+struct fd_rpc_pix_field {
+  char const *  name;
+  int           kind;
+  uchar const * ptr;
+  ulong         u;
+  ulong         len;
+};
+typedef struct fd_rpc_pix_field fd_rpc_pix_field_t;
+
+struct fd_rpc_pix {
+  fd_rpc_pix_field_t    f[ FD_RPC_PIX_FIELD_MAX ];
+  ulong                 cnt;
+  uchar const * const * keys;
+  ulong                 key_cnt;
+  uchar const *         accts;
+  ulong                 acct_cnt;
+  int                   null_info;
+};
+typedef struct fd_rpc_pix fd_rpc_pix_t;
+
+static void
+fd_rpc_pix_add( fd_rpc_pix_t * x,
+                char const *   name,
+                int            kind,
+                uchar const *  ptr,
+                ulong          u,
+                ulong          len ) {
+  if( FD_UNLIKELY( x->cnt==FD_RPC_PIX_FIELD_MAX ) ) return;
+  x->f[ x->cnt++ ] = (fd_rpc_pix_field_t){ .name = name, .kind = kind, .ptr = ptr, .u = u, .len = len };
+}
+
+static int
+fd_rpc_pix_emit( fd_rpc_tile_t * ctx,
+                 fd_rpc_pix_t *  x,
+                 char const *    type,
+                 char const *    program ) {
+  fd_http_server_t * h = ctx->http;
+  if( x->null_info ) {
+    fd_http_server_printf( h, "\"parsed\":{\"info\":null,\"type\":\"%s\"},\"program\":\"%s\"", type, program );
+    return 1;
+  }
+  ulong order[ FD_RPC_PIX_FIELD_MAX ];
+  for( ulong i=0UL; i<x->cnt; i++ ) {
+    ulong j = i;
+    while( j && strcmp( x->f[ order[ j-1UL ] ].name, x->f[ i ].name )>0 ) { order[ j ] = order[ j-1UL ]; j--; }
+    order[ j ] = i;
+  }
+  fd_http_server_printf( h, "\"parsed\":{\"info\":{" );
+  for( ulong i=0UL; i<x->cnt; i++ ) {
+    fd_rpc_pix_field_t const * f = &x->f[ order[ i ] ];
+    char b58[ FD_BASE58_ENCODED_32_SZ ];
+    fd_http_server_printf( h, "%s\"%s\":", i ? "," : "", f->name );
+    switch( f->kind ) {
+      case FD_RPC_PIX_KEY:    fd_base58_encode_32( f->ptr, NULL, b58 ); fd_http_server_printf( h, "\"%s\"", b58 ); break;
+      case FD_RPC_PIX_U64:    fd_http_server_printf( h, "%lu", f->u ); break;
+      case FD_RPC_PIX_I64:    fd_http_server_printf( h, "%ld", (long)f->u ); break;
+      case FD_RPC_PIX_STR:    fd_http_server_printf( h, "\"%s\"", (char const *)f->ptr ); break;
+      case FD_RPC_PIX_TEXT:   fd_http_server_printf( h, "\"" ); fd_rpc_print_json_text( ctx, f->ptr, f->len ); fd_http_server_printf( h, "\"" ); break;
+      case FD_RPC_PIX_RAW:    fd_http_server_printf( h, "%s", (char const *)f->ptr ); break;
+      case FD_RPC_PIX_NULL:   fd_http_server_printf( h, "null" ); break;
+      case FD_RPC_PIX_U64STR: fd_http_server_printf( h, "\"%lu\"", f->u ); break;
+      case FD_RPC_PIX_TOKAMT: fd_http_server_printf( h, "{" ); fd_rpc_print_ui_amount_fields( ctx, f->u, (uchar)f->len ); fd_http_server_printf( h, "}" ); break;
+      case FD_RPC_PIX_B64: {
+        static char b64[ FD_BASE64_ENC_SZ( 8192UL )+1UL ];
+        ulong n = fd_base64_encode( b64, f->ptr, fd_ulong_min( f->len, 8192UL ) );
+        fd_http_server_printf( h, "\"%.*s\"", (int)n, b64 );
+        break;
+      }
+      case FD_RPC_PIX_KEYS:
+        fd_http_server_printf( h, "[" );
+        for( ulong k=f->u; k<x->acct_cnt; k++ ) {
+          fd_base58_encode_32( x->keys[ x->accts[ k ] ], NULL, b58 );
+          fd_http_server_printf( h, "%s\"%s\"", k>f->u ? "," : "", b58 );
+        }
+        fd_http_server_printf( h, "]" );
+        break;
+      default: fd_http_server_printf( h, "null" ); break;
+    }
+  }
+  fd_http_server_printf( h, "},\"type\":\"%s\"},\"program\":\"%s\"", type, program );
+  return 1;
+}
+
+/* a bincode Option<8 byte value>: 0, or 1 and the value.  Returns the
+   bytes used, 0 if malformed. */
+static ulong
+fd_rpc_pix_opt8( uchar const * a,
+                 ulong         n,
+                 int *         has,
+                 ulong *       val ) {
+  if( n<1UL ) return 0UL;
+  if( a[ 0 ]==0 ) { *has = 0; return 1UL; }
+  if( a[ 0 ]!=1 || n<9UL ) return 0UL;
+  *has = 1; *val = FD_LOAD( ulong, a+1UL );
+  return 9UL;
+}
+
+/* Returns 1 if it printed a "parsed":…,"program":"…" pair. */
+static int
+fd_rpc_print_parsed_ix_more( fd_rpc_tile_t *       ctx,
+                             uchar const * const * keys,
+                             ulong                 key_cnt,
+                             uchar const *         program,
+                             uchar const *         accts,
+                             ulong                 acct_cnt,
+                             uchar const *         d,
+                             ulong                 sz ) {
+  static char raw[ 2 ][ 8192 ];
+  char dk[ 4 ][ FD_BASE58_ENCODED_32_SZ ];
+  fd_rpc_pix_t x[ 1 ];
+  x->cnt = 0UL; x->keys = keys; x->key_cnt = key_cnt; x->accts = accts; x->acct_cnt = acct_cnt; x->null_info = 0;
+
+  FD_BASE58_ENCODE_32_BYTES( program, prog_b58 );
+  int is_stake   = !memcmp( program, fd_solana_stake_program_id.uc, 32UL );
+  int is_vote    = !memcmp( program, fd_solana_vote_program_id.uc, 32UL );
+  int is_token   = !memcmp( program, fd_solana_spl_token_id.uc, 32UL ) || !strcmp( prog_b58, "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb" );
+  int is_ata     = !strcmp( prog_b58, "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL" );
+  int is_loader  = !strcmp( prog_b58, "BPFLoader2111111111111111111111111111111111" );
+  int is_loader3 = !memcmp( program, fd_solana_bpf_loader_upgradeable_program_id.uc, 32UL );
+  if( !is_stake && !is_vote && !is_token && !is_ata && !is_loader && !is_loader3 ) return 0;
+
+  /* Agave does not decode an instruction of these programs that names
+     no accounts, and every account index must name an account of the
+     transaction */
+  if( !acct_cnt ) return 0;
+  for( ulong i=0UL; i<acct_cnt; i++ ) if( FD_UNLIKELY( (ulong)accts[ i ]>=key_cnt ) ) return 0;
+
+# define A( name, i )        fd_rpc_pix_add( x, name, FD_RPC_PIX_KEY, keys[ accts[ i ] ], 0UL, 0UL )
+# define PK( name, p )       fd_rpc_pix_add( x, name, FD_RPC_PIX_KEY, (p), 0UL, 0UL )
+# define U( name, v )        fd_rpc_pix_add( x, name, FD_RPC_PIX_U64, NULL, (ulong)(v), 0UL )
+# define S( name, lit )      fd_rpc_pix_add( x, name, FD_RPC_PIX_STR, (uchar const *)(lit), 0UL, 0UL )
+# define T( name, p, l )     fd_rpc_pix_add( x, name, FD_RPC_PIX_TEXT, (p), 0UL, (l) )
+# define R( name, cstr )     fd_rpc_pix_add( x, name, FD_RPC_PIX_RAW, (uchar const *)(cstr), 0UL, 0UL )
+# define NUL( name )         fd_rpc_pix_add( x, name, FD_RPC_PIX_NULL, NULL, 0UL, 0UL )
+# define NEED( k )           do { if( acct_cnt<(ulong)(k) ) return 0; } while(0)
+# define HOLDS( i, id )      ( (ulong)(i)<acct_cnt && !memcmp( keys[ accts[ i ] ], (id).uc, 32UL ) )
+# define EMIT( type, prog )  return fd_rpc_pix_emit( ctx, x, type, prog )
+  /* a bincode string: u64 length, then UTF-8 bytes */
+# define STRING( off, out_ptr, out_len ) do {                                  \
+    if( n<(off)+8UL ) return 0;                                                 \
+    (out_len) = FD_LOAD( ulong, a+(off) );                                      \
+    if( (out_len)>n-(off)-8UL ) return 0;                                       \
+    (out_ptr) = a+(off)+8UL;                                                    \
+    if( !fd_utf8_verify( (char const *)(out_ptr), (out_len) ) ) return 0;       \
+  } while(0)
+
+  if( is_stake ) {
+    if( sz<4UL ) return 0;
+    uint          tag = FD_LOAD( uint, d );
+    uchar const * a   = d+4UL;
+    ulong         n   = sz-4UL;
+    static char const * const auth_name[ 2 ] = { "Staker", "Withdrawer" };
+    switch( tag ) {
+      case 0U: { /* Initialize( Authorized, Lockup ) */
+        if( n<112UL ) return 0;
+        int legacy = HOLDS( 1, fd_sysvar_rent_id );
+        NEED( legacy ? 2 : 1 );
+        snprintf( raw[ 0 ], sizeof(raw[ 0 ]), "{\"staker\":\"%s\",\"withdrawer\":\"%s\"}", fd_rpc_b58_32( a, dk[ 0 ] ), fd_rpc_b58_32( a+32UL, dk[ 1 ] ) );
+        snprintf( raw[ 1 ], sizeof(raw[ 1 ]), "{\"custodian\":\"%s\",\"epoch\":%lu,\"unixTimestamp\":%ld}", fd_rpc_b58_32( a+80UL, dk[ 2 ] ), FD_LOAD( ulong, a+72UL ), FD_LOAD( long, a+64UL ) );
+        A( "stakeAccount", 0 ); R( "authorized", raw[ 0 ] ); R( "lockup", raw[ 1 ] );
+        if( legacy ) A( "rentSysvar", 1 );
+        EMIT( "initialize", "stake" );
+      }
+      case 1U: { /* Authorize( Pubkey, StakeAuthorize ) */
+        if( n<36UL ) return 0;
+        uint kind = FD_LOAD( uint, a+32UL );
+        if( kind>1U ) return 0;
+        int   legacy = HOLDS( 1, fd_sysvar_clock_id );
+        NEED( legacy ? 3 : 2 );
+        ulong auth = legacy ? 2UL : 1UL;
+        A( "stakeAccount", 0 ); A( "authority", auth ); PK( "newAuthority", a ); S( "authorityType", auth_name[ kind ] );
+        if( legacy ) A( "clockSysvar", 1 );
+        if( acct_cnt>auth+1UL ) A( "custodian", auth+1UL );
+        EMIT( "authorize", "stake" );
+      }
+      case 2U: { /* DelegateStake */
+        int   legacy = HOLDS( 2, fd_sysvar_clock_id );
+        NEED( legacy ? 6 : 3 );
+        ulong auth = legacy ? 5UL : 2UL;
+        A( "stakeAccount", 0 ); A( "voteAccount", 1 ); A( "stakeAuthority", auth );
+        if( legacy ) { A( "clockSysvar", 2 ); A( "stakeHistorySysvar", 3 ); A( "stakeConfigAccount", 4 ); }
+        EMIT( "delegate", "stake" );
+      }
+      case 3U: { /* Split( lamports ) */
+        if( n<8UL ) return 0;
+        NEED( 3 );
+        A( "stakeAccount", 0 ); A( "newSplitAccount", 1 ); A( "stakeAuthority", 2 ); U( "lamports", FD_LOAD( ulong, a ) );
+        EMIT( "split", "stake" );
+      }
+      case 4U: { /* Withdraw( lamports ) */
+        if( n<8UL ) return 0;
+        int   legacy = HOLDS( 2, fd_sysvar_clock_id );
+        NEED( legacy ? 5 : 3 );
+        ulong auth = legacy ? 4UL : 2UL;
+        A( "stakeAccount", 0 ); A( "destination", 1 ); A( "withdrawAuthority", auth ); U( "lamports", FD_LOAD( ulong, a ) );
+        if( legacy ) { A( "clockSysvar", 2 ); A( "stakeHistorySysvar", 3 ); }
+        if( acct_cnt>auth+1UL ) A( "custodian", auth+1UL );
+        EMIT( "withdraw", "stake" );
+      }
+      case 5U: { /* Deactivate */
+        int   legacy = HOLDS( 1, fd_sysvar_clock_id );
+        NEED( legacy ? 3 : 2 );
+        A( "stakeAccount", 0 ); A( "stakeAuthority", legacy ? 2UL : 1UL );
+        if( legacy ) A( "clockSysvar", 1 );
+        EMIT( "deactivate", "stake" );
+      }
+      case 6U: case 12U: { /* SetLockup( LockupArgs ), SetLockupChecked( LockupCheckedArgs ) */
+        int has_ts = 0, has_epoch = 0, has_cust = 0; ulong ts = 0UL, epoch = 0UL; uchar const * cust = NULL;
+        ulong off = 0UL, used;
+        if( !(used = fd_rpc_pix_opt8( a+off, n-off, &has_ts,    &ts    )) ) return 0;
+        off += used;
+        if( !(used = fd_rpc_pix_opt8( a+off, n-off, &has_epoch, &epoch )) ) return 0;
+        off += used;
+        if( tag==6U ) {
+          if( n<off+1UL ) return 0;
+          if( a[ off ]==1 ) { if( n<off+33UL ) return 0; has_cust = 1; cust = a+off+1UL; }
+          else if( a[ off ]!=0 ) return 0;
+        }
+        NEED( 2 );
+        if( tag==12U && acct_cnt>=3UL ) { has_cust = 1; cust = keys[ accts[ 2 ] ]; }
+        char * p = raw[ 0 ]; char * e = raw[ 0 ]+sizeof(raw[ 0 ]); int first = 1;
+        p += snprintf( p, (ulong)(e-p), "{" );
+        if( has_cust  ) { p += snprintf( p, (ulong)(e-p), "\"custodian\":\"%s\"", fd_rpc_b58_32( cust, dk[ 0 ] ) ); first = 0; }
+        if( has_epoch ) { p += snprintf( p, (ulong)(e-p), "%s\"epoch\":%lu", first ? "" : ",", epoch ); first = 0; }
+        if( has_ts    ) { p += snprintf( p, (ulong)(e-p), "%s\"unixTimestamp\":%ld", first ? "" : ",", (long)ts ); first = 0; }
+        snprintf( p, (ulong)(e-p), "}" );
+        A( "stakeAccount", 0 ); A( "custodian", 1 ); R( "lockup", raw[ 0 ] );
+        EMIT( tag==6U ? "setLockup" : "setLockupChecked", "stake" );
+      }
+      case 7U: { /* Merge */
+        int   legacy = HOLDS( 2, fd_sysvar_clock_id );
+        NEED( legacy ? 5 : 3 );
+        A( "destination", 0 ); A( "source", 1 ); A( "stakeAuthority", legacy ? 4UL : 2UL );
+        if( legacy ) { A( "clockSysvar", 2 ); A( "stakeHistorySysvar", 3 ); }
+        EMIT( "merge", "stake" );
+      }
+      case 8U: { /* AuthorizeWithSeed: new_authorized, stake_authorize, authority_seed, authority_owner */
+        if( n<36UL ) return 0;
+        uint kind = FD_LOAD( uint, a+32UL );
+        if( kind>1U ) return 0;
+        uchar const * seed; ulong seed_len;
+        STRING( 36UL, seed, seed_len );
+        ulong off = 44UL+seed_len;
+        if( n<off+32UL ) return 0;
+        NEED( 2 );
+        A( "stakeAccount", 0 ); A( "authorityBase", 1 ); PK( "newAuthorized", a ); S( "authorityType", auth_name[ kind ] );
+        T( "authoritySeed", seed, seed_len ); PK( "authorityOwner", a+off );
+        int   legacy = HOLDS( 2, fd_sysvar_clock_id );
+        if( legacy ) A( "clockSysvar", 2 );
+        ulong cust = legacy ? 3UL : 2UL;
+        if( acct_cnt>cust ) A( "custodian", cust );
+        EMIT( "authorizeWithSeed", "stake" );
+      }
+      case 9U: { /* InitializeChecked */
+        int   legacy = HOLDS( 1, fd_sysvar_rent_id );
+        NEED( legacy ? 4 : 3 );
+        ulong staker = legacy ? 2UL : 1UL;
+        A( "stakeAccount", 0 ); A( "staker", staker ); A( "withdrawer", staker+1UL );
+        if( legacy ) A( "rentSysvar", 1 );
+        EMIT( "initializeChecked", "stake" );
+      }
+      case 10U: { /* AuthorizeChecked( StakeAuthorize ) */
+        if( n<4UL ) return 0;
+        uint kind = FD_LOAD( uint, a );
+        if( kind>1U ) return 0;
+        int   legacy = HOLDS( 1, fd_sysvar_clock_id );
+        NEED( legacy ? 4 : 3 );
+        ulong auth = legacy ? 2UL : 1UL;
+        A( "stakeAccount", 0 ); A( "authority", auth ); A( "newAuthority", auth+1UL ); S( "authorityType", auth_name[ kind ] );
+        if( legacy ) A( "clockSysvar", 1 );
+        if( acct_cnt>auth+2UL ) A( "custodian", auth+2UL );
+        EMIT( "authorizeChecked", "stake" );
+      }
+      case 11U: { /* AuthorizeCheckedWithSeed: stake_authorize, authority_seed, authority_owner */
+        if( n<4UL ) return 0;
+        uint kind = FD_LOAD( uint, a );
+        if( kind>1U ) return 0;
+        uchar const * seed; ulong seed_len;
+        STRING( 4UL, seed, seed_len );
+        ulong off = 12UL+seed_len;
+        if( n<off+32UL ) return 0;
+        int   legacy = HOLDS( 2, fd_sysvar_clock_id );
+        NEED( legacy ? 4 : 3 );
+        ulong na = legacy ? 3UL : 2UL;
+        A( "stakeAccount", 0 ); A( "authorityBase", 1 ); A( "newAuthorized", na ); S( "authorityType", auth_name[ kind ] );
+        T( "authoritySeed", seed, seed_len ); PK( "authorityOwner", a+off );
+        if( legacy ) A( "clockSysvar", 2 );
+        if( acct_cnt>na+1UL ) A( "custodian", na+1UL );
+        EMIT( "authorizeCheckedWithSeed", "stake" );
+      }
+      case 13U: x->null_info = 1; EMIT( "getMinimumDelegation", "stake" );
+      case 14U: { /* DeactivateDelinquent */
+        NEED( 3 );
+        A( "stakeAccount", 0 ); A( "voteAccount", 1 ); A( "referenceVoteAccount", 2 );
+        EMIT( "deactivateDelinquent", "stake" );
+      }
+      case 15U: { /* Redelegate */
+        NEED( 5 );
+        A( "stakeAccount", 0 ); A( "newStakeAccount", 1 ); A( "voteAccount", 2 ); A( "stakeConfigAccount", 3 ); A( "stakeAuthority", 4 );
+        EMIT( "redelegate", "stake" );
+      }
+      case 16U: case 17U: { /* MoveStake( lamports ), MoveLamports( lamports ) */
+        if( n<8UL ) return 0;
+        NEED( 3 );
+        A( "source", 0 ); A( "destination", 1 ); A( "stakeAuthority", 2 ); U( "lamports", FD_LOAD( ulong, a ) );
+        EMIT( tag==16U ? "moveStake" : "moveLamports", "stake" );
+      }
+      default: return 0;
+    }
+  }
+
+  if( is_vote ) {
+    if( sz<4UL ) return 0;
+    uint          tag = FD_LOAD( uint, d );
+    uchar const * a   = d+4UL;
+    ulong         n   = sz-4UL;
+    static char const * const auth_name[ 2 ] = { "Voter", "Withdrawer" };
+    static char const * const kind_name[ 2 ] = { "InflationRewards", "BlockRevenue" };
+    /* VoteAuthorize at offset off: Voter, Withdrawer, or VoterWithBLS
+       followed by a 48 byte BLS key and a 96 byte proof.  Adds the
+       authorityType field and sets ext to the bytes the BLS form adds. */
+    ulong ext = 0UL;
+#   define VAUTH( off ) do {                                                                    \
+      if( n<(ulong)(off)+4UL ) return 0;                                                        \
+      uint _kind = FD_LOAD( uint, a+(off) );                                                    \
+      if( _kind<2U ) S( "authorityType", auth_name[ _kind ] );                                  \
+      else if( _kind==2U ) {                                                                    \
+        if( n<(ulong)(off)+4UL+144UL ) return 0;                                                \
+        ext = 144UL;                                                                            \
+        char * _p = raw[ 1 ]; char * _e = raw[ 1 ]+sizeof(raw[ 1 ]);                            \
+        _p += snprintf( _p, (ulong)(_e-_p), "{\"VoterWithBLS\":{\"bls_proof_of_possession\":[" ); \
+        for( ulong _i=0UL; _i<96UL; _i++ ) _p += snprintf( _p, (ulong)(_e-_p), "%s%u", _i ? "," : "", (uint)a[ (off)+4UL+48UL+_i ] ); \
+        _p += snprintf( _p, (ulong)(_e-_p), "],\"bls_pubkey\":[" );                             \
+        for( ulong _i=0UL; _i<48UL; _i++ ) _p += snprintf( _p, (ulong)(_e-_p), "%s%u", _i ? "," : "", (uint)a[ (off)+4UL+_i ] ); \
+        snprintf( _p, (ulong)(_e-_p), "]}}" );                                                  \
+        R( "authorityType", raw[ 1 ] );                                                         \
+      } else return 0;                                                                          \
+    } while(0)
+    switch( tag ) {
+      case 0U: { /* InitializeAccount( VoteInit ): node, voter, withdrawer, commission */
+        if( n<97UL ) return 0;
+        NEED( 4 );
+        A( "voteAccount", 0 ); A( "rentSysvar", 1 ); A( "clockSysvar", 2 ); A( "node", 3 );
+        PK( "authorizedVoter", a+32UL ); PK( "authorizedWithdrawer", a+64UL ); U( "commission", a[ 96 ] );
+        EMIT( "initialize", "vote" );
+      }
+      case 1U: { /* Authorize( Pubkey, VoteAuthorize ) */
+        if( n<36UL ) return 0;
+        NEED( 3 );
+        A( "voteAccount", 0 ); A( "clockSysvar", 1 ); A( "authority", 2 ); PK( "newAuthority", a ); VAUTH( 32UL );
+        EMIT( "authorize", "vote" );
+      }
+      case 2U: case 6U: { /* Vote( Vote ), VoteSwitch( Vote, Hash ): slots, hash, timestamp */
+        if( n<8UL ) return 0;
+        ulong cnt = FD_LOAD( ulong, a );
+        if( cnt>128UL || n<8UL+8UL*cnt+32UL ) return 0;
+        ulong off = 8UL+8UL*cnt;
+        int has_ts = 0; ulong ts = 0UL;
+        ulong used = fd_rpc_pix_opt8( a+off+32UL, n-off-32UL, &has_ts, &ts );
+        if( !used ) return 0;
+        if( tag==6U && n<off+32UL+used+32UL ) return 0;
+        NEED( 4 );
+        char * p = raw[ 0 ]; char * e = raw[ 0 ]+sizeof(raw[ 0 ]);
+        p += snprintf( p, (ulong)(e-p), "{\"hash\":\"%s\",\"slots\":[", fd_rpc_b58_32( a+off, dk[ 0 ] ) );
+        for( ulong i=0UL; i<cnt; i++ ) p += snprintf( p, (ulong)(e-p), "%s%lu", i ? "," : "", FD_LOAD( ulong, a+8UL+8UL*i ) );
+        if( has_ts ) snprintf( p, (ulong)(e-p), "],\"timestamp\":%ld}", (long)ts ); else snprintf( p, (ulong)(e-p), "],\"timestamp\":null}" );
+        A( "voteAccount", 0 ); A( "slotHashesSysvar", 1 ); A( "clockSysvar", 2 ); A( "voteAuthority", 3 ); R( "vote", raw[ 0 ] );
+        if( tag==6U ) PK( "hash", a+off+32UL+used );
+        EMIT( tag==2U ? "vote" : "voteSwitch", "vote" );
+      }
+      case 3U: { /* Withdraw( lamports ) */
+        if( n<8UL ) return 0;
+        NEED( 3 );
+        A( "voteAccount", 0 ); A( "destination", 1 ); A( "withdrawAuthority", 2 ); U( "lamports", FD_LOAD( ulong, a ) );
+        EMIT( "withdraw", "vote" );
+      }
+      case 4U: { /* UpdateValidatorIdentity */
+        NEED( 3 );
+        A( "voteAccount", 0 ); A( "newValidatorIdentity", 1 ); A( "withdrawAuthority", 2 );
+        EMIT( "updateValidatorIdentity", "vote" );
+      }
+      case 5U: { /* UpdateCommission( u8 ) */
+        if( n<1UL ) return 0;
+        NEED( 2 );
+        A( "voteAccount", 0 ); A( "withdrawAuthority", 1 ); U( "commission", a[ 0 ] );
+        EMIT( "updateCommission", "vote" );
+      }
+      case 7U: { /* AuthorizeChecked( VoteAuthorize ) */
+        NEED( 4 );
+        A( "voteAccount", 0 ); A( "clockSysvar", 1 ); A( "authority", 2 ); A( "newAuthority", 3 ); VAUTH( 0UL );
+        EMIT( "authorizeChecked", "vote" );
+      }
+      case 8U: case 9U: { /* UpdateVoteState( VoteStateUpdate ) [, Hash]: lockouts, root, hash, timestamp */
+        if( n<8UL ) return 0;
+        ulong cnt = FD_LOAD( ulong, a );
+        if( cnt>128UL || n<8UL+12UL*cnt ) return 0;
+        ulong off = 8UL+12UL*cnt;
+        int has_root = 0, has_ts = 0; ulong root = 0UL, ts = 0UL, used;
+        if( !(used = fd_rpc_pix_opt8( a+off, n-off, &has_root, &root )) ) return 0;
+        off += used;
+        if( n<off+32UL ) return 0;
+        uchar const * hash = a+off; off += 32UL;
+        if( !(used = fd_rpc_pix_opt8( a+off, n-off, &has_ts, &ts )) ) return 0;
+        off += used;
+        if( tag==9U && n<off+32UL ) return 0;
+        NEED( 2 );
+        char * p = raw[ 0 ]; char * e = raw[ 0 ]+sizeof(raw[ 0 ]);
+        p += snprintf( p, (ulong)(e-p), "{\"hash\":\"%s\",\"lockouts\":[", fd_rpc_b58_32( hash, dk[ 0 ] ) );
+        for( ulong i=0UL; i<cnt; i++ ) p += snprintf( p, (ulong)(e-p), "%s{\"confirmation_count\":%u,\"slot\":%lu}", i ? "," : "", FD_LOAD( uint, a+8UL+12UL*i+8UL ), FD_LOAD( ulong, a+8UL+12UL*i ) );
+        if( has_root ) p += snprintf( p, (ulong)(e-p), "],\"root\":%lu,", root ); else p += snprintf( p, (ulong)(e-p), "],\"root\":null," );
+        if( has_ts ) snprintf( p, (ulong)(e-p), "\"timestamp\":%ld}", (long)ts ); else snprintf( p, (ulong)(e-p), "\"timestamp\":null}" );
+        A( "voteAccount", 0 ); A( "voteAuthority", 1 ); R( "voteStateUpdate", raw[ 0 ] );
+        if( tag==9U ) PK( "hash", a+off );
+        EMIT( tag==8U ? "updatevotestate" : "updatevotestateswitch", "vote" );
+      }
+      case 10U: case 11U: { /* AuthorizeWithSeed, AuthorizeCheckedWithSeed: type, owner, seed [, new_authority] */
+        NEED( tag==10U ? 3 : 4 );
+        VAUTH( 0UL );
+        if( n<36UL+ext ) return 0;
+        uchar const * seed; ulong seed_len;
+        STRING( 36UL+ext, seed, seed_len );
+        ulong off = 44UL+ext+seed_len;
+        if( tag==10U && n<off+32UL ) return 0;
+        A( "voteAccount", 0 ); A( "clockSysvar", 1 ); A( "authorityBaseKey", 2 ); PK( "authorityOwner", a+4UL+ext );
+        T( "authoritySeed", seed, seed_len );
+        if( tag==10U ) PK( "newAuthority", a+off ); else A( "newAuthority", 3 );
+        EMIT( tag==10U ? "authorizeWithSeed" : "authorizeCheckedWithSeed", "vote" );
+      }
+      case 12U: case 13U: case 14U: case 15U: {
+        /* CompactUpdateVoteState [Switch], TowerSync [Switch]: root (all
+           ones if none), lockouts as slot offsets from the root, hash,
+           timestamp, then for a tower sync the block id */
+        if( n<9UL ) return 0;
+        ulong root = FD_LOAD( ulong, a );
+        ulong off  = 8UL;
+        ulong cnt  = 0UL;
+        for( uint shift=0U; ; shift+=7U ) { /* short_vec length */
+          if( off>=n || shift>14U ) return 0;
+          uchar b = a[ off++ ];
+          cnt |= (ulong)(b & 0x7f)<<shift;
+          if( !(b & 0x80) ) break;
+        }
+        if( cnt>128UL ) return 0;
+        char * p = raw[ 1 ]; char * e = raw[ 1 ]+sizeof(raw[ 1 ]);
+        ulong slot = root==ULONG_MAX ? 0UL : root;
+        p += snprintf( p, (ulong)(e-p), "[" );
+        for( ulong i=0UL; i<cnt; i++ ) {
+          ulong delta = 0UL;
+          for( uint shift=0U; ; shift+=7U ) { /* varint */
+            if( off>=n || shift>63U ) return 0;
+            uchar b = a[ off++ ];
+            delta |= (ulong)(b & 0x7f)<<shift;
+            if( !(b & 0x80) ) break;
+          }
+          if( off>=n ) return 0;
+          uint conf = a[ off++ ];
+          if( FD_UNLIKELY( slot+delta<slot ) ) return 0;
+          slot += delta;
+          p += snprintf( p, (ulong)(e-p), "%s{\"confirmation_count\":%u,\"slot\":%lu}", i ? "," : "", conf, slot );
+        }
+        snprintf( p, (ulong)(e-p), "]" );
+        if( n<off+32UL ) return 0;
+        uchar const * hash = a+off; off += 32UL;
+        int has_ts = 0; ulong ts = 0UL, used;
+        if( !(used = fd_rpc_pix_opt8( a+off, n-off, &has_ts, &ts )) ) return 0;
+        off += used;
+        int tower = tag>=14U;
+        uchar const * block_id = NULL;
+        if( tower ) { if( n<off+32UL ) return 0; block_id = a+off; off += 32UL; }
+        int sw = tag==13U || tag==15U;
+        if( sw && n<off+32UL ) return 0;
+        NEED( 2 );
+        p = raw[ 0 ]; e = raw[ 0 ]+sizeof(raw[ 0 ]);
+        p += snprintf( p, (ulong)(e-p), "{" );
+        if( tower ) p += snprintf( p, (ulong)(e-p), "\"blockId\":\"%s\",", fd_rpc_b58_32( block_id, dk[ 1 ] ) );
+        p += snprintf( p, (ulong)(e-p), "\"hash\":\"%s\",\"lockouts\":%s,", fd_rpc_b58_32( hash, dk[ 0 ] ), raw[ 1 ] );
+        if( root!=ULONG_MAX ) p += snprintf( p, (ulong)(e-p), "\"root\":%lu,", root ); else p += snprintf( p, (ulong)(e-p), "\"root\":null," );
+        if( has_ts ) snprintf( p, (ulong)(e-p), "\"timestamp\":%ld}", (long)ts ); else snprintf( p, (ulong)(e-p), "\"timestamp\":null}" );
+        A( "voteAccount", 0 ); A( "voteAuthority", 1 ); R( tower ? "towerSync" : "voteStateUpdate", raw[ 0 ] );
+        if( sw ) PK( "hash", a+off );
+        EMIT( tag==12U ? "compactupdatevotestate" : tag==13U ? "compactupdatevotestateswitch" : tag==14U ? "towersync" : "towersyncswitch", "vote" );
+      }
+      case 16U: { /* InitializeAccountV2( VoteInitV2 ): node, voter, BLS key, BLS proof, withdrawer, two commissions */
+        if( n<244UL ) return 0;
+        NEED( 4 );
+        A( "voteAccount", 0 ); A( "node", 1 ); A( "inflationRewardsCollector", 2 ); A( "blockRevenueCollector", 3 );
+        PK( "authorizedVoter", a+32UL );
+        fd_rpc_pix_add( x, "authorizedVoterBlsPubkey", FD_RPC_PIX_RAW, (uchar const *)raw[ 0 ], 0UL, 0UL );
+        { raw[ 0 ][ 0 ] = '"'; ulong k = fd_base64_encode( raw[ 0 ]+1UL, a+64UL, 48UL ); raw[ 0 ][ 1UL+k ] = '"'; raw[ 0 ][ 2UL+k ] = '\0'; }
+        fd_rpc_pix_add( x, "authorizedVoterBlsProofOfPossession", FD_RPC_PIX_RAW, (uchar const *)raw[ 1 ], 0UL, 0UL );
+        { raw[ 1 ][ 0 ] = '"'; ulong k = fd_base64_encode( raw[ 1 ]+1UL, a+112UL, 96UL ); raw[ 1 ][ 1UL+k ] = '"'; raw[ 1 ][ 2UL+k ] = '\0'; }
+        PK( "authorizedWithdrawer", a+208UL );
+        U( "inflationRewardsCommissionBps", FD_LOAD( ushort, a+240UL ) ); U( "blockRevenueCommissionBps", FD_LOAD( ushort, a+242UL ) );
+        EMIT( "initializeV2", "vote" );
+      }
+      case 17U: { /* UpdateCommissionCollector( CommissionKind ) */
+        if( n<4UL ) return 0;
+        uint kind = FD_LOAD( uint, a );
+        if( kind>1U ) return 0;
+        NEED( 3 );
+        A( "voteAccount", 0 ); A( "newCollector", 1 ); A( "withdrawAuthority", 2 ); S( "commissionKind", kind_name[ kind ] );
+        EMIT( "updateCommissionCollector", "vote" );
+      }
+      case 18U: { /* UpdateCommissionBps { commission_bps, kind } */
+        if( n<6UL ) return 0;
+        uint kind = FD_LOAD( uint, a+2UL );
+        if( kind>1U ) return 0;
+        NEED( 2 );
+        A( "voteAccount", 0 ); A( "withdrawAuthority", 1 ); U( "commissionBps", FD_LOAD( ushort, a ) ); S( "commissionKind", kind_name[ kind ] );
+        EMIT( "updateCommissionBps", "vote" );
+      }
+      case 19U: { /* DepositDelegatorRewards { deposit } */
+        if( n<8UL ) return 0;
+        NEED( 2 );
+        A( "voteAccount", 0 ); A( "source", 1 ); U( "deposit", FD_LOAD( ulong, a ) );
+        EMIT( "depositDelegatorRewards", "vote" );
+      }
+      default: return 0;
+    }
+#   undef VAUTH
+  }
+
+  if( is_token ) {
+    if( sz<1UL ) return 0;
+    uint          tag = d[ 0 ];
+    uchar const * a   = d+1UL;
+    ulong         n   = sz-1UL;
+    /* the last account is the authority, or a multisig followed by its signers */
+#   define SIGNERS( last, owner_name, multisig_name ) do {                                               \
+      if( acct_cnt>(ulong)(last)+1UL ) { A( multisig_name, last ); fd_rpc_pix_add( x, "signers", FD_RPC_PIX_KEYS, NULL, (ulong)(last)+1UL, 0UL ); } \
+      else                             A( owner_name, last );                                             \
+    } while(0)
+#   define AMT( name, v )      fd_rpc_pix_add( x, name, FD_RPC_PIX_U64STR, NULL, (v), 0UL )
+#   define TOK( v, decimals )  fd_rpc_pix_add( x, "tokenAmount", FD_RPC_PIX_TOKAMT, NULL, (v), (ulong)(decimals) )
+    switch( tag ) {
+      case 0U: case 20U: { /* InitializeMint, InitializeMint2: decimals, mint authority, optional freeze authority */
+        if( n<34UL ) return 0;
+        if( a[ 33 ]>1 || ( a[ 33 ]==1 && n<66UL ) ) return 0;
+        NEED( tag==0U ? 2 : 1 );
+        A( "mint", 0 ); U( "decimals", a[ 0 ] ); PK( "mintAuthority", a+1UL );
+        if( tag==0U ) A( "rentSysvar", 1 );
+        if( a[ 33 ]==1 ) PK( "freezeAuthority", a+34UL );
+        EMIT( tag==0U ? "initializeMint" : "initializeMint2", "spl-token" );
+      }
+      case 1U: { /* InitializeAccount */
+        NEED( 4 );
+        A( "account", 0 ); A( "mint", 1 ); A( "owner", 2 ); A( "rentSysvar", 3 );
+        EMIT( "initializeAccount", "spl-token" );
+      }
+      case 16U: { /* InitializeAccount2 { owner } */
+        if( n<32UL ) return 0;
+        NEED( 3 );
+        A( "account", 0 ); A( "mint", 1 ); PK( "owner", a ); A( "rentSysvar", 2 );
+        EMIT( "initializeAccount2", "spl-token" );
+      }
+      case 18U: { /* InitializeAccount3 { owner } */
+        if( n<32UL ) return 0;
+        NEED( 2 );
+        A( "account", 0 ); A( "mint", 1 ); PK( "owner", a );
+        EMIT( "initializeAccount3", "spl-token" );
+      }
+      case 2U: { /* InitializeMultisig { m } */
+        if( n<1UL ) return 0;
+        NEED( 3 );
+        A( "multisig", 0 ); A( "rentSysvar", 1 ); fd_rpc_pix_add( x, "signers", FD_RPC_PIX_KEYS, NULL, 2UL, 0UL ); U( "m", a[ 0 ] );
+        EMIT( "initializeMultisig", "spl-token" );
+      }
+      case 19U: { /* InitializeMultisig2 { m } */
+        if( n<1UL ) return 0;
+        NEED( 2 );
+        A( "multisig", 0 ); fd_rpc_pix_add( x, "signers", FD_RPC_PIX_KEYS, NULL, 1UL, 0UL ); U( "m", a[ 0 ] );
+        EMIT( "initializeMultisig2", "spl-token" );
+      }
+      case 3U: { /* Transfer { amount } */
+        if( n<8UL ) return 0;
+        NEED( 3 );
+        A( "source", 0 ); A( "destination", 1 ); AMT( "amount", FD_LOAD( ulong, a ) );
+        SIGNERS( 2, "authority", "multisigAuthority" );
+        EMIT( "transfer", "spl-token" );
+      }
+      case 4U: { /* Approve { amount } */
+        if( n<8UL ) return 0;
+        NEED( 3 );
+        A( "source", 0 ); A( "delegate", 1 ); AMT( "amount", FD_LOAD( ulong, a ) );
+        SIGNERS( 2, "owner", "multisigOwner" );
+        EMIT( "approve", "spl-token" );
+      }
+      case 5U: { /* Revoke */
+        NEED( 2 );
+        A( "source", 0 );
+        SIGNERS( 1, "owner", "multisigOwner" );
+        EMIT( "revoke", "spl-token" );
+      }
+      case 6U: { /* SetAuthority { authority_type, new_authority } */
+        static char const * const type_name[ 18 ] = {
+          "mintTokens", "freezeAccount", "accountOwner", "closeAccount", "transferFeeConfig", "withheldWithdraw", "closeMint",
+          "interestRate", "permanentDelegate", "confidentialTransferMint", "transferHookProgramId", "confidentialTransferFeeConfig",
+          "metadataPointer", "groupPointer", "groupMemberPointer", "scaledUiAmount", "pause", "permissionedBurn" };
+        if( n<2UL || a[ 0 ]>=18 ) return 0;
+        if( a[ 1 ]>1 || ( a[ 1 ]==1 && n<34UL ) ) return 0;
+        NEED( 2 );
+        A( ( a[ 0 ]==2 || a[ 0 ]==3 ) ? "account" : "mint", 0 ); S( "authorityType", type_name[ a[ 0 ] ] );
+        if( a[ 1 ]==1 ) PK( "newAuthority", a+2UL ); else NUL( "newAuthority" );
+        SIGNERS( 1, "authority", "multisigAuthority" );
+        EMIT( "setAuthority", "spl-token" );
+      }
+      case 7U: { /* MintTo { amount } */
+        if( n<8UL ) return 0;
+        NEED( 3 );
+        A( "mint", 0 ); A( "account", 1 ); AMT( "amount", FD_LOAD( ulong, a ) );
+        SIGNERS( 2, "mintAuthority", "multisigMintAuthority" );
+        EMIT( "mintTo", "spl-token" );
+      }
+      case 8U: { /* Burn { amount } */
+        if( n<8UL ) return 0;
+        NEED( 3 );
+        A( "account", 0 ); A( "mint", 1 ); AMT( "amount", FD_LOAD( ulong, a ) );
+        SIGNERS( 2, "authority", "multisigAuthority" );
+        EMIT( "burn", "spl-token" );
+      }
+      case 9U: { /* CloseAccount */
+        NEED( 3 );
+        A( "account", 0 ); A( "destination", 1 );
+        SIGNERS( 2, "owner", "multisigOwner" );
+        EMIT( "closeAccount", "spl-token" );
+      }
+      case 10U: case 11U: { /* FreezeAccount, ThawAccount */
+        NEED( 3 );
+        A( "account", 0 ); A( "mint", 1 );
+        SIGNERS( 2, "freezeAuthority", "multisigFreezeAuthority" );
+        EMIT( tag==10U ? "freezeAccount" : "thawAccount", "spl-token" );
+      }
+      case 12U: { /* TransferChecked { amount, decimals } */
+        if( n<9UL ) return 0;
+        NEED( 4 );
+        A( "source", 0 ); A( "mint", 1 ); A( "destination", 2 ); TOK( FD_LOAD( ulong, a ), a[ 8 ] );
+        SIGNERS( 3, "authority", "multisigAuthority" );
+        EMIT( "transferChecked", "spl-token" );
+      }
+      case 13U: { /* ApproveChecked { amount, decimals } */
+        if( n<9UL ) return 0;
+        NEED( 4 );
+        A( "source", 0 ); A( "mint", 1 ); A( "delegate", 2 ); TOK( FD_LOAD( ulong, a ), a[ 8 ] );
+        SIGNERS( 3, "owner", "multisigOwner" );
+        EMIT( "approveChecked", "spl-token" );
+      }
+      case 14U: { /* MintToChecked { amount, decimals } */
+        if( n<9UL ) return 0;
+        NEED( 3 );
+        A( "mint", 0 ); A( "account", 1 ); TOK( FD_LOAD( ulong, a ), a[ 8 ] );
+        SIGNERS( 2, "mintAuthority", "multisigMintAuthority" );
+        EMIT( "mintToChecked", "spl-token" );
+      }
+      case 15U: { /* BurnChecked { amount, decimals } */
+        if( n<9UL ) return 0;
+        NEED( 3 );
+        A( "account", 0 ); A( "mint", 1 ); TOK( FD_LOAD( ulong, a ), a[ 8 ] );
+        SIGNERS( 2, "authority", "multisigAuthority" );
+        EMIT( "burnChecked", "spl-token" );
+      }
+      case 17U: NEED( 1 ); A( "account", 0 ); EMIT( "syncNative", "spl-token" );
+      case 21U: { /* GetAccountDataSize { extension_types } */
+        static char const * const ext_name[ 29 ] = {
+          "uninitialized", "transferFeeConfig", "transferFeeAmount", "mintCloseAuthority", "confidentialTransferMint",
+          "confidentialTransferAccount", "defaultAccountState", "immutableOwner", "memoTransfer", "nonTransferable",
+          "interestBearingConfig", "cpiGuard", "permanentDelegate", "nonTransferableAccount", "transferHook", "transferHookAccount",
+          "confidentialTransferFeeConfig", "confidentialTransferFeeAmount", "metadataPointer", "tokenMetadata", "groupPointer",
+          "tokenGroup", "groupMemberPointer", "tokenGroupMember", "confidentialMintBurn", "scaledUiAmount", "pausable",
+          "pausableAccount", "permissionedBurn" };
+        if( (n & 1UL) || n>128UL ) return 0;
+        NEED( 1 );
+        A( "mint", 0 );
+        if( n ) {
+          char * p = raw[ 0 ]; char * e = raw[ 0 ]+sizeof(raw[ 0 ]);
+          p += snprintf( p, (ulong)(e-p), "[" );
+          for( ulong i=0UL; i<n; i+=2UL ) {
+            ushort t = FD_LOAD( ushort, a+i );
+            if( t>=29 ) return 0;
+            p += snprintf( p, (ulong)(e-p), "%s\"%s\"", i ? "," : "", ext_name[ t ] );
+          }
+          snprintf( p, (ulong)(e-p), "]" );
+          R( "extensionTypes", raw[ 0 ] );
+        }
+        EMIT( "getAccountDataSize", "spl-token" );
+      }
+      case 25U: { /* InitializeMintCloseAuthority { close_authority } */
+        if( n<1UL || a[ 0 ]>1 || ( a[ 0 ]==1 && n<33UL ) ) return 0;
+        NEED( 1 );
+        A( "mint", 0 );
+        if( a[ 0 ]==1 ) PK( "newAuthority", a+1UL ); else NUL( "newAuthority" );
+        EMIT( "initializeMintCloseAuthority", "spl-token" );
+      }
+      case 31U: { /* CreateNativeMint */
+        NEED( 3 );
+        A( "payer", 0 ); A( "nativeMint", 1 ); A( "systemProgram", 2 );
+        EMIT( "createNativeMint", "spl-token" );
+      }
+      case 32U: NEED( 1 ); A( "mint", 0 ); EMIT( "initializeNonTransferableMint", "spl-token" );
+      case 35U: { /* InitializePermanentDelegate { delegate } */
+        if( n<32UL ) return 0;
+        NEED( 1 );
+        A( "mint", 0 ); PK( "delegate", a );
+        EMIT( "initializePermanentDelegate", "spl-token" );
+      }
+      case 38U: { /* WithdrawExcessLamports */
+        NEED( 3 );
+        A( "source", 0 ); A( "destination", 1 );
+        SIGNERS( 2, "authority", "multisigAuthority" );
+        EMIT( "withdrawExcessLamports", "spl-token" );
+      }
+      case 45U: { /* UnwrapLamports { amount } */
+        if( n<1UL || a[ 0 ]>1 || ( a[ 0 ]==1 && n<9UL ) ) return 0;
+        NEED( 3 );
+        A( "source", 0 ); A( "destination", 1 );
+        if( a[ 0 ]==1 ) AMT( "amount", FD_LOAD( ulong, a+1UL ) );
+        SIGNERS( 2, "authority", "multisigAuthority" );
+        EMIT( "unwrapLamports", "spl-token" );
+      }
+      case 22U: NEED( 1 ); A( "account", 0 ); EMIT( "initializeImmutableOwner", "spl-token" );
+      case 23U: { /* AmountToUiAmount { amount } */
+        if( n<8UL ) return 0;
+        NEED( 1 );
+        A( "mint", 0 ); AMT( "amount", FD_LOAD( ulong, a ) );
+        EMIT( "amountToUiAmount", "spl-token" );
+      }
+      case 24U: { /* UiAmountToAmount { ui_amount } */
+        if( !fd_utf8_verify( (char const *)a, n ) ) return 0;
+        NEED( 1 );
+        A( "mint", 0 ); T( "uiAmount", a, n );
+        EMIT( "uiAmountToAmount", "spl-token" );
+      }
+      default: return 0; /* the Token-2022 extension families are not decoded */
+    }
+#   undef SIGNERS
+#   undef AMT
+#   undef TOK
+  }
+
+  if( is_ata ) {
+    uint tag = 0U;
+    if( sz ) { if( sz!=1UL || d[ 0 ]>2 ) return 0; tag = d[ 0 ]; }
+    if( tag<2U ) {
+      NEED( 6 );
+      A( "source", 0 ); A( "account", 1 ); A( "wallet", 2 ); A( "mint", 3 ); A( "systemProgram", 4 ); A( "tokenProgram", 5 );
+      EMIT( tag==0U ? "create" : "createIdempotent", "spl-associated-token-account" );
+    }
+    NEED( 7 );
+    A( "nestedSource", 0 ); A( "nestedMint", 1 ); A( "destination", 2 ); A( "nestedOwner", 3 ); A( "ownerMint", 4 ); A( "wallet", 5 ); A( "tokenProgram", 6 );
+    EMIT( "recoverNested", "spl-associated-token-account" );
+  }
+
+  if( is_loader ) {
+    if( sz<4UL || !acct_cnt ) return 0;
+    uint          tag = FD_LOAD( uint, d );
+    uchar const * a   = d+4UL;
+    ulong         n   = sz-4UL;
+    if( tag==0U ) { /* Write { offset, bytes } */
+      if( n<12UL ) return 0;
+      ulong len = FD_LOAD( ulong, a+4UL );
+      if( len>n-12UL || len>8192UL ) return 0;
+      NEED( 1 );
+      U( "offset", FD_LOAD( uint, a ) ); fd_rpc_pix_add( x, "bytes", FD_RPC_PIX_B64, a+12UL, 0UL, len ); A( "account", 0 );
+      EMIT( "write", "bpf-loader" );
+    }
+    if( tag==1U ) { NEED( 2 ); A( "account", 0 ); EMIT( "finalize", "bpf-loader" ); }
+    return 0;
+  }
+
+  if( is_loader3 ) {
+    if( sz<4UL ) return 0;
+    uint          tag = FD_LOAD( uint, d );
+    uchar const * a   = d+4UL;
+    ulong         n   = sz-4UL;
+    switch( tag ) {
+      case 0U: { /* InitializeBuffer */
+        NEED( 1 );
+        A( "account", 0 );
+        if( acct_cnt>1UL ) A( "authority", 1 );
+        EMIT( "initializeBuffer", "bpf-upgradeable-loader" );
+      }
+      case 1U: { /* Write { offset, bytes } */
+        if( n<12UL ) return 0;
+        ulong len = FD_LOAD( ulong, a+4UL );
+        if( len>n-12UL || len>8192UL ) return 0;
+        NEED( 2 );
+        U( "offset", FD_LOAD( uint, a ) ); fd_rpc_pix_add( x, "bytes", FD_RPC_PIX_B64, a+12UL, 0UL, len ); A( "account", 0 ); A( "authority", 1 );
+        EMIT( "write", "bpf-upgradeable-loader" );
+      }
+      case 2U: { /* DeployWithMaxDataLen { max_data_len } */
+        if( n<8UL ) return 0;
+        NEED( 8 );
+        U( "maxDataLen", FD_LOAD( ulong, a ) ); A( "payerAccount", 0 ); A( "programDataAccount", 1 ); A( "programAccount", 2 ); A( "bufferAccount", 3 );
+        A( "rentSysvar", 4 ); A( "clockSysvar", 5 ); A( "systemProgram", 6 ); A( "authority", 7 );
+        EMIT( "deployWithMaxDataLen", "bpf-upgradeable-loader" );
+      }
+      case 3U: { /* Upgrade */
+        NEED( 7 );
+        A( "programDataAccount", 0 ); A( "programAccount", 1 ); A( "bufferAccount", 2 ); A( "spillAccount", 3 ); A( "rentSysvar", 4 ); A( "clockSysvar", 5 ); A( "authority", 6 );
+        EMIT( "upgrade", "bpf-upgradeable-loader" );
+      }
+      case 4U: { /* SetAuthority */
+        NEED( 2 );
+        A( "account", 0 ); A( "authority", 1 );
+        if( acct_cnt>2UL ) A( "newAuthority", 2 ); else NUL( "newAuthority" );
+        EMIT( "setAuthority", "bpf-upgradeable-loader" );
+      }
+      case 5U: { /* Close */
+        NEED( 3 );
+        A( "account", 0 ); A( "recipient", 1 ); A( "authority", 2 );
+        if( acct_cnt>3UL ) A( "programAccount", 3 ); else NUL( "programAccount" );
+        EMIT( "close", "bpf-upgradeable-loader" );
+      }
+      case 6U: { /* ExtendProgram { additional_bytes } */
+        if( n<4UL ) return 0;
+        NEED( 2 );
+        U( "additionalBytes", FD_LOAD( uint, a ) ); A( "programDataAccount", 0 ); A( "programAccount", 1 );
+        if( acct_cnt>2UL ) A( "systemProgram", 2 ); else NUL( "systemProgram" );
+        if( acct_cnt>3UL ) A( "payerAccount", 3 );  else NUL( "payerAccount" );
+        EMIT( "extendProgram", "bpf-upgradeable-loader" );
+      }
+      case 7U: { /* SetAuthorityChecked */
+        NEED( 3 );
+        A( "account", 0 ); A( "authority", 1 ); A( "newAuthority", 2 );
+        EMIT( "setAuthorityChecked", "bpf-upgradeable-loader" );
+      }
+      default: return 0;
+    }
+  }
+# undef A
+# undef PK
+# undef U
+# undef S
+# undef T
+# undef R
+# undef NUL
+# undef NEED
+# undef HOLDS
+# undef EMIT
+# undef STRING
+  return 0;
 }
 
 /* Returns 1 if it printed a "parsed":…,"program":"…" pair. */
@@ -5274,9 +6154,11 @@ fd_rpc_print_parsed_ix_body( fd_rpc_tile_t *       ctx,
 # undef NEED
 # undef SEED
 
+  if( fd_rpc_print_parsed_ix_more( ctx, keys, key_cnt, program, accts, acct_cnt, d, sz ) ) return 1;
+
   /* the memo programs: the memo text itself is the parsed value */
   FD_BASE58_ENCODE_32_BYTES( program, prog_b58 );
-  if( !strcmp( prog_b58, "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr" ) || !strcmp( prog_b58, "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo" ) ) {
+  if( !strcmp( prog_b58, "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr" ) || !strcmp( prog_b58, "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo" ) || !strcmp( prog_b58, "Memo4c2pN8afCj432Lb7RMVKi9PbQnnW7ewFFaV3oAH" ) ) {
     if( FD_UNLIKELY( !fd_utf8_verify( (char const *)d, sz ) ) ) return 0;
     fd_http_server_printf( h, "\"parsed\":\"" );
     fd_rpc_print_json_text( ctx, d, sz );
@@ -6415,36 +7297,139 @@ fd_rpc_print_vote_infos( fd_rpc_tile_t *            ctx,
   }
 }
 
+/* fd_rpc_vote_stakes_refresh rebuilds the table of vote accounts and
+   their delegated stake if it may be out of date.  Agave reports every
+   vote account, with the stake that is effective in the bank's epoch.
+   That stake only changes at an epoch boundary and while the epoch's
+   staking rewards are paid out in its first blocks, so the table is
+   rebuilt on a new epoch, every 30 seconds while rewards are being
+   paid, and otherwise every 10 minutes to pick up new vote accounts.
+   The rebuild walks every account, which blocks this tile for seconds.
+   Returns 0 if the table could not be built. */
+
+static int
+fd_rpc_vote_stakes_refresh( fd_rpc_tile_t *     ctx,
+                            bank_info_t const * bank ) {
+  long now = fd_log_wallclock();
+  if( FD_LIKELY( ctx->vote_stake_valid && ctx->vote_stake_epoch==bank->epoch &&
+                 now-ctx->vote_stake_ts < ( ctx->vote_stake_rewards_active ? 30L : 600L )*1000000000L ) ) return 1;
+  if( FD_UNLIKELY( !ctx->has_features || !ctx->has_epoch_schedule ) ) return 0;
+
+  fd_stake_history_t   hist_view[ 1 ];
+  fd_stake_history_t * hist = NULL;
+  {
+    ulong lamports; int executable; uchar owner[ 32UL ]; ulong data_len;
+    fd_accdb_read_one_nocache( ctx->accdb, bank->accdb_fork_id, fd_sysvar_stake_history_id.uc, &lamports, &executable, owner, ctx->scratch.accdb_data_buf, &data_len );
+    if( FD_LIKELY( lamports && data_len ) ) {
+      ulong sz = fd_ulong_min( data_len, FD_SYSVAR_STAKE_HISTORY_BINCODE_SZ );
+      fd_memcpy( ctx->stake_history_buf, ctx->scratch.accdb_data_buf, sz );
+      hist = fd_sysvar_stake_history_view( hist_view, ctx->stake_history_buf, sz );
+    }
+  }
+  if( FD_UNLIKELY( !hist ) ) return 0;
+  ulong rate_epoch = fd_slot_to_epoch( &ctx->epoch_schedule, ctx->features.reduce_stake_warmup_cooldown, NULL );
+
+  memset( ctx->voter_table, 0, sizeof(ctx->voter_table) );
+  ulong vote_cnt  = 0UL;
+  ulong chain_cnt = fd_accdb_scan_chain_cnt( ctx->accdb );
+  ulong cursor    = 0UL;
+  while( cursor<chain_cnt ) {
+    ulong n = fd_accdb_scan_keys( ctx->accdb, &cursor, ctx->scan_keys, FD_RPC_SCAN_KEYS_MAX, FD_RPC_SCAN_CHAIN_BUDGET );
+    for( ulong i=0UL; i<n; i++ ) {
+      uchar const * key = ctx->scan_keys+i*32UL;
+      uchar owner[ 32UL ];
+      ulong data_len = 0UL;
+      fd_accdb_read_one_meta( ctx->accdb, bank->accdb_fork_id, key, owner, &data_len );
+      if( !memcmp( owner, fd_solana_vote_program_id.uc, 32UL ) ) {
+        if( !fd_accdb_lamports( ctx->accdb, bank->accdb_fork_id, key ) ) continue;
+        if( FD_UNLIKELY( vote_cnt==FD_RPC_VOTE_STAKE_MAX ) ) continue;
+        memcpy( ctx->vote_stake_keys[ vote_cnt++ ].uc, key, 32UL );
+      } else if( !memcmp( owner, fd_solana_stake_program_id.uc, 32UL ) ) {
+        if( data_len<FD_STAKE_STATE_SZ ) continue;
+        ulong lamports = 0UL; int executable = 0;
+        fd_accdb_read_one_nocache( ctx->accdb, bank->accdb_fork_id, key, &lamports, &executable, owner, ctx->scratch.accdb_data_buf, &data_len );
+        if( !lamports || memcmp( owner, fd_solana_stake_program_id.uc, 32UL ) ) continue;
+        fd_stake_state_t const * st = fd_stake_state_view( ctx->scratch.accdb_data_buf, data_len );
+        if( !st || st->stake_type!=FD_STAKE_STATE_STAKE ) continue;
+        fd_delegation_t const * del = &st->stake.stake.delegation;
+        ulong eff = fd_delegation_activation_status( del, bank->epoch, hist, &rate_epoch ).effective;
+        if( !eff ) continue;
+        ulong h = fd_ulong_hash( FD_LOAD( ulong, del->voter_pubkey.uc ) ^ FD_LOAD( ulong, del->voter_pubkey.uc+8UL ) ) % FD_RPC_VOTER_TABLE_CNT;
+        for( ulong probe=0UL; probe<FD_RPC_VOTER_TABLE_CNT; probe++, h=(h+1UL)%FD_RPC_VOTER_TABLE_CNT ) {
+          if( !ctx->voter_table[ h ].used ) {
+            ctx->voter_table[ h ].used  = 1;
+            ctx->voter_table[ h ].stake = eff;
+            memcpy( ctx->voter_table[ h ].key, del->voter_pubkey.uc, 32UL );
+            break;
+          }
+          if( !memcmp( ctx->voter_table[ h ].key, del->voter_pubkey.uc, 32UL ) ) { ctx->voter_table[ h ].stake += eff; break; }
+        }
+      }
+    }
+  }
+
+  /* in address order, so the answer does not depend on the walk */
+  for( ulong i=1UL; i<vote_cnt; i++ ) {
+    fd_pubkey_t k = ctx->vote_stake_keys[ i ];
+    ulong j = i;
+    while( j && memcmp( ctx->vote_stake_keys[ j-1UL ].uc, k.uc, 32UL )>0 ) { ctx->vote_stake_keys[ j ] = ctx->vote_stake_keys[ j-1UL ]; j--; }
+    ctx->vote_stake_keys[ j ] = k;
+  }
+
+  for( ulong i=0UL; i<vote_cnt; i++ ) {
+    uchar const * key = ctx->vote_stake_keys[ i ].uc;
+    ulong stake = 0UL;
+    ulong h = fd_ulong_hash( FD_LOAD( ulong, key ) ^ FD_LOAD( ulong, key+8UL ) ) % FD_RPC_VOTER_TABLE_CNT;
+    for( ulong probe=0UL; probe<FD_RPC_VOTER_TABLE_CNT && ctx->voter_table[ h ].used; probe++, h=(h+1UL)%FD_RPC_VOTER_TABLE_CNT ) {
+      if( !memcmp( ctx->voter_table[ h ].key, key, 32UL ) ) { stake = ctx->voter_table[ h ].stake; break; }
+    }
+    ctx->vote_stake_amt[ i ] = stake;
+  }
+
+  /* EpochRewards.active: the epoch's staking rewards are still being
+     paid, each payment adding to a delegation */
+  int active = 1;
+  {
+    ulong lamports; int executable; uchar owner[ 32UL ]; ulong data_len;
+    fd_accdb_read_one_nocache( ctx->accdb, bank->accdb_fork_id, fd_sysvar_epoch_rewards_id.uc, &lamports, &executable, owner, ctx->scratch.accdb_data_buf, &data_len );
+    if( FD_LIKELY( lamports && data_len>=81UL ) ) active = !!ctx->scratch.accdb_data_buf[ 80 ];
+  }
+
+  ctx->vote_stake_cnt            = vote_cnt;
+  ctx->vote_stake_epoch          = bank->epoch;
+  ctx->vote_stake_ts             = now;
+  ctx->vote_stake_rewards_active = active;
+  ctx->vote_stake_valid          = 1;
+  ctx->vote_infos_valid          = 0;
+  return 1;
+}
+
 static ulong
 fd_rpc_vote_infos_load( fd_rpc_tile_t *           ctx,
                         bank_info_t const *       bank,
                         fd_rpc_vote_set_t const * cur,
-                        fd_rpc_vote_set_t const * nxt,
                         fd_pubkey_t const *       filter,
                         fd_rpc_vote_info_t *      infos ) {
-  ulong nxt_cnt  = nxt ? nxt->cnt : 0UL;
   ulong info_cnt = 0UL;
-  ulong i        = 0UL;
-  ulong j        = 0UL;
-  while( i<cur->cnt || j<nxt_cnt ) {
-    int cmp;
-    if(      i>=cur->cnt ) cmp =  1;
-    else if( j>=nxt_cnt  ) cmp = -1;
-    else                   cmp = memcmp( cur->ele[ i ].vote_key.uc, nxt->ele[ j ].vote_key.uc, 32UL );
-
-    fd_rpc_vote_set_ele_t const * ele_cur = NULL;
-    fd_rpc_vote_set_ele_t const * ele_nxt = NULL;
-    if( cmp<=0 ) ele_cur = &cur->ele[ i++ ];
-    if( cmp>=0 ) ele_nxt = &nxt->ele[ j++ ];
-    fd_pubkey_t const * vote_key = ele_cur ? &ele_cur->vote_key : &ele_nxt->vote_key;
-
+  for( ulong i=0UL; i<ctx->vote_stake_cnt; i++ ) {
+    fd_pubkey_t const * vote_key = &ctx->vote_stake_keys[ i ];
     if( filter && !fd_pubkey_eq( vote_key, filter ) ) continue;
 
     fd_rpc_vote_info_t * info = &infos[ info_cnt ];
     if( FD_UNLIKELY( !fd_rpc_vote_info_load( ctx, bank->accdb_fork_id, vote_key, info ) ) ) continue;
-    info->vote_key           = *vote_key;
-    info->stake              = ele_nxt ? ele_nxt->stake : ( nxt ? 0UL : ele_cur->stake );
-    info->epoch_vote_account = !!ele_cur;
+    info->vote_key = *vote_key;
+    info->stake    = ctx->vote_stake_amt[ i ];
+
+    /* in the set that votes this epoch? (the set is sorted by key) */
+    int in_set = 0;
+    ulong lo = 0UL, hi = cur->cnt;
+    while( lo<hi ) {
+      ulong mid = lo+(hi-lo)/2UL;
+      int   cmp = memcmp( cur->ele[ mid ].vote_key.uc, vote_key->uc, 32UL );
+      if( !cmp ) { in_set = 1; break; }
+      if( cmp<0 ) lo = mid+1UL; else hi = mid;
+    }
+    info->epoch_vote_account = in_set;
     info_cnt++;
     if( filter ) break;
   }
@@ -6509,22 +7494,23 @@ getVoteAccounts( fd_rpc_tile_t *         ctx,
   if( FD_UNLIKELY( !cur ) ) {
     return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32600,\"message\":\"Invalid request\"},\"id\":%s}\n", id_cstr );
   }
-  fd_rpc_vote_set_t const * nxt = fd_rpc_vote_set_query( ctx, bank->epoch+1UL );
+  if( FD_UNLIKELY( !fd_rpc_vote_stakes_refresh( ctx, bank ) ) ) {
+    return fd_rpc_err_msg( ctx, id_cstr, -32065, "Firedancer Error: vote account stakes unavailable" );
+  }
 
   fd_rpc_vote_info_t         filtered[ 1 ];
   fd_rpc_vote_info_t const * infos    = ctx->vote_infos;
   ulong                      info_cnt = ctx->vote_infos_cnt;
-  int cached = ctx->vote_infos_valid && ctx->vote_infos_slot==bank->slot && ctx->vote_infos_has_nxt==!!nxt &&
+  int cached = ctx->vote_infos_valid && ctx->vote_infos_slot==bank->slot &&
                !memcmp( ctx->vote_infos_block_hash, bank->block_hash, 32UL );
   if( !cached ) {
     if( has_filter ) {
-      info_cnt = fd_rpc_vote_infos_load( ctx, bank, cur, nxt, filter, filtered );
+      info_cnt = fd_rpc_vote_infos_load( ctx, bank, cur, filter, filtered );
       infos    = filtered;
     } else {
       ctx->vote_infos_valid   = 0;
-      ctx->vote_infos_cnt     = fd_rpc_vote_infos_load( ctx, bank, cur, nxt, NULL, ctx->vote_infos );
+      ctx->vote_infos_cnt     = fd_rpc_vote_infos_load( ctx, bank, cur, NULL, ctx->vote_infos );
       ctx->vote_infos_slot    = bank->slot;
-      ctx->vote_infos_has_nxt = !!nxt;
       fd_memcpy( ctx->vote_infos_block_hash, bank->block_hash, 32UL );
       ctx->vote_infos_valid   = 1;
       info_cnt                = ctx->vote_infos_cnt;
@@ -7616,6 +8602,8 @@ unprivileged_init( fd_topo_t const *      topo,
   memset( ctx->send_pending, 0, sizeof(ctx->send_pending) );
   ctx->send_datagram_cnt = 0UL;
   ctx->txn_rec_next  = 0UL;
+  ctx->vote_stake_valid = 0;
+  ctx->vote_stake_cnt   = 0UL;
   memset( ctx->txn_table, 0, sizeof(ctx->txn_table) );
   for( ulong i=0UL; i<FD_RPC_BLOCK_META_CNT; i++ ) ctx->block_metas[ i ].slot = ULONG_MAX;
   ctx->prio_fee_next = 0UL;

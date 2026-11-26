@@ -37,7 +37,7 @@ not been reviewed by the Firedancer team.
 | `getTokenAccountBalance`, `getTokenSupply` | account read | |
 | `getTokenAccountsByOwner`, `getTokenAccountsByDelegate`, `getTokenLargestAccounts` | full account scan | No `jsonParsed`. |
 | `getSignatureStatuses` | recent transaction window | See "The recent transaction window" below. A failed transaction carries the failed instruction and its error, as Agave prints it. Without `searchTransactionHistory` only the last 300 slots are searched, as in Agave; with it, the whole window. |
-| `getTransaction` | recent transaction window, plus what the exec tiles report | Encodings `json`, `jsonParsed`, `base64`, `base58`. `meta` has the result, fee, `computeUnitsConsumed`, `costUnits`, lamport balances before and after, loaded addresses, `logMessages`, `innerInstructions` and `returnData`. With `jsonParsed`, instructions of the system program, the address lookup table program and the memo programs are decoded into named fields; **every other program (stake, vote, token, loaders, ...) is printed in Agave's "partially decoded" form** (account addresses and base58 data), which Agave itself uses for programs it does not know. **Token balances are not reported**: `preTokenBalances` and `postTokenBalances` are `[]` when no token program or token-owned account is involved and `null` otherwise. Logs and inner instructions are `null` for a transaction whose report the tile missed or no longer keeps (see "Logs and inner instructions" below). |
+| `getTransaction` | recent transaction window, plus what the exec tiles report | Encodings `json`, `jsonParsed`, `base64`, `base58`. `meta` has the result, fee, `computeUnitsConsumed`, `costUnits`, lamport balances before and after, loaded addresses, `logMessages`, `innerInstructions` and `returnData`. With `jsonParsed`, instructions of the system, address lookup table, stake, vote, SPL token, associated token account, BPF loader, upgradeable loader and memo programs are decoded into named fields, as Agave does. **The Token-2022 extension instruction families (transfer fee, confidential transfer, metadata, group, pointer, pausable, ... instructions) are not decoded** and are printed in Agave's "partially decoded" form (account addresses and base58 data), which Agave uses for programs it does not know; so are the two upgradeable loader instructions newer than `SetAuthorityChecked`. **Token balances are not reported**: `preTokenBalances` and `postTokenBalances` are `[]` when no token program or token-owned account is involved and `null` otherwise. Logs and inner instructions are `null` for a transaction whose report the tile missed or no longer keeps (see "Logs and inner instructions" below). |
 | `getBlock` | recent transaction window | `transactionDetails` `full`, `accounts`, `signatures` or `none`. Transactions as for `getTransaction`. `rewards` lists the block's fee reward (recipient, amount and balance after, recorded where the runtime pays it). **For the blocks at the start of an epoch that also pay vote and stake rewards, `rewards` is `null`.** A block is served only while every one of its transactions is in the window; otherwise "Block not available". |
 | `getSignaturesForAddress` | recent transaction window | Matches addresses written in the transaction itself. **A transaction that only reaches the address through a lookup table is not found.** `limit`, `before`, `until` are supported. Each call walks the whole window. |
 | `getInflationReward` | rewards recorded as replay pays them | See "Epoch rewards" below. Up to 32 addresses, the previous epoch by default or `epoch`. Only the two most recent reward epochs, and only if the node was running when they were paid; otherwise "Block not available". `commission` and `blockRewardAmount` are always null. |
@@ -54,16 +54,26 @@ not been reviewed by the Firedancer team.
 `getVoteAccounts`, `getBlockProduction`, `getBlockTime`,
 `getEpochSchedule`, `getRecentPerformanceSamples`.
 
-On the test cluster, `getVoteAccounts` from the base branch listed the
+`getVoteAccounts` is changed by this patch. The base branch listed the
 vote accounts in the epoch's voting set only (60 of the 65 Agave
-listed) and the stake the leader schedule was built from rather than
-current stake. This patch does not change that.
+listed on the test cluster) with the stake the leader schedule was
+built from. It now lists every vote account with the stake that is
+effective in the current epoch, and `epochVoteAccount` says whether the
+account is in the epoch's voting set, which is what Agave and the
+[RPC specification](https://github.com/solana-rpc/specs) describe.
+Firedancer has no table of stake by vote account outside the runtime,
+so the RPC tile builds one by walking the accounts: on the first call
+of an epoch, every 30 seconds while the epoch's staking rewards are
+being paid out, and otherwise every 10 minutes. That walk blocks the
+tile like any other account scan (see below). Between walks the list of
+vote accounts and their stake are as of the last walk; last vote, root,
+credits, identity and commission are always read live.
 
 ### Still not implemented
 
 | Method | Why |
 |---|---|
-| `jsonParsed` instruction decoding for stake, vote, token and loader programs | Printed partially decoded instead. |
+| `jsonParsed` instruction decoding for the Token-2022 extension instruction families | Printed partially decoded instead. |
 | Token balances in transaction history; the reward list of epoch-start blocks | See the `getTransaction` and `getBlock` rows. |
 | `logsSubscribe`, `programSubscribe`, `blockSubscribe`, `rootSubscribe` and the other websocket subscriptions | Not written. Only slot, vote, signature and account subscriptions exist. |
 | `requestAirdrop` | Needs a faucet. |
@@ -82,7 +92,8 @@ current stake. This patch does not change that.
   last 131,072 transactions this node replayed, held in memory (about
   330 MB in the RPC tile). There is no history from before the node
   started, none survives a restart, and nothing older than the window
-  is known. The RPC tile reads replay's per-transaction messages from
+  is known. Block headers (hash, height, parent, time) are kept for the
+  last 524,288 slots. The RPC tile reads replay's per-transaction messages from
   the `replay_out` link unreliably, so it cannot backpressure replay,
   and it discards a message it was too slow to read; that transaction
   is then missing, and `getBlock` refuses its block.

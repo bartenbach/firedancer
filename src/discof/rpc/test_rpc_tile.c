@@ -4,6 +4,7 @@
 #include "../../flamenco/runtime/program/vote/fd_vote_state_versioned.h"
 #include "../../waltz/http/fd_http_server_private.h"
 #include "../../util/pod/fd_pod.h"
+#include "../../ballet/hex/fd_hex.h"
 #include "../../tango/fseq/fd_fseq.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -79,6 +80,47 @@ test_put_vote_account( fd_accdb_t *        accdb,
   memcpy( acc[ 0 ].data, data, data_len );
   acc[ 0 ].commit = 1;
   fd_accdb_release( accdb, 1UL, acc );
+}
+
+/* Writes an account with the given owner and data. */
+static void
+test_put_raw_account( fd_accdb_t *       accdb,
+                      fd_accdb_fork_id_t fork_id,
+                      uchar const *      key,
+                      uchar const *      owner,
+                      uchar const *      data,
+                      ulong              data_len ) {
+  uchar const * pks[ 1 ] = { key };
+  int           wr [ 1 ] = { 1 };
+  fd_acc_t      acc[ 1 ]; memset( acc, 0, sizeof(acc) );
+  fd_accdb_acquire( accdb, fork_id, 1UL, pks, wr, acc );
+  acc[ 0 ].lamports = 1000000000UL;
+  acc[ 0 ].data_len = data_len;
+  memcpy( acc[ 0 ].owner, owner, 32UL );
+  memcpy( acc[ 0 ].data, data, data_len );
+  acc[ 0 ].commit = 1;
+  fd_accdb_release( accdb, 1UL, acc );
+}
+
+/* A stake account delegated to voter. */
+static void
+test_put_stake_account( fd_accdb_t *        accdb,
+                        fd_accdb_fork_id_t  fork_id,
+                        uchar               key_byte,
+                        fd_pubkey_t const * voter,
+                        ulong               stake,
+                        ulong               activation_epoch,
+                        ulong               deactivation_epoch ) {
+  fd_pubkey_t key; memset( key.uc, key_byte, 32UL );
+  uchar data[ FD_STAKE_STATE_SZ ] = {0};
+  fd_stake_state_t * st = (fd_stake_state_t *)data;
+  st->stake_type = FD_STAKE_STATE_STAKE;
+  st->stake.stake.delegation.voter_pubkey         = *voter;
+  st->stake.stake.delegation.stake                = stake;
+  st->stake.stake.delegation.activation_epoch     = activation_epoch;
+  st->stake.stake.delegation.deactivation_epoch   = deactivation_epoch;
+  st->stake.stake.delegation.warmup_cooldown_rate = 0.25;
+  test_put_raw_account( accdb, fork_id, key.uc, fd_solana_stake_program_id.uc, data, sizeof(data) );
 }
 
 static void
@@ -1567,6 +1609,23 @@ main( int     argc,
     };
     fd_rpc_vote_sets_ingest( ctx, test_vote_set_msg( set_buf, 10UL, 2UL, nxt ) );
 
+    /* The stake reported is what is delegated now, not what the epoch
+       sets say: 1000+500 to A, 900 to C (which is not in this epoch's
+       set), one deactivated delegation to B, one to a vote account that
+       does not exist. */
+    {
+      static uchar hist[ FD_SYSVAR_STAKE_HISTORY_BINCODE_SZ ]; /* an empty stake history */
+      test_put_raw_account( writer_accdb, test_fork_id, fd_sysvar_stake_history_id.uc, fd_sysvar_owner_id.uc, hist, sizeof(hist) );
+      test_put_stake_account( writer_accdb, test_fork_id, 0x51, &vote_a, 1000UL, 1UL, ULONG_MAX );
+      test_put_stake_account( writer_accdb, test_fork_id, 0x52, &vote_a,  500UL, 2UL, ULONG_MAX );
+      test_put_stake_account( writer_accdb, test_fork_id, 0x53, &vote_c,  900UL, 3UL, ULONG_MAX );
+      test_put_stake_account( writer_accdb, test_fork_id, 0x54, &vote_b,  700UL, 1UL, 4UL );
+      test_put_stake_account( writer_accdb, test_fork_id, 0x55, &vote_d,   50UL, 1UL, ULONG_MAX );
+      memset( &ctx->features, 0xff, sizeof(ctx->features) ); /* no feature active */
+      ctx->has_features     = 1;
+      ctx->vote_stake_valid = 0;
+    }
+
     ctx->banks[ 0 ].slot          = 300UL;
     ctx->banks[ 0 ].epoch         = 9UL;
     ctx->banks[ 0 ].accdb_fork_id = test_fork_id;
@@ -1895,6 +1954,39 @@ main( int     argc,
         "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32001,\"message\":\"Block 10 cleaned up, does not exist on node. First available block: 11\"},\"id\":1}" );
     expect_rpc_response( ctx, BT_REQ( "[11]" ), "{\"jsonrpc\":\"2.0\",\"result\":1700000011,\"id\":1}" );
 #undef BT_REQ
+  }
+
+  /* Optional replay of instructions through the jsonParsed decoder, to
+     compare against another implementation.  FD_RPC_PIX_IN names a
+     file with one instruction per line, as hex: account count, the
+     account addresses, program index, instruction account count, the
+     account indexes, then the data.  One JSON object per line is
+     written to FD_RPC_PIX_OUT. */
+  char const * pix_in  = getenv( "FD_RPC_PIX_IN" );
+  char const * pix_out = getenv( "FD_RPC_PIX_OUT" );
+  if( pix_in && pix_out ) {
+    FILE * in  = fopen( pix_in,  "r" ); FD_TEST( in );
+    FILE * out = fopen( pix_out, "w" ); FD_TEST( out );
+    static char  line[ 1<<17 ];
+    static uchar bin [ 1<<16 ];
+    while( fgets( line, sizeof(line), in ) ) {
+      ulong len = strlen( line );
+      while( len && ( line[ len-1UL ]=='\n' || line[ len-1UL ]=='\r' ) ) len--;
+      ulong sz = len/2UL;
+      FD_TEST( fd_hex_decode( bin, line, sz )==sz );
+      ulong key_cnt = bin[ 0 ];
+      uchar const * keys[ 256 ];
+      for( ulong i=0UL; i<key_cnt; i++ ) keys[ i ] = bin+1UL+32UL*i;
+      uchar const * p = bin+1UL+32UL*key_cnt;
+      ulong program_idx = p[ 0 ];
+      ulong acct_cnt    = p[ 1 ];
+      fd_rpc_print_parsed_ix( ctx, keys, key_cnt, program_idx, p+2UL, acct_cnt, p+2UL+acct_cnt, sz-(ulong)(p+2UL+acct_cnt-bin), 1U );
+      fd_http_server_response_t res = STAGE_JSON( ctx );
+      FD_TEST( res.status==200 );
+      fwrite( ctx->http->oring+(res._body_off % ctx->http->oring_sz), 1UL, res._body_len, out );
+      fputc( '\n', out );
+    }
+    fclose( in ); fclose( out );
   }
 
   /* Reset the HTTP server so the eviction regression starts with empty
