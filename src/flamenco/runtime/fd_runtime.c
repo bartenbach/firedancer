@@ -220,6 +220,7 @@ fd_runtime_deposit_fees( fd_bank_t *         bank,
 
   fd_accdb_svm_update_t update[1];
   fd_acc_t acc = fd_accdb_svm_open_rw( bank, accdb, update, collector_id, 1 );
+  ulong lamports_before = acc.lamports;
   int burn;
   if( FD_FEATURE_ACTIVE_BANK( bank, custom_commission_collector ) ) {
     /* https://github.com/anza-xyz/agave/blob/v4.4.0-alpha.5/runtime/src/bank/fee_distribution.rs#L254-L267 */
@@ -238,6 +239,7 @@ fd_runtime_deposit_fees( fd_bank_t *         bank,
     }
   }
   if( FD_LIKELY( !burn ) ) fd_stakes_update_stake_delegation( collector_id, &acc, bank, stake_history, NULL );
+  if( FD_LIKELY( !burn ) ) fd_reward_log_push( FD_REWARD_KIND_FEE, collector_id->uc, bank->f.slot, lamports_before, acc.lamports );
   fd_accdb_svm_close_rw( bank, accdb, capture_ctx, &acc, update );
   return burn;
 }
@@ -274,6 +276,7 @@ fd_runtime_deposit_delegator_fees( fd_bank_t *         bank,
   if( !burn && fd_vote_account_add_pending_delegator_rewards( acc.data, acc.data_len, fees ) ) burn = 1;
 
   if( burn ) acc.lamports = pre_lamports;
+  else       fd_reward_log_push( FD_REWARD_KIND_FEE, vote_address->uc, bank->f.slot, pre_lamports, acc.lamports );
   fd_accdb_svm_close_rw( bank, accdb, capture_ctx, &acc, update );
   return burn;
 }

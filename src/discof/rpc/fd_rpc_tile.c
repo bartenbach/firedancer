@@ -6,6 +6,7 @@
 #include "../../ballet/base64/fd_base64.h"
 #include "fd_rpc_sim.h"
 #include "../backup/fd_snapmk_tile.h"
+#include "../../ballet/utf8/fd_utf8.h"
 #include "../replay/fd_execrp.h"
 #include "../../flamenco/rewards/fd_epoch_inflation_account.h"
 #include "../../ballet/txn/fd_txn_v1.h"
@@ -859,6 +860,16 @@ struct fd_rpc_tile {
 
   /* Epoch rewards, for getInflationReward.  See fd_rpc_reward_ingest. */
   fd_rpc_reward_epoch_t reward_epochs[ FD_RPC_REWARD_EPOCH_CNT ];
+  /* Block fee rewards by slot, for getBlock.  A block may pay more
+     than one (the validator's and the delegators' share). */
+# define FD_RPC_FEE_REWARD_CNT (16384UL)
+  struct {
+    ulong slot;        /* 0 if unused */
+    uchar pubkey[ 32 ];
+    ulong lamports;
+    ulong post_balance;
+  } fee_rewards[ FD_RPC_FEE_REWARD_CNT ];
+  ulong                 fee_reward_next;
   ulong                 reward_seq_next;   /* next expected record index, ULONG_MAX before the first batch */
   ulong                 reward_dropped;    /* replay's drop count as of the last batch */
   ulong                 reward_boot_slot;  /* first slot this tile saw complete, ULONG_MAX if none */
@@ -1401,12 +1412,34 @@ fd_rpc_reward_ingest( fd_rpc_tile_t *             ctx,
                       fd_replay_rewards_t const * msg ) {
   if( FD_UNLIKELY( !ctx->has_epoch_schedule || msg->cnt>FD_REPLAY_REWARDS_BATCH_MAX ) ) { fd_rpc_reward_gap( ctx ); return; }
   if( FD_UNLIKELY( ( ctx->reward_seq_next!=ULONG_MAX && msg->seq!=ctx->reward_seq_next ) || msg->dropped!=ctx->reward_dropped ) ) fd_rpc_reward_gap( ctx );
-  ctx->reward_seq_next = msg->seq+msg->cnt;
+  ulong epoch_cnt = 0UL;
+  for( ulong i=0UL; i<msg->cnt; i++ ) epoch_cnt += (ulong)( msg->recs[ i ].kind!=2U );
+  ctx->reward_seq_next = msg->seq+epoch_cnt;
   ctx->reward_dropped  = msg->dropped;
 
   for( ulong i=0UL; i<msg->cnt; i++ ) {
     ulong slot = msg->recs[ i ].slot;
     if( FD_UNLIKELY( !slot ) ) continue;
+    if( msg->recs[ i ].kind==2U ) {
+      /* same collector twice in a block: one entry, as Agave lists it */
+      ulong k;
+      for( k=0UL; k<4UL; k++ ) {
+        ulong j = (ctx->fee_reward_next-1UL-k) % FD_RPC_FEE_REWARD_CNT;
+        if( ctx->fee_rewards[ j ].slot==slot && !memcmp( ctx->fee_rewards[ j ].pubkey, msg->recs[ i ].pubkey, 32UL ) ) {
+          ctx->fee_rewards[ j ].lamports    += msg->recs[ i ].lamports_post-msg->recs[ i ].lamports_pre;
+          ctx->fee_rewards[ j ].post_balance = msg->recs[ i ].lamports_post;
+          break;
+        }
+      }
+      if( k==4UL ) {
+        ulong j = ctx->fee_reward_next++ % FD_RPC_FEE_REWARD_CNT;
+        ctx->fee_rewards[ j ].slot         = slot;
+        ctx->fee_rewards[ j ].lamports     = msg->recs[ i ].lamports_post-msg->recs[ i ].lamports_pre;
+        ctx->fee_rewards[ j ].post_balance = msg->recs[ i ].lamports_post;
+        memcpy( ctx->fee_rewards[ j ].pubkey, msg->recs[ i ].pubkey, 32UL );
+      }
+      continue;
+    }
     /* Agave records no reward for a stake account that was paid nothing */
     if( msg->recs[ i ].kind==1U && msg->recs[ i ].lamports_post==msg->recs[ i ].lamports_pre ) continue;
     ulong pay_epoch = fd_slot_to_epoch( &ctx->epoch_schedule, slot, NULL );
@@ -5007,6 +5040,280 @@ fd_rpc_print_loaded_addresses( fd_rpc_tile_t *     ctx,
   fd_http_server_printf( ctx->http, "]}" );
 }
 
+#define FD_RPC_TXN_ENC_JSON   (0)
+#define FD_RPC_TXN_ENC_BASE64 (1)
+#define FD_RPC_TXN_ENC_BASE58 (2)
+#define FD_RPC_TXN_ENC_ACCOUNTS (3) /* getBlock transactionDetails "accounts" */
+#define FD_RPC_TXN_ENC_PARSED   (4)
+
+/* Prints the version specific end of a transaction message:
+   ,"transactionConfig":{…} for v1, ,"addressTableLookups":[…] for v0. */
+static void
+fd_rpc_print_txn_msg_tail( fd_rpc_tile_t *  ctx,
+                           fd_txn_t const * txn,
+                           uchar const *    p ) {
+    if( txn->transaction_version==FD_TXN_V1 ) {
+      /* v1 has no lookup tables; it carries its compute budget in the
+         header, each field present only if its mask bit is set */
+      uint          mask = fd_uint_load_4( p+4UL );
+      uchar const * cv   = p+txn->v1_txn_config_values_off;
+      fd_http_server_printf( ctx->http, ",\"transactionConfig\":{" );
+      ulong fee = 0UL; int has_fee = 0;
+      if( mask & 1U ) { fee = FD_LOAD( ulong, cv ); cv += 8UL; has_fee = 1; }
+      if( (mask>>2)&1U ) { fd_http_server_printf( ctx->http, "\"computeUnitLimit\":%u,", FD_LOAD( uint, cv ) ); cv += 4UL; } else fd_http_server_printf( ctx->http, "\"computeUnitLimit\":null," );
+      uint lads = 0U; int has_lads = 0;
+      if( (mask>>3)&1U ) { lads = FD_LOAD( uint, cv ); cv += 4UL; has_lads = 1; }
+      if( (mask>>4)&1U ) fd_http_server_printf( ctx->http, "\"heapSize\":%u,", FD_LOAD( uint, cv ) ); else fd_http_server_printf( ctx->http, "\"heapSize\":null," );
+      if( has_lads ) fd_http_server_printf( ctx->http, "\"loadedAccountsDataSizeLimit\":%u,", lads ); else fd_http_server_printf( ctx->http, "\"loadedAccountsDataSizeLimit\":null," );
+      if( has_fee ) fd_http_server_printf( ctx->http, "\"priorityFee\":%lu}", fee ); else fd_http_server_printf( ctx->http, "\"priorityFee\":null}" );
+    } else if( txn->transaction_version!=FD_TXN_VLEGACY ) {
+      fd_txn_acct_addr_lut_t const * luts = fd_txn_get_address_tables_const( txn );
+      fd_http_server_printf( ctx->http, ",\"addressTableLookups\":[" );
+      for( ulong i=0UL; i<txn->addr_table_lookup_cnt; i++ ) {
+        FD_BASE58_ENCODE_32_BYTES( p+luts[ i ].addr_off, lut_b58 );
+        fd_http_server_printf( ctx->http, "%s{\"accountKey\":\"%s\",\"readonlyIndexes\":[", i ? "," : "", lut_b58 );
+        for( ulong k=0UL; k<luts[ i ].readonly_cnt; k++ ) fd_http_server_printf( ctx->http, "%s%u", k ? "," : "", (uint)p[ luts[ i ].readonly_off+k ] );
+        fd_http_server_printf( ctx->http, "],\"writableIndexes\":[" );
+        for( ulong k=0UL; k<luts[ i ].writable_cnt; k++ ) fd_http_server_printf( ctx->http, "%s%u", k ? "," : "", (uint)p[ luts[ i ].writable_off+k ] );
+        fd_http_server_printf( ctx->http, "]}" );
+      }
+      fd_http_server_printf( ctx->http, "]" );
+    }
+}
+
+/* jsonParsed instruction decoding.  Agave decodes the instructions of
+   a fixed set of programs into named fields and prints everything
+   else "partially decoded" (account addresses, base58 data).  Decoded
+   here: the system program, the address lookup table program and the
+   memo programs.  Every other program, and any instruction that does
+   not decode, is printed partially decoded. */
+
+#define FD_RPC_IX_KEY( n ) ( (n)<acct_cnt && (ulong)accts[ n ]<key_cnt ? fd_rpc_b58_32( keys[ accts[ n ] ], b58[ n ] ) : NULL )
+
+static char const *
+fd_rpc_b58_32( uchar const * key,
+               char *        out ) {
+  fd_base58_encode_32( key, NULL, out );
+  return out;
+}
+
+/* Returns 1 if it printed a "parsed":…,"program":"…" pair. */
+static int
+fd_rpc_print_parsed_ix_body( fd_rpc_tile_t *       ctx,
+                             uchar const * const * keys,
+                             ulong                 key_cnt,
+                             uchar const *         program,
+                             uchar const *         accts,
+                             ulong                 acct_cnt,
+                             uchar const *         d,
+                             ulong                 sz ) {
+  char b58[ 8 ][ FD_BASE58_ENCODED_32_SZ ];
+  char dk [ 3 ][ FD_BASE58_ENCODED_32_SZ ];
+  fd_http_server_t * h = ctx->http;
+
+  if( !memcmp( program, fd_solana_system_program_id.uc, 32UL ) ) {
+    if( sz<4UL ) return 0;
+    uint          tag = FD_LOAD( uint, d );
+    uchar const * a   = d+4UL;
+    ulong         n   = sz-4UL;
+#   define K( i ) FD_RPC_IX_KEY( i )
+#   define NEED( k ) do { for( ulong _i=0UL; _i<(k); _i++ ) if( !K( _i ) ) return 0; } while(0)
+    /* a bincode string: u64 length, then the bytes */
+#   define SEED( off, out_ptr, out_len ) do { if( n<(off)+8UL ) return 0; (out_len) = FD_LOAD( ulong, a+(off) ); if( (out_len)>n-(off)-8UL ) return 0; (out_ptr) = a+(off)+8UL; } while(0)
+    switch( tag ) {
+      case 0U: { /* CreateAccount */
+        if( n<48UL ) return 0;
+        NEED( 2UL );
+        fd_http_server_printf( h, "\"parsed\":{\"info\":{\"lamports\":%lu,\"newAccount\":\"%s\",\"owner\":\"%s\",\"source\":\"%s\",\"space\":%lu},\"type\":\"createAccount\"},\"program\":\"system\"",
+                               FD_LOAD( ulong, a ), K( 1 ), fd_rpc_b58_32( a+16UL, dk[ 0 ] ), K( 0 ), FD_LOAD( ulong, a+8UL ) );
+        return 1;
+      }
+      case 1U: { /* Assign */
+        if( n<32UL ) return 0;
+        NEED( 1UL );
+        fd_http_server_printf( h, "\"parsed\":{\"info\":{\"account\":\"%s\",\"owner\":\"%s\"},\"type\":\"assign\"},\"program\":\"system\"", K( 0 ), fd_rpc_b58_32( a, dk[ 0 ] ) );
+        return 1;
+      }
+      case 2U: { /* Transfer */
+        if( n<8UL ) return 0;
+        NEED( 2UL );
+        fd_http_server_printf( h, "\"parsed\":{\"info\":{\"destination\":\"%s\",\"lamports\":%lu,\"source\":\"%s\"},\"type\":\"transfer\"},\"program\":\"system\"", K( 1 ), FD_LOAD( ulong, a ), K( 0 ) );
+        return 1;
+      }
+      case 3U: { /* CreateAccountWithSeed: base, seed, lamports, space, owner */
+        uchar const * seed; ulong seed_len;
+        if( n<32UL ) return 0;
+        SEED( 32UL, seed, seed_len );
+        ulong off = 40UL+seed_len;
+        if( n<off+48UL ) return 0;
+        NEED( 2UL );
+        fd_http_server_printf( h, "\"parsed\":{\"info\":{\"base\":\"%s\",\"lamports\":%lu,\"newAccount\":\"%s\",\"owner\":\"%s\",\"seed\":\"",
+                               fd_rpc_b58_32( a, dk[ 0 ] ), FD_LOAD( ulong, a+off ), K( 1 ), fd_rpc_b58_32( a+off+16UL, dk[ 1 ] ) );
+        fd_rpc_print_json_text( ctx, seed, seed_len );
+        fd_http_server_printf( h, "\",\"source\":\"%s\",\"space\":%lu},\"type\":\"createAccountWithSeed\"},\"program\":\"system\"", K( 0 ), FD_LOAD( ulong, a+off+8UL ) );
+        return 1;
+      }
+      case 4U: { /* AdvanceNonceAccount */
+        NEED( 3UL );
+        fd_http_server_printf( h, "\"parsed\":{\"info\":{\"nonceAccount\":\"%s\",\"nonceAuthority\":\"%s\",\"recentBlockhashesSysvar\":\"%s\"},\"type\":\"advanceNonce\"},\"program\":\"system\"", K( 0 ), K( 2 ), K( 1 ) );
+        return 1;
+      }
+      case 5U: { /* WithdrawNonceAccount */
+        if( n<8UL ) return 0;
+        NEED( 5UL );
+        fd_http_server_printf( h, "\"parsed\":{\"info\":{\"destination\":\"%s\",\"lamports\":%lu,\"nonceAccount\":\"%s\",\"nonceAuthority\":\"%s\",\"recentBlockhashesSysvar\":\"%s\",\"rentSysvar\":\"%s\"},\"type\":\"withdrawFromNonce\"},\"program\":\"system\"",
+                               K( 1 ), FD_LOAD( ulong, a ), K( 0 ), K( 4 ), K( 2 ), K( 3 ) );
+        return 1;
+      }
+      case 6U: { /* InitializeNonceAccount */
+        if( n<32UL ) return 0;
+        NEED( 3UL );
+        fd_http_server_printf( h, "\"parsed\":{\"info\":{\"nonceAccount\":\"%s\",\"nonceAuthority\":\"%s\",\"recentBlockhashesSysvar\":\"%s\",\"rentSysvar\":\"%s\"},\"type\":\"initializeNonce\"},\"program\":\"system\"",
+                               K( 0 ), fd_rpc_b58_32( a, dk[ 0 ] ), K( 1 ), K( 2 ) );
+        return 1;
+      }
+      case 7U: { /* AuthorizeNonceAccount */
+        if( n<32UL ) return 0;
+        NEED( 2UL );
+        fd_http_server_printf( h, "\"parsed\":{\"info\":{\"newAuthorized\":\"%s\",\"nonceAccount\":\"%s\",\"nonceAuthority\":\"%s\"},\"type\":\"authorizeNonce\"},\"program\":\"system\"",
+                               fd_rpc_b58_32( a, dk[ 0 ] ), K( 0 ), K( 1 ) );
+        return 1;
+      }
+      case 8U: { /* Allocate */
+        if( n<8UL ) return 0;
+        NEED( 1UL );
+        fd_http_server_printf( h, "\"parsed\":{\"info\":{\"account\":\"%s\",\"space\":%lu},\"type\":\"allocate\"},\"program\":\"system\"", K( 0 ), FD_LOAD( ulong, a ) );
+        return 1;
+      }
+      case 9U: { /* AllocateWithSeed: base, seed, space, owner */
+        uchar const * seed; ulong seed_len;
+        if( n<32UL ) return 0;
+        SEED( 32UL, seed, seed_len );
+        ulong off = 40UL+seed_len;
+        if( n<off+40UL ) return 0;
+        NEED( 1UL );
+        fd_http_server_printf( h, "\"parsed\":{\"info\":{\"account\":\"%s\",\"base\":\"%s\",\"owner\":\"%s\",\"seed\":\"", K( 0 ), fd_rpc_b58_32( a, dk[ 0 ] ), fd_rpc_b58_32( a+off+8UL, dk[ 1 ] ) );
+        fd_rpc_print_json_text( ctx, seed, seed_len );
+        fd_http_server_printf( h, "\",\"space\":%lu},\"type\":\"allocateWithSeed\"},\"program\":\"system\"", FD_LOAD( ulong, a+off ) );
+        return 1;
+      }
+      case 10U: { /* AssignWithSeed: base, seed, owner */
+        uchar const * seed; ulong seed_len;
+        if( n<32UL ) return 0;
+        SEED( 32UL, seed, seed_len );
+        ulong off = 40UL+seed_len;
+        if( n<off+32UL ) return 0;
+        NEED( 1UL );
+        fd_http_server_printf( h, "\"parsed\":{\"info\":{\"account\":\"%s\",\"base\":\"%s\",\"owner\":\"%s\",\"seed\":\"", K( 0 ), fd_rpc_b58_32( a, dk[ 0 ] ), fd_rpc_b58_32( a+off, dk[ 1 ] ) );
+        fd_rpc_print_json_text( ctx, seed, seed_len );
+        fd_http_server_printf( h, "\"},\"type\":\"assignWithSeed\"},\"program\":\"system\"" );
+        return 1;
+      }
+      case 11U: { /* TransferWithSeed: lamports, from_seed, from_owner */
+        uchar const * seed; ulong seed_len;
+        if( n<8UL ) return 0;
+        SEED( 8UL, seed, seed_len );
+        ulong off = 16UL+seed_len;
+        if( n<off+32UL ) return 0;
+        NEED( 3UL );
+        fd_http_server_printf( h, "\"parsed\":{\"info\":{\"destination\":\"%s\",\"lamports\":%lu,\"source\":\"%s\",\"sourceBase\":\"%s\",\"sourceOwner\":\"%s\",\"sourceSeed\":\"",
+                               K( 2 ), FD_LOAD( ulong, a ), K( 0 ), K( 1 ), fd_rpc_b58_32( a+off, dk[ 0 ] ) );
+        fd_rpc_print_json_text( ctx, seed, seed_len );
+        fd_http_server_printf( h, "\"},\"type\":\"transferWithSeed\"},\"program\":\"system\"" );
+        return 1;
+      }
+      case 12U: { /* UpgradeNonceAccount */
+        NEED( 1UL );
+        fd_http_server_printf( h, "\"parsed\":{\"info\":{\"nonceAccount\":\"%s\"},\"type\":\"upgradeNonce\"},\"program\":\"system\"", K( 0 ) );
+        return 1;
+      }
+      default: return 0;
+    }
+  }
+
+  if( !memcmp( program, fd_solana_address_lookup_table_program_id.uc, 32UL ) ) {
+    if( sz<4UL ) return 0;
+    uint          tag = FD_LOAD( uint, d );
+    uchar const * a   = d+4UL;
+    ulong         n   = sz-4UL;
+    switch( tag ) {
+      case 0U: { /* CreateLookupTable: recent_slot, bump_seed */
+        if( n<9UL ) return 0;
+        NEED( 4UL );
+        fd_http_server_printf( h, "\"parsed\":{\"info\":{\"bumpSeed\":%u,\"lookupTableAccount\":\"%s\",\"lookupTableAuthority\":\"%s\",\"payerAccount\":\"%s\",\"recentSlot\":%lu,\"systemProgram\":\"%s\"},\"type\":\"createLookupTable\"},\"program\":\"address-lookup-table\"",
+                               (uint)a[ 8 ], K( 0 ), K( 1 ), K( 2 ), FD_LOAD( ulong, a ), K( 3 ) );
+        return 1;
+      }
+      case 1U: case 3U: { /* FreezeLookupTable, DeactivateLookupTable */
+        NEED( 2UL );
+        fd_http_server_printf( h, "\"parsed\":{\"info\":{\"lookupTableAccount\":\"%s\",\"lookupTableAuthority\":\"%s\"},\"type\":\"%s\"},\"program\":\"address-lookup-table\"",
+                               K( 0 ), K( 1 ), tag==1U ? "freezeLookupTable" : "deactivateLookupTable" );
+        return 1;
+      }
+      case 2U: { /* ExtendLookupTable: the new addresses */
+        if( n<8UL ) return 0;
+        ulong cnt = FD_LOAD( ulong, a );
+        if( cnt>(n-8UL)/32UL ) return 0;
+        NEED( 2UL );
+        fd_http_server_printf( h, "\"parsed\":{\"info\":{\"lookupTableAccount\":\"%s\",\"lookupTableAuthority\":\"%s\",\"newAddresses\":[", K( 0 ), K( 1 ) );
+        for( ulong i=0UL; i<cnt; i++ ) fd_http_server_printf( h, "%s\"%s\"", i ? "," : "", fd_rpc_b58_32( a+8UL+32UL*i, dk[ 0 ] ) );
+        fd_http_server_printf( h, "]" );
+        if( acct_cnt>=4UL && K( 2 ) && K( 3 ) ) fd_http_server_printf( h, ",\"payerAccount\":\"%s\",\"systemProgram\":\"%s\"", K( 2 ), K( 3 ) );
+        fd_http_server_printf( h, "},\"type\":\"extendLookupTable\"},\"program\":\"address-lookup-table\"" );
+        return 1;
+      }
+      case 4U: { /* CloseLookupTable */
+        NEED( 3UL );
+        fd_http_server_printf( h, "\"parsed\":{\"info\":{\"lookupTableAccount\":\"%s\",\"lookupTableAuthority\":\"%s\",\"recipient\":\"%s\"},\"type\":\"closeLookupTable\"},\"program\":\"address-lookup-table\"", K( 0 ), K( 1 ), K( 2 ) );
+        return 1;
+      }
+      default: return 0;
+    }
+  }
+# undef K
+# undef NEED
+# undef SEED
+
+  /* the memo programs: the memo text itself is the parsed value */
+  FD_BASE58_ENCODE_32_BYTES( program, prog_b58 );
+  if( !strcmp( prog_b58, "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr" ) || !strcmp( prog_b58, "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo" ) ) {
+    if( FD_UNLIKELY( !fd_utf8_verify( (char const *)d, sz ) ) ) return 0;
+    fd_http_server_printf( h, "\"parsed\":\"" );
+    fd_rpc_print_json_text( ctx, d, sz );
+    fd_http_server_printf( h, "\",\"program\":\"spl-memo\"" );
+    return 1;
+  }
+  return 0;
+}
+
+/* Prints one instruction of a jsonParsed transaction. */
+static void
+fd_rpc_print_parsed_ix( fd_rpc_tile_t *       ctx,
+                        uchar const * const * keys,
+                        ulong                 key_cnt,
+                        ulong                 program_idx,
+                        uchar const *         accts,
+                        ulong                 acct_cnt,
+                        uchar const *         data,
+                        ulong                 data_sz,
+                        uint                  stack_height ) {
+  static const uchar zero[ 32 ] = {0};
+  uchar const * program = program_idx<key_cnt ? keys[ program_idx ] : zero;
+  FD_BASE58_ENCODE_32_BYTES( program, prog_b58 );
+  fd_http_server_printf( ctx->http, "{" );
+  if( !fd_rpc_print_parsed_ix_body( ctx, keys, key_cnt, program, accts, acct_cnt, data, data_sz ) ) {
+    fd_http_server_printf( ctx->http, "\"accounts\":[" );
+    for( ulong k=0UL; k<acct_cnt; k++ ) {
+      FD_BASE58_ENCODE_32_BYTES( (ulong)accts[ k ]<key_cnt ? keys[ accts[ k ] ] : zero, key_b58 );
+      fd_http_server_printf( ctx->http, "%s\"%s\"", k ? "," : "", key_b58 );
+    }
+    fd_http_server_printf( ctx->http, "],\"data\":\"" );
+    fd_rpc_print_base58( ctx, data, data_sz );
+    fd_http_server_printf( ctx->http, "\"" );
+  }
+  fd_http_server_printf( ctx->http, ",\"programId\":\"%s\",\"stackHeight\":%u}", prog_b58, stack_height );
+}
+
 /* Version of a stored transaction: -1 legacy, else 0 or 1.  A v1
    transaction starts with its version byte; legacy and v0 start with
    the signature count and carry the version after the signatures. */
@@ -5018,9 +5325,6 @@ fd_rpc_txn_rec_version( fd_rpc_txn_rec_t const * rec ) {
   return ( rec->payload[ off ] & 0x80 ) ? (int)( rec->payload[ off ] & 0x7f ) : -1;
 }
 
-#define FD_RPC_TXN_ENC_JSON   (0)
-#define FD_RPC_TXN_ENC_BASE64 (1)
-#define FD_RPC_TXN_ENC_BASE58 (2)
 
 /* Prints "transaction":…,"meta":{…},"version":… for one record.
    Returns 0 if the stored payload does not parse (should not happen). */
@@ -5034,7 +5338,74 @@ fd_rpc_print_txn( fd_rpc_tile_t *          ctx,
   fd_txn_t const * txn = (fd_txn_t const *)txn_buf;
   uchar const *    p   = rec->payload;
 
-  if( enc==FD_RPC_TXN_ENC_BASE64 ) {
+  /* All of the transaction's account addresses in order (static ones,
+     then the writable and the read-only ones loaded from lookup
+     tables), for the forms that print addresses instead of indexes. */
+  uchar const * keys[ 256 ];
+  uchar         key_writable[ 256 ];
+  uchar         loaded[ 256 ][ 32 ];
+  ulong         key_cnt = 0UL, static_cnt = txn->acct_addr_cnt;
+  if( enc==FD_RPC_TXN_ENC_ACCOUNTS || enc==FD_RPC_TXN_ENC_PARSED ) {
+    /* Writable as the runtime sees it: a reserved account, or a
+       program that is invoked without the upgradeable loader in the
+       transaction, is demoted to read-only. */
+    int upgradeable = 0;
+    for( ulong i=0UL; i<static_cnt; i++ ) upgradeable |= !memcmp( p+txn->acct_addr_off+32UL*i, fd_solana_bpf_loader_upgradeable_program_id.uc, 32UL );
+    for( ulong i=0UL; i<static_cnt && key_cnt<256UL; i++ ) {
+      fd_pubkey_t const * key = (fd_pubkey_t const *)( p+txn->acct_addr_off+32UL*i );
+      int invoked = 0;
+      for( ulong k=0UL; k<txn->instr_cnt; k++ ) invoked |= (ulong)txn->instr[ k ].program_id==i;
+      keys[ key_cnt ]         = key->uc;
+      key_writable[ key_cnt ] = (uchar)( fd_txn_is_writable( txn, (ushort)i ) && !fd_pubkey_is_active_reserved_key( key ) && !fd_pubkey_is_pending_reserved_key( key ) && !( invoked && !upgradeable ) );
+      key_cnt++;
+    }
+    fd_txn_acct_addr_lut_t const * luts = fd_txn_get_address_tables_const( txn );
+    ulong loaded_cnt = 0UL;
+    for( int pass=0; pass<2; pass++ ) {
+      for( ulong i=0UL; i<txn->addr_table_lookup_cnt; i++ ) {
+        ulong lamports; int executable; uchar owner[ 32UL ]; ulong data_len;
+        fd_accdb_read_one_nocache( ctx->accdb, info->accdb_fork_id, p+luts[ i ].addr_off, &lamports, &executable, owner, ctx->scratch.accdb_data_buf, &data_len );
+        if( FD_UNLIKELY( !lamports || data_len<56UL ) ) continue;
+        ulong         cnt  = pass ? luts[ i ].readonly_cnt : luts[ i ].writable_cnt;
+        uchar const * idxs = p + ( pass ? luts[ i ].readonly_off : luts[ i ].writable_off );
+        for( ulong k=0UL; k<cnt && key_cnt<256UL; k++ ) {
+          ulong off = 56UL+32UL*(ulong)idxs[ k ];
+          if( FD_UNLIKELY( off+32UL>data_len ) ) continue;
+          memcpy( loaded[ loaded_cnt ], ctx->scratch.accdb_data_buf+off, 32UL );
+          fd_pubkey_t const * key = (fd_pubkey_t const *)loaded[ loaded_cnt++ ];
+          keys[ key_cnt ]         = key->uc;
+          key_writable[ key_cnt ] = (uchar)( !pass && !fd_pubkey_is_active_reserved_key( key ) && !fd_pubkey_is_pending_reserved_key( key ) );
+          key_cnt++;
+        }
+      }
+    }
+
+    fd_http_server_printf( ctx->http, enc==FD_RPC_TXN_ENC_PARSED ? "\"transaction\":{\"message\":{\"accountKeys\":[" : "\"transaction\":{\"accountKeys\":[" );
+    for( ulong i=0UL; i<key_cnt; i++ ) {
+      FD_BASE58_ENCODE_32_BYTES( keys[ i ], key_b58 );
+      fd_http_server_printf( ctx->http, "%s{\"pubkey\":\"%s\",\"signer\":%s,\"source\":\"%s\",\"writable\":%s}", i ? "," : "", key_b58,
+                             i<txn->signature_cnt ? "true" : "false", i<static_cnt ? "transaction" : "lookupTable", key_writable[ i ] ? "true" : "false" );
+    }
+    fd_http_server_printf( ctx->http, "]" );
+    if( enc==FD_RPC_TXN_ENC_PARSED ) {
+      fd_http_server_printf( ctx->http, ",\"instructions\":[" );
+      for( ulong i=0UL; i<txn->instr_cnt; i++ ) {
+        fd_txn_instr_t const * ix = &txn->instr[ i ];
+        if( i ) fd_http_server_printf( ctx->http, "," );
+        fd_rpc_print_parsed_ix( ctx, keys, key_cnt, ix->program_id, p+ix->acct_off, ix->acct_cnt, p+ix->data_off, ix->data_sz, 1U );
+      }
+      FD_BASE58_ENCODE_32_BYTES( p+txn->recent_blockhash_off, bh_b58 );
+      fd_http_server_printf( ctx->http, "],\"recentBlockhash\":\"%s\"", bh_b58 );
+      fd_rpc_print_txn_msg_tail( ctx, txn, p );
+      fd_http_server_printf( ctx->http, "}" );
+    }
+    fd_http_server_printf( ctx->http, ",\"signatures\":[" );
+    for( ulong i=0UL; i<txn->signature_cnt; i++ ) {
+      FD_BASE58_ENCODE_64_BYTES( p+txn->signature_off+64UL*i, sig_b58 );
+      fd_http_server_printf( ctx->http, "%s\"%s\"", i ? "," : "", sig_b58 );
+    }
+    fd_http_server_printf( ctx->http, "]}," );
+  } else if( enc==FD_RPC_TXN_ENC_BASE64 ) {
     static char b64[ FD_BASE64_ENC_SZ( FD_TXN_MTU_V0 )+1UL ];
     ulong n = fd_base64_encode( b64, p, rec->payload_sz );
     fd_http_server_printf( ctx->http, "\"transaction\":[\"%.*s\",\"base64\"],", (int)n, b64 );
@@ -5065,33 +5436,7 @@ fd_rpc_print_txn( fd_rpc_tile_t *          ctx,
       fd_http_server_printf( ctx->http, "\",\"programIdIndex\":%u,\"stackHeight\":1}", (uint)ix->program_id );
     }
     fd_http_server_printf( ctx->http, "]" );
-    if( txn->transaction_version==FD_TXN_V1 ) {
-      /* v1 has no lookup tables; it carries its compute budget in the
-         header, each field present only if its mask bit is set */
-      uint          mask = fd_uint_load_4( p+4UL );
-      uchar const * cv   = p+txn->v1_txn_config_values_off;
-      fd_http_server_printf( ctx->http, ",\"transactionConfig\":{" );
-      ulong fee = 0UL; int has_fee = 0;
-      if( mask & 1U ) { fee = FD_LOAD( ulong, cv ); cv += 8UL; has_fee = 1; }
-      if( (mask>>2)&1U ) { fd_http_server_printf( ctx->http, "\"computeUnitLimit\":%u,", FD_LOAD( uint, cv ) ); cv += 4UL; } else fd_http_server_printf( ctx->http, "\"computeUnitLimit\":null," );
-      uint lads = 0U; int has_lads = 0;
-      if( (mask>>3)&1U ) { lads = FD_LOAD( uint, cv ); cv += 4UL; has_lads = 1; }
-      if( (mask>>4)&1U ) fd_http_server_printf( ctx->http, "\"heapSize\":%u,", FD_LOAD( uint, cv ) ); else fd_http_server_printf( ctx->http, "\"heapSize\":null," );
-      if( has_lads ) fd_http_server_printf( ctx->http, "\"loadedAccountsDataSizeLimit\":%u,", lads ); else fd_http_server_printf( ctx->http, "\"loadedAccountsDataSizeLimit\":null," );
-      if( has_fee ) fd_http_server_printf( ctx->http, "\"priorityFee\":%lu}", fee ); else fd_http_server_printf( ctx->http, "\"priorityFee\":null}" );
-    } else if( txn->transaction_version!=FD_TXN_VLEGACY ) {
-      fd_txn_acct_addr_lut_t const * luts = fd_txn_get_address_tables_const( txn );
-      fd_http_server_printf( ctx->http, ",\"addressTableLookups\":[" );
-      for( ulong i=0UL; i<txn->addr_table_lookup_cnt; i++ ) {
-        FD_BASE58_ENCODE_32_BYTES( p+luts[ i ].addr_off, lut_b58 );
-        fd_http_server_printf( ctx->http, "%s{\"accountKey\":\"%s\",\"readonlyIndexes\":[", i ? "," : "", lut_b58 );
-        for( ulong k=0UL; k<luts[ i ].readonly_cnt; k++ ) fd_http_server_printf( ctx->http, "%s%u", k ? "," : "", (uint)p[ luts[ i ].readonly_off+k ] );
-        fd_http_server_printf( ctx->http, "],\"writableIndexes\":[" );
-        for( ulong k=0UL; k<luts[ i ].writable_cnt; k++ ) fd_http_server_printf( ctx->http, "%s%u", k ? "," : "", (uint)p[ luts[ i ].writable_off+k ] );
-        fd_http_server_printf( ctx->http, "]}" );
-      }
-      fd_http_server_printf( ctx->http, "]" );
-    }
+    fd_rpc_print_txn_msg_tail( ctx, txn, p );
     fd_http_server_printf( ctx->http, "}}," );
   }
 
@@ -5104,7 +5449,8 @@ fd_rpc_print_txn( fd_rpc_tile_t *          ctx,
   if( meta && meta->slot!=rec->slot ) meta = NULL;
   /* costUnits is what the transaction cost the block; the compute
      units its programs used are only known from the exec tile. */
-  if( meta && meta->has_cu ) fd_http_server_printf( ctx->http, "\"meta\":{\"computeUnitsConsumed\":%u,\"costUnits\":%u,", meta->cu_consumed, rec->compute_units );
+  if( enc==FD_RPC_TXN_ENC_ACCOUNTS ) fd_http_server_printf( ctx->http, "\"meta\":{" ); /* the accounts form has a short meta */
+  else if( meta && meta->has_cu ) fd_http_server_printf( ctx->http, "\"meta\":{\"computeUnitsConsumed\":%u,\"costUnits\":%u,", meta->cu_consumed, rec->compute_units );
   else                       fd_http_server_printf( ctx->http, "\"meta\":{\"computeUnitsConsumed\":null,\"costUnits\":%u,", rec->compute_units );
   fd_rpc_print_txn_status( ctx, rec );
   /* Logs, inner instructions and return data come from the exec tile
@@ -5112,8 +5458,11 @@ fd_rpc_print_txn( fd_rpc_tile_t *          ctx,
      nothing was kept (a block this node produced itself, an entry that
      aged out, or a message the tile missed). */
   uchar const * meta_body = meta ? (uchar const *)( meta+1 ) : NULL;
+  if( enc==FD_RPC_TXN_ENC_ACCOUNTS ) {
+    fd_http_server_printf( ctx->http, ",\"fee\":%lu", rec->fee );
+  } else {
   if( !meta || meta->inner_truncated ) {
-    fd_http_server_printf( ctx->http, ",\"fee\":%lu,\"innerInstructions\":null,\"loadedAddresses\":", rec->fee );
+    fd_http_server_printf( ctx->http, ",\"fee\":%lu,\"innerInstructions\":null", rec->fee );
   } else {
     /* Same walk as simulateTransaction: an instruction at stack height
        1 is a top level one, what follows deeper was invoked from it. */
@@ -5127,6 +5476,7 @@ fd_rpc_print_txn( fd_rpc_tile_t *          ctx,
       if( e[ 0 ]<=1 ) { top = top==ULONG_MAX ? 0UL : top+1UL; if( open ) { fd_http_server_printf( ctx->http, "]}" ); open = 0; } continue; }
       if( !open ) { fd_http_server_printf( ctx->http, "%s{\"index\":%lu,\"instructions\":[", groups++ ? "," : "", top ); open = 1; }
       else          fd_http_server_printf( ctx->http, "," );
+      if( enc==FD_RPC_TXN_ENC_PARSED ) { fd_rpc_print_parsed_ix( ctx, keys, key_cnt, e[ 1 ], e+5UL, acct_cnt, e+5UL+acct_cnt, data_sz, (uint)e[ 0 ] ); continue; }
       fd_http_server_printf( ctx->http, "{\"accounts\":[" );
       for( ulong k=0UL; k<acct_cnt; k++ ) fd_http_server_printf( ctx->http, "%s%u", k ? "," : "", (uint)e[ 5UL+k ] );
       fd_http_server_printf( ctx->http, "],\"data\":\"" );
@@ -5134,9 +5484,13 @@ fd_rpc_print_txn( fd_rpc_tile_t *          ctx,
       fd_http_server_printf( ctx->http, "\",\"programIdIndex\":%u,\"stackHeight\":%u}", (uint)e[ 1 ], (uint)e[ 0 ] );
     }
     if( open ) fd_http_server_printf( ctx->http, "]}" );
-    fd_http_server_printf( ctx->http, "],\"loadedAddresses\":" );
+    fd_http_server_printf( ctx->http, "]" );
   }
-  fd_rpc_print_loaded_addresses( ctx, info, txn, p );
+  /* the parsed form lists loaded addresses among the account keys */
+  if( enc!=FD_RPC_TXN_ENC_PARSED ) {
+    fd_http_server_printf( ctx->http, ",\"loadedAddresses\":" );
+    fd_rpc_print_loaded_addresses( ctx, info, txn, p );
+  }
   if( !meta ) {
     fd_http_server_printf( ctx->http, ",\"logMessages\":null" );
   } else {
@@ -5156,6 +5510,7 @@ fd_rpc_print_txn( fd_rpc_tile_t *          ctx,
     }
     fd_http_server_printf( ctx->http, "]" );
   }
+  }
   fd_http_server_printf( ctx->http, ",\"postBalances\":[" );
   for( ulong i=0UL; i<rec->bal_cnt; i++ ) fd_http_server_printf( ctx->http, "%s%lu", i ? "," : "", rec->post_lamports[ i ] );
   /* Token balances are not reported.  They are known to be empty if
@@ -5164,7 +5519,7 @@ fd_rpc_print_txn( fd_rpc_tile_t *          ctx,
   fd_http_server_printf( ctx->http, "],\"postTokenBalances\":%s,\"preBalances\":[", tok );
   for( ulong i=0UL; i<rec->bal_cnt; i++ ) fd_http_server_printf( ctx->http, "%s%lu", i ? "," : "", rec->pre_lamports[ i ] );
   fd_http_server_printf( ctx->http, "],\"preTokenBalances\":%s", tok );
-  if( meta && meta->has_return ) {
+  if( meta && meta->has_return && enc!=FD_RPC_TXN_ENC_ACCOUNTS ) {
     static char b64[ FD_BASE64_ENC_SZ( FD_EXECRP_TXN_META_RETURN_MAX )+1UL ];
     ulong n = fd_base64_encode( b64, meta_body+meta->inner_sz+meta->log_sz, meta->return_sz );
     FD_BASE58_ENCODE_32_BYTES( meta->return_program, prog_b58 );
@@ -5190,8 +5545,9 @@ fd_rpc_txn_encoding( fd_rpc_tile_t *             ctx,
   if(      !strcmp( e, "json"   ) ) *enc = FD_RPC_TXN_ENC_JSON;
   else if( !strcmp( e, "base64" ) ) *enc = FD_RPC_TXN_ENC_BASE64;
   else if( !strcmp( e, "base58" ) ) *enc = FD_RPC_TXN_ENC_BASE58;
+  else if( !strcmp( e, "jsonParsed" ) ) *enc = FD_RPC_TXN_ENC_PARSED;
   else {
-    *res = fd_rpc_err_msg( ctx, id_cstr, -32065, "Firedancer Error: supported transaction encodings are json, base64 and base58" );
+    *res = fd_rpc_err_msg( ctx, id_cstr, -32065, "Firedancer Error: supported transaction encodings are json, jsonParsed, base64 and base58" );
     return 0;
   }
   return 1;
@@ -5342,13 +5698,15 @@ getBlock( fd_rpc_tile_t *         ctx,
   fd_rpc_val_t v[1];
   char details[ 16 ] = "full";
   if( fd_rpc_cfg_member( config, "transactionDetails", v ) && v->kind==FD_RPC_VAL_STR ) fd_rpc_val_cstr( v, details, sizeof(details) );
-  int want_full = !strcmp( details, "full" );
-  int want_sigs = !strcmp( details, "signatures" );
+  int want_accounts = !strcmp( details, "accounts" );
+  int want_full     = !strcmp( details, "full" ) || want_accounts;
+  int want_sigs     = !strcmp( details, "signatures" );
   if( FD_UNLIKELY( !want_full && !want_sigs && strcmp( details, "none" ) ) ) {
-    return fd_rpc_err_msg( ctx, id_cstr, -32065, "Firedancer Error: getBlock supports transactionDetails full, signatures or none" );
+    return fd_rpc_err_msg( ctx, id_cstr, -32602, "Invalid params: unknown variant, expected one of `full`, `signatures`, `none`, `accounts`." );
   }
   int enc = FD_RPC_TXN_ENC_JSON;
-  if( want_full && FD_UNLIKELY( !fd_rpc_txn_encoding( ctx, id_cstr, config, &enc, &response ) ) ) return response;
+  if( want_full && !want_accounts && FD_UNLIKELY( !fd_rpc_txn_encoding( ctx, id_cstr, config, &enc, &response ) ) ) return response;
+  if( want_accounts ) enc = FD_RPC_TXN_ENC_ACCOUNTS;
   int want_rewards    = !( fd_rpc_cfg_member( config, "rewards", v ) && v->kind==FD_RPC_VAL_BOOL && v->raw_sz==5UL );
   long max_version = ( fd_rpc_cfg_member( config, "maxSupportedTransactionVersion", v ) && v->kind==FD_RPC_VAL_INT && !v->neg ) ? (long)fd_ulong_min( v->u, 255UL ) : -1L;
 
@@ -5413,15 +5771,37 @@ getBlock( fd_rpc_tile_t *         ctx,
       fd_rpc_reward_epoch_t const * t = &ctx->reward_epochs[ i ];
       if( t->epoch!=ULONG_MAX && t->slot_lo<=slot && slot<=t->slot_hi ) epoch_rewards = 1;
     }
-    int near_epoch_start = !ctx->has_epoch_schedule || slot-fd_epoch_slot0( &ctx->epoch_schedule, fd_slot_to_epoch( &ctx->epoch_schedule, slot, NULL ) )<4096UL;
-    if( epoch_rewards || !meta->has_leader || ( near_epoch_start && !fd_rpc_reward_table( ctx, fd_slot_to_epoch( &ctx->epoch_schedule, slot, NULL )-1UL, 0 ) ) ) {
+    /* The EpochRewards sysvar says which blocks of the current epoch
+       paid epoch rewards: the one before distribution starts (vote
+       rewards) and one per partition after it. */
+    {
+      ulong lamports; int executable; uchar owner[ 32UL ]; ulong data_len;
+      fd_accdb_read_one_nocache( ctx->accdb, info->accdb_fork_id, fd_sysvar_epoch_rewards_id.uc, &lamports, &executable, owner, ctx->scratch.accdb_data_buf, &data_len );
+      if( FD_LIKELY( lamports && data_len>=16UL ) ) {
+        ulong start = FD_LOAD( ulong, ctx->scratch.accdb_data_buf ), parts = FD_LOAD( ulong, ctx->scratch.accdb_data_buf+8UL );
+        if( meta->block_height+1UL>=start && meta->block_height<start+parts ) epoch_rewards = 1;
+      } else {
+        epoch_rewards = 1; /* cannot tell */
+      }
+    }
+    if( epoch_rewards || !meta->has_leader ) {
       fd_http_server_printf( ctx->http, ",\"rewards\":null" );
     } else if( !meta->fee_reward ) {
       fd_http_server_printf( ctx->http, ",\"rewards\":[]" );
     } else {
-      /* Who collects the fee reward depends on the vote account's
-         collector settings, which this tile does not track. */
-      fd_http_server_printf( ctx->http, ",\"rewards\":null" );
+      /* The fee rewards replay reported for this slot.  None found
+         means the batch was missed. */
+      ulong found = 0UL;
+      for( ulong j=0UL; j<FD_RPC_FEE_REWARD_CNT; j++ ) {
+        if( ctx->fee_rewards[ j ].slot!=slot ) continue;
+        if( !found ) fd_http_server_printf( ctx->http, ",\"rewards\":[" );
+        FD_BASE58_ENCODE_32_BYTES( ctx->fee_rewards[ j ].pubkey, fee_b58 );
+        fd_http_server_printf( ctx->http, "%s{\"commission\":null,\"lamports\":%lu,\"postBalance\":%lu,\"pubkey\":\"%s\",\"rewardType\":\"Fee\"}",
+                               found ? "," : "", ctx->fee_rewards[ j ].lamports, ctx->fee_rewards[ j ].post_balance, fee_b58 );
+        found++;
+      }
+      if( found ) fd_http_server_printf( ctx->http, "]" );
+      else        fd_http_server_printf( ctx->http, ",\"rewards\":null" );
     }
   }
   if( want_sigs ) {
@@ -6987,7 +7367,21 @@ static fd_http_server_response_t
 rpc_http_request( fd_http_server_request_t const * request ) {
   fd_rpc_tile_t * ctx = request->ctx;
   long dt = -fd_tickcount();
-  fd_http_server_response_t response = rpc_http_request1( ctx, request );
+  fd_http_server_response_t response;
+  if( FD_UNLIKELY( request->method==FD_HTTP_SERVER_METHOD_OPTIONS ) ) {
+    /* A browser's cross-origin preflight.  Agave allows any origin. */
+    response = (fd_http_server_response_t){
+      .status                       = 204,
+      .access_control_allow_methods = "POST, GET, OPTIONS",
+      .access_control_allow_headers = "*",
+      .access_control_max_age       = 86400UL,
+    };
+  } else {
+    response = rpc_http_request1( ctx, request );
+  }
+  /* without this header a web page on another origin cannot read the
+     answer */
+  if( FD_LIKELY( !response.upgrade_websocket ) ) response.access_control_allow_origin = "*";
   dt += fd_tickcount();
   fd_histf_sample( ctx->request_duration, (ulong)dt );
   return response;

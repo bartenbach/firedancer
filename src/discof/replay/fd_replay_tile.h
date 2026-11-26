@@ -337,9 +337,11 @@ typedef struct fd_replay_slot_states fd_replay_slot_states_t;
 
 /* fd_replay_rewards_t is a batch of the epoch rewards (vote and stake)
    credited at the start of a block.  It is only published on
-   replay_out, for the RPC server.  seq is the cumulative index of the
-   first record of the batch, so a consumer can tell if it missed
-   one; dropped counts records replay itself had no room to queue. */
+   replay_out, for the RPC server.  A batch may also carry block fee
+   rewards (kind 2).  seq is the number of vote and stake records
+   (kinds 0 and 1) published before this batch, so a consumer can tell
+   if it missed any of those; dropped counts records replay itself had
+   no room to queue. */
 
 #define FD_REPLAY_REWARDS_BATCH_MAX (64UL)
 
@@ -352,7 +354,7 @@ struct fd_replay_rewards {
     ulong slot;
     ulong lamports_pre;
     ulong lamports_post;
-    uint  kind; /* 0 vote, 1 stake */
+    uint  kind; /* 0 vote, 1 stake, 2 block fee */
     uint  pad;
   } recs[ FD_REPLAY_REWARDS_BATCH_MAX ];
 };

@@ -107,6 +107,7 @@ fd_rewards_get_reward_distribution_num_blocks( fd_epoch_schedule_t const * epoch
 
 #define FD_REWARD_KIND_VOTE  (0U)
 #define FD_REWARD_KIND_STAKE (1U)
+#define FD_REWARD_KIND_FEE   (2U) /* a block's fee reward, paid to the leader's collector */
 
 struct fd_reward_rec {
   uchar pubkey[ 32 ];

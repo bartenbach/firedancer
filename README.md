@@ -37,8 +37,8 @@ not been reviewed by the Firedancer team.
 | `getTokenAccountBalance`, `getTokenSupply` | account read | |
 | `getTokenAccountsByOwner`, `getTokenAccountsByDelegate`, `getTokenLargestAccounts` | full account scan | No `jsonParsed`. |
 | `getSignatureStatuses` | recent transaction window | See "The recent transaction window" below. A failed transaction carries the failed instruction and its error, as Agave prints it. Without `searchTransactionHistory` only the last 300 slots are searched, as in Agave; with it, the whole window. |
-| `getTransaction` | recent transaction window, plus what the exec tiles report | Encodings `json`, `base64`, `base58`. **No `jsonParsed`.** `meta` has the result, fee, `computeUnitsConsumed`, `costUnits`, lamport balances before and after, loaded addresses, `logMessages`, `innerInstructions` and `returnData`. **Token balances are not reported**: `preTokenBalances` and `postTokenBalances` are `[]` when no token program or token-owned account is involved and `null` otherwise. Logs and inner instructions are `null` for a transaction whose report the tile missed or no longer keeps (see "Logs and inner instructions" below). |
-| `getBlock` | recent transaction window | `transactionDetails` `full`, `signatures` or `none` (**not `accounts`**). Transactions as for `getTransaction`. **Block rewards are not reported**: `rewards` is `[]` for a block that collected no fees and paid no epoch rewards, `null` otherwise (Agave lists the fee reward and, at the start of an epoch, the vote and stake rewards). A block is served only while every one of its transactions is in the window; otherwise "Block not available". |
+| `getTransaction` | recent transaction window, plus what the exec tiles report | Encodings `json`, `jsonParsed`, `base64`, `base58`. `meta` has the result, fee, `computeUnitsConsumed`, `costUnits`, lamport balances before and after, loaded addresses, `logMessages`, `innerInstructions` and `returnData`. With `jsonParsed`, instructions of the system program, the address lookup table program and the memo programs are decoded into named fields; **every other program (stake, vote, token, loaders, ...) is printed in Agave's "partially decoded" form** (account addresses and base58 data), which Agave itself uses for programs it does not know. **Token balances are not reported**: `preTokenBalances` and `postTokenBalances` are `[]` when no token program or token-owned account is involved and `null` otherwise. Logs and inner instructions are `null` for a transaction whose report the tile missed or no longer keeps (see "Logs and inner instructions" below). |
+| `getBlock` | recent transaction window | `transactionDetails` `full`, `accounts`, `signatures` or `none`. Transactions as for `getTransaction`. `rewards` lists the block's fee reward (recipient, amount and balance after, recorded where the runtime pays it). **For the blocks at the start of an epoch that also pay vote and stake rewards, `rewards` is `null`.** A block is served only while every one of its transactions is in the window; otherwise "Block not available". |
 | `getSignaturesForAddress` | recent transaction window | Matches addresses written in the transaction itself. **A transaction that only reaches the address through a lookup table is not found.** `limit`, `before`, `until` are supported. Each call walks the whole window. |
 | `getInflationReward` | rewards recorded as replay pays them | See "Epoch rewards" below. Up to 32 addresses, the previous epoch by default or `epoch`. Only the two most recent reward epochs, and only if the node was running when they were paid; otherwise "Block not available". `commission` and `blockRewardAmount` are always null. |
 | `signatureSubscribe`, `signatureUnsubscribe` (websocket) | recent transaction window | One notification when the transaction reaches the requested commitment, then the subscription ends. A transaction that is already there is notified on the next slot. `enableReceivedNotification` is ignored. At most 256 pending subscriptions in total; the oldest is dropped beyond that. |
@@ -63,9 +63,8 @@ current stake. This patch does not change that.
 
 | Method | Why |
 |---|---|
-| `getTransaction`, `getBlock` with `jsonParsed` | Needs an instruction parser for every program Agave knows. |
-| `getBlock` with `transactionDetails: "accounts"` | Not written. |
-| Token balances and block rewards in transaction history | See the `getTransaction` and `getBlock` rows. |
+| `jsonParsed` instruction decoding for stake, vote, token and loader programs | Printed partially decoded instead. |
+| Token balances in transaction history; the reward list of epoch-start blocks | See the `getTransaction` and `getBlock` rows. |
 | `logsSubscribe`, `programSubscribe`, `blockSubscribe`, `rootSubscribe` and the other websocket subscriptions | Not written. Only slot, vote, signature and account subscriptions exist. |
 | `requestAirdrop` | Needs a faucet. |
 
@@ -125,6 +124,8 @@ current stake. This patch does not change that.
   - the runtime (`fd_rewards.c`, `fd_rewards.h`, `fd_accdb_svm.c`): a
     thread-local hook that records each vote and stake reward as it is
     credited. It is NULL, and does nothing, in every tile but replay;
+  - the runtime's fee settlement (`fd_runtime.c`): the same hook
+    records the block fee reward as it is deposited;
   - `topology.c`: the links.
 
   These changes copy data out; they do not change what is executed or
@@ -180,6 +181,16 @@ current stake. This patch does not change that.
   format with a single signer; v0 transactions, lookup tables in use,
   return data in a landed transaction and blocks with many
   transactions have not been seen.
+- `jsonParsed` transactions (a transfer, a failing nonce withdrawal, a
+  lookup table extend with a parsed inner transfer) and `getBlock`
+  with `transactionDetails: accounts` matched Agave field for field.
+  The other system and lookup table instruction decoders are written
+  from Agave's source and have not been exercised.
+- `getBlock` `rewards` matched Agave on blocks with one fee reward.
+- **Browsers.** The RPC answers `OPTIONS` preflight requests and sends
+  `Access-Control-Allow-Origin: *` on every response, as Agave does,
+  so a web page on another origin can call it. Stock Firedancer does
+  neither.
 - **An earlier version of this patch printed the block cost as
   `computeUnitsConsumed`.** That is fixed: the cost is `costUnits` and
   `computeUnitsConsumed` is what the programs used.

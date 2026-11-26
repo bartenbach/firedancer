@@ -258,6 +258,7 @@ struct fd_replay_tile {
      once, far more than one stem burst).  See fd_rewards.h. */
 # define FD_REPLAY_REWARD_LOG_MAX (32768UL)
   fd_reward_log_t reward_log[ 1 ];
+  ulong           reward_epoch_seq; /* vote and stake records published so far */
   fd_reward_rec_t reward_log_recs[ FD_REPLAY_REWARD_LOG_MAX ];
 
   /* Signing payload of each exec tile's footer cert verify task */

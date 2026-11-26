@@ -3495,7 +3495,7 @@ after_credit( fd_replay_tile_t *  ctx,
   if( FD_UNLIKELY( rlog->head!=rlog->tail ) ) {
     fd_replay_rewards_t * msg = fd_chunk_to_laddr( ctx->replay_out->mem, ctx->replay_out->chunk );
     ulong cnt = fd_ulong_min( rlog->tail-rlog->head, FD_REPLAY_REWARDS_BATCH_MAX );
-    msg->seq     = rlog->head;
+    msg->seq     = ctx->reward_epoch_seq;
     msg->dropped = rlog->dropped;
     msg->cnt     = cnt;
     for( ulong i=0UL; i<cnt; i++ ) {
@@ -3506,6 +3506,7 @@ after_credit( fd_replay_tile_t *  ctx,
       msg->recs[ i ].lamports_post = rec->lamports_post;
       msg->recs[ i ].kind          = rec->kind;
       msg->recs[ i ].pad           = 0U;
+      ctx->reward_epoch_seq       += (ulong)( rec->kind!=FD_REWARD_KIND_FEE );
     }
     rlog->head += cnt;
     publish_replay_out( ctx, stem, REPLAY_SIG_REWARDS, sizeof(fd_replay_rewards_t) );
@@ -4767,6 +4768,7 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->reward_log->head    = 0UL;
   ctx->reward_log->tail    = 0UL;
   ctx->reward_log->dropped = 0UL;
+  ctx->reward_epoch_seq    = 0UL;
   fd_reward_log_tl         = ctx->reward_log;
   ulong execrp_result_obj_id = fd_pod_query_ulong( topo->props, "execrp_result", ULONG_MAX );
   FD_TEST( execrp_result_obj_id!=ULONG_MAX );
