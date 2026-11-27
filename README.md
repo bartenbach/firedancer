@@ -31,23 +31,28 @@ not been reviewed by the Firedancer team.
 | `getInflationRate` | bank inflation parameters | Assumes inflation started at slot 0. Wrong on a cluster that enabled inflation later (mainnet). |
 | `getFeeForMessage` | the message itself | A message that sets a compute unit price without a compute unit limit is refused with an error. |
 | `getRecentPrioritizationFees` | per-slot fee totals | Lists only blocks whose priority fees were zero. A block that paid priority fees is left out, because its minimum fee is not known to the tile. The account list argument is validated and otherwise ignored. |
-| `getProgramAccounts` | full account scan | `memcmp` and `dataSize` filters (max 4), `dataSlice`, `withContext`. No `jsonParsed` except vote accounts. |
-| `getLargestAccounts` | full account scan | The `filter` argument is ignored. |
-| `getSupply` | full account scan | Everything is reported as circulating; the non-circulating list is empty. |
-| `getTokenAccountBalance`, `getTokenSupply` | account read | |
-| `getTokenAccountsByOwner`, `getTokenAccountsByDelegate`, `getTokenLargestAccounts` | full account scan | No `jsonParsed`. |
+| `getProgramAccounts` | full account scan | `memcmp`, `dataSize` and `tokenAccountState` filters (max 4), `dataSlice`, `withContext`, `jsonParsed` as for `getAccountInfo`. |
+| `getLargestAccounts` | full account scan | `filter` `circulating` / `nonCirculating`, classified as in `getSupply`. Agave answers this from a cache, so its balances can be older. |
+| `getSupply` | full account scan | Non-circulating accounts by Agave's rules: its fixed account list (copied from Agave 4.5, `fd_rpc_noncirc.h`) plus stake accounts that are locked up or whose withdrawer is on its authority list. `excludeNonCirculatingAccountsList` is honoured. |
+| `getTokenAccountBalance`, `getTokenSupply` | account read | Token-2022 mints with the interest-bearing or scaled UI amount extension show the amount as Agave does, as of the bank's clock. |
+| `getTokenAccountsByOwner`, `getTokenAccountsByDelegate`, `getTokenLargestAccounts` | full account scan | `jsonParsed` as for `getAccountInfo`. A `mint` that does not exist or is not a mint is refused, as in Agave. |
 | `getSignatureStatuses` | recent transaction window | See "The recent transaction window" below. A failed transaction carries the failed instruction and its error, as Agave prints it. Without `searchTransactionHistory` only the last 300 slots are searched, as in Agave; with it, the whole window. |
-| `getTransaction` | recent transaction window, plus what the exec tiles report | Encodings `json`, `jsonParsed`, `base64`, `base58`. `meta` has the result, fee, `computeUnitsConsumed`, `costUnits`, lamport balances before and after, loaded addresses, `logMessages`, `innerInstructions` and `returnData`. With `jsonParsed`, instructions of the system, address lookup table, stake, vote, SPL token, associated token account, BPF loader, upgradeable loader and memo programs are decoded into named fields, as Agave does. **The Token-2022 extension instruction families (transfer fee, confidential transfer, metadata, group, pointer, pausable, ... instructions) are not decoded** and are printed in Agave's "partially decoded" form (account addresses and base58 data), which Agave uses for programs it does not know; so are the two upgradeable loader instructions newer than `SetAuthorityChecked`. **Token balances are not reported**: `preTokenBalances` and `postTokenBalances` are `[]` when no token program or token-owned account is involved and `null` otherwise. Logs and inner instructions are `null` for a transaction whose report the tile missed or no longer keeps (see "Logs and inner instructions" below). |
-| `getBlock` | recent transaction window | `transactionDetails` `full`, `accounts`, `signatures` or `none`. Transactions as for `getTransaction`. `rewards` lists the block's fee reward (recipient, amount and balance after, recorded where the runtime pays it). **For the blocks at the start of an epoch that also pay vote and stake rewards, `rewards` is `null`.** A block is served only while every one of its transactions is in the window; otherwise "Block not available". |
+| `getTransaction` | recent transaction window, plus what the exec tiles report | Encodings `json`, `jsonParsed`, `base64`, `base58`. `meta` has the result, fee, `computeUnitsConsumed`, `costUnits`, lamport balances before and after, loaded addresses, `logMessages`, `innerInstructions` and `returnData`. With `jsonParsed`, instructions of the system, address lookup table, stake, vote, SPL token, associated token account, BPF loader, upgradeable loader and memo programs are decoded into named fields, as Agave does. The Token-2022 extension instructions are decoded too (transfer fee, default account state, reallocate, memo transfer, interest-bearing, CPI guard, transfer hook, metadata / group / member pointers, scaled UI amount, pausable, permissioned burn, the token-metadata and token-group interfaces, and the confidential transfer instructions that carry no proof). **Not decoded**, and printed in Agave's "partially decoded" form (account addresses and base58 data): the confidential transfer instructions that carry zero-knowledge proofs (withdraw, transfer, transfer with fee, configure with registry), the confidential transfer fee and confidential mint/burn families, the token `Batch` instruction, and the two upgradeable loader instructions newer than `SetAuthorityChecked`. `preTokenBalances` and `postTokenBalances` list every token account the transaction touched, read by the execution tile before and after it ran (up to 24 per transaction; beyond that they are `null`). `maxSupportedTransactionVersion` works as in Agave: without it the `version` field is left out, and base58 is refused once it is 1 or more. Logs and inner instructions are `null` for a transaction whose report the tile missed or no longer keeps (see "Logs and inner instructions" below). |
+| `getBlock` | recent transaction window | `transactionDetails` `full`, `accounts`, `signatures` or `none`. Transactions as for `getTransaction`. `rewards` lists the block's fee reward (recipient, amount and balance after, recorded where the runtime pays it). The blocks at the start of an epoch also list the vote account burns (`VATDebit`), vote rewards and stake rewards paid in them, and the first carries `numRewardPartitions`; this needs the node to have been running when the epoch started (see "Epoch rewards"), otherwise `rewards` is `null` there. `processed` commitment is refused, as in Agave. A block is served only while every one of its transactions is in the window; otherwise "Block not available". |
 | `getSignaturesForAddress` | recent transaction window | Matches addresses written in the transaction itself. **A transaction that only reaches the address through a lookup table is not found.** `limit`, `before`, `until` are supported. Each call walks the whole window. |
-| `getInflationReward` | rewards recorded as replay pays them | See "Epoch rewards" below. Up to 32 addresses, the previous epoch by default or `epoch`. Only the two most recent reward epochs, and only if the node was running when they were paid; otherwise "Block not available". `commission` and `blockRewardAmount` are always null. |
-| `signatureSubscribe`, `signatureUnsubscribe` (websocket) | recent transaction window | One notification when the transaction reaches the requested commitment, then the subscription ends. A transaction that is already there is notified on the next slot. `enableReceivedNotification` is ignored. At most 256 pending subscriptions in total; the oldest is dropped beyond that. |
+| `getInflationReward` | rewards recorded as replay pays them | See "Epoch rewards" below. Up to 32 addresses, the previous epoch by default or `epoch`. Only the eight most recent reward epochs, and only if the node was running when they were paid; otherwise "Block not available". `commission` and `blockRewardAmount` are always null. |
+| `signatureSubscribe`, `signatureUnsubscribe` (websocket) | recent transaction window | One notification when the transaction reaches the requested commitment, then the subscription ends. A transaction that is already there is notified on the next slot. `enableReceivedNotification` sends `receivedSignature` first. At most 256 pending subscriptions in total; the oldest is dropped beyond that. |
 | `accountSubscribe`, `accountUnsubscribe` (websocket) | account read on every commitment change | The account is re-read each time the subscribed commitment level moves and a notification is sent if it changed. Encodings as `getAccountInfo`. At most 256 subscriptions in total. |
-| `simulateTransaction` | a private runtime inside the RPC tile | See "The transaction simulator" below. `sigVerify`, `replaceRecentBlockhash`, `accounts` (base64 only), `encoding` base58/base64. Returns `err`, `logs`, `unitsConsumed`, `returnData`, `fee`, `loadedAccountsDataSize`, `loadedAddresses`, lamport and token balances before and after, the requested accounts, and `innerInstructions` when asked for. Inner instructions are given in compiled form (account indexes, base58 data); Agave gives them parsed for programs it knows. A transaction that already landed is simulated again rather than reported as `AlreadyProcessed`. |
+| `programSubscribe`, `programUnsubscribe` (websocket) | recent transaction window + account read | For each transaction that reaches the subscribed commitment, every account it could write is re-read; those owned by the program and passing the filters (as `getProgramAccounts`) are notified, once per block. An account changed without a transaction (rewards, rent) is not noticed. At most 32 subscriptions. |
+| `logsSubscribe`, `logsUnsubscribe` (websocket) | recent transaction window | `all`, `allWithVotes`, or `mentions` with one address (matched against the addresses written in the transaction, not ones reached through a lookup table). At most 64 subscriptions. |
+| `rootSubscribe`, `rootUnsubscribe` (websocket) | replay's root messages | |
+| `slotsUpdatesSubscribe`, `slotsUpdatesUnsubscribe` (websocket) | replay's slot messages | `firstShredReceived`, `createdBank`, `completed`, `frozen`, `optimisticConfirmation`, `root`, each with the time it was taken at. Replay reports a slot once, when it is done, so a slot's events arrive together. `completed` carries the time replay finished rather than the time the last shred arrived, the entry counts in `frozen` are 0, and `optimisticConfirmation` is sent with `root` because this node's confirmed level moves with its root. `dead` is not sent. |
+| JSON-RPC batch requests | | An array of calls is answered with an array, as in Agave. Request bodies up to 50 KiB. |
+| `simulateTransaction` | a private runtime inside the RPC tile | See "The transaction simulator" below. `sigVerify`, `replaceRecentBlockhash`, `accounts` (base64 or `jsonParsed`), `encoding` base58/base64. Returns `err`, `logs`, `unitsConsumed`, `returnData`, `fee`, `loadedAccountsDataSize`, `loadedAddresses`, lamport and token balances before and after, the requested accounts, and `innerInstructions` when asked for. Inner instructions are given in compiled form (account indexes, base58 data); Agave gives them parsed for programs it knows. A transaction that already landed is simulated again rather than reported as `AlreadyProcessed`. |
 | `getStakeMinimumDelegation` | the simulator | Simulates the stake program's `GetMinimumDelegation` instruction and returns what the program answers, as Agave does. |
 | `getHighestSnapshotSlot` | the snapshot writer's messages | The newest full snapshot the node has on disk and the newest incremental built on it. Only on a node that writes snapshots (`[layout] enable_snapshot_production = true`, which the Firedancer defaults mark as unsupported); otherwise "No snapshot". With it on, the check node reported the same full snapshot slot as Agave and its incremental slot followed each new file. |
-| `sendTransaction` | UDP to upcoming leaders | The transaction is parsed, its signatures verified and, unless `skipPreflight`, its blockhash checked. It is then sent as a UDP datagram to the TPU port of the leaders of the next 4 rotations and resent every rotation until it is seen in a block or 150 slots pass. **There is no simulation**: a transaction that would fail on chain is still sent. A leader that advertises no TPU UDP port (Agave takes QUIC only) is skipped, and so is this node itself when it is the leader. `maxRetries`, `preflightCommitment` and `minContextSlot` are ignored. At most 256 transactions are kept for resending. |
-| `jsonParsed` encoding | account data | Parsed: vote accounts (v4 vote state), stake accounts, plain SPL token mints (82 bytes) and accounts (165 bytes) of either token program, nonce accounts, address lookup tables, upgradeable-loader program and programData accounts, validator info records, and the sysvars clock, epochSchedule, rent, lastRestartSlot, epochRewards, recentBlockhashes, slotHashes, slotHistory and stakeHistory. Accounts Agave does not parse fall back to base64, as in Agave. Not parsed, and returned as an error rather than as unparsed data: Token-2022 accounts with extensions, token multisigs, loader buffer accounts, uninitialized nonce accounts, pre-v4 vote states. `rentEpoch` is always printed as 18446744073709551615, where Agave prints 0 for accounts not rewritten since genesis. A sysvar is parsed only where its address is known to the encoder (`getAccountInfo`, `getMultipleAccounts`, `getProgramAccounts`). |
+| `sendTransaction` | UDP to upcoming leaders | The transaction is parsed and its signatures verified. Unless `skipPreflight`, its blockhash is checked, a transaction that already landed is refused, and it is run in the simulator on the bank named by `preflightCommitment` (finalized by default); a failure comes back as error -32002 with the error, logs and units consumed, as Agave reports it, and nothing is sent. It is then sent as a UDP datagram to the TPU port of the leaders of the next 4 rotations and resent every rotation until it is seen in a block or 150 slots pass. A leader that advertises no TPU UDP port (Agave takes QUIC only) is skipped, and so is this node itself when it is the leader. `maxRetries` and `minContextSlot` are ignored. At most 256 transactions are kept for resending. |
+| `jsonParsed` encoding | account data | Parsed: vote accounts (v4 vote state), stake accounts, SPL token mints and accounts of either token program including Token-2022 extensions (every extension type Agave 4.5 prints), nonce accounts, address lookup tables, upgradeable-loader program and programData accounts, validator info records, and the sysvars clock, epochSchedule, rent, lastRestartSlot, epochRewards, recentBlockhashes, slotHashes, slotHistory and stakeHistory. Accounts Agave does not parse fall back to base64, as in Agave. Not parsed, and returned as an error rather than as unparsed data: token multisigs, loader buffer accounts, uninitialized nonce accounts, pre-v4 vote states. `rentEpoch` is always printed as 18446744073709551615, where Agave prints 0 for accounts not rewritten since genesis. A sysvar is parsed only where its address is known to the encoder (`getAccountInfo`, `getMultipleAccounts`, `getProgramAccounts`). |
 
 ### Already in the base branch (not part of this patch)
 
@@ -73,10 +78,10 @@ credits, identity and commission are always read live.
 
 | Method | Why |
 |---|---|
-| `jsonParsed` instruction decoding for the Token-2022 extension instruction families | Printed partially decoded instead. |
-| Token balances in transaction history; the reward list of epoch-start blocks | See the `getTransaction` and `getBlock` rows. |
-| `logsSubscribe`, `programSubscribe`, `blockSubscribe`, `rootSubscribe` and the other websocket subscriptions | Not written. Only slot, vote, signature and account subscriptions exist. |
-| `requestAirdrop` | Needs a faucet. |
+| History that survives a restart | Blocks, transactions, rewards and performance samples are kept in memory only. After a restart the node knows nothing older than its start. |
+| `jsonParsed` decoding of the confidential transfer instructions that carry proofs, the confidential fee and mint/burn families, and token `Batch` | Printed partially decoded instead. |
+| `blockSubscribe` | Not written. Agave has it off by default and answers "Method not found" too. |
+| `requestAirdrop` | Needs a faucet. Answers "Invalid request", as an Agave node without a faucet does. |
 
 ### Things to know before running it
 
@@ -124,17 +129,18 @@ credits, identity and commission are always read live.
     differently than on chain. That has not been explored.
 - **The patch is not confined to the RPC tile.** It also changes:
   - the execution tiles (`fd_execrp_tile.c`, `fd_execrp.h`): each
-    reports a transaction's balances and failed-instruction detail to
-    replay, and publishes its logs, instruction trace and return data
+    reports a transaction's lamport and token balances and
+    failed-instruction detail to replay, and publishes its logs, instruction trace and return data
     on a new `execrp_rpc` link that only the RPC tile reads;
   - **program log collection is switched on in the execution tiles**
     whenever the RPC tile is in the topology. Stock Firedancer runs
     with it off. Its cost on a busy cluster has not been measured;
   - replay (`fd_replay_tile.c`): passes the above along and publishes
     epoch rewards in batches;
-  - the runtime (`fd_rewards.c`, `fd_rewards.h`, `fd_accdb_svm.c`): a
-    thread-local hook that records each vote and stake reward as it is
-    credited. It is NULL, and does nothing, in every tile but replay;
+  - the runtime (`fd_rewards.c`, `fd_rewards.h`, `fd_accdb_svm.c`,
+    `fd_stakes.c`): a thread-local hook that records each vote and
+    stake reward as it is credited and each vote account burn as it is
+    taken. It is NULL, and does nothing, in every tile but replay;
   - the runtime's fee settlement (`fd_runtime.c`): the same hook
     records the block fee reward as it is deposited;
   - `topology.c`: the links.
@@ -152,9 +158,9 @@ credits, identity and commission are always read live.
   tile and have none. Inner instructions are in compiled form (account
   indexes, base58 data), which is what Agave returns for the `json`,
   `base64` and `base58` encodings.
-- **Epoch rewards.** Two tables of 4 million entries each (about 270 MB
-  each, paged in as they fill) hold the rewards of the two most recent
-  epochs. Like the transaction window they are memory only: after a
+- **Epoch rewards.** Eight tables of 4 million entries each (about
+  270 MB each, paged in as they fill) hold the rewards of the eight
+  most recent epochs. Like the transaction window they are memory only: after a
   restart the node answers "Block not available" for an epoch until it
   has watched one being paid from the start. If the tile misses a batch
   the whole epoch is marked incomplete and answers the same error
@@ -162,11 +168,54 @@ credits, identity and commission are always read live.
   comes back `null` where Agave returns an entry with amount 0.
 - **A scan is not a point-in-time view.** Accounts written while a scan
   runs may or may not be included.
-- **How it was checked.** Each call was issued to an Agave 4.5.0-beta.0
+- **Three-way comparison, 2026-11-27.** 356 calls were sent to this
+  patch, to another public Firedancer RPC on the same cluster (stock
+  Firedancer RPC behind a gateway, no websocket) and to an Agave
+  4.5.0-beta.0 node, which is the reference. "Same" means the same
+  answer as Agave, or the same error code where Agave returns an
+  error; values that differ between nodes by nature (current slot, a
+  node's identity, live vote progress) are compared by shape. Test
+  transactions of every kind below were sent from a throwaway wallet
+  through all three.
+
+  | Area | Calls | This patch same as Agave | Other Firedancer RPC same as Agave |
+  |---|---|---|---|
+  | Protocol | 11 | 11 | 9 |
+  | Cluster | 38 | 36 | 35 |
+  | Validators | 7 | 5 | 7 |
+  | Accounts | 19 | 19 | 19 |
+  | Parsed accounts | 27 | 27 | 26 |
+  | Program scans | 19 | 19 | 18 |
+  | Tokens | 17 | 17 | 15 |
+  | Blocks | 35 | 30 | 25 |
+  | Transactions: decoding | 68 | 68 | 20 |
+  | Transactions | 38 | 37 | 31 |
+  | Sending transactions | 11 | 11 | 9 |
+  | Simulation | 16 | 16 | 16 |
+  | Websocket | 35 | 33 | 0 |
+  | Other | 4 | 2 | 4 |
+  | Removed methods | 11 | 11 | 11 |
+  | **Total** | **356** | **342** | **245** |
+
+  The 14 calls where this patch differs: 12 ask for something from
+  before the node's last restart, 25 minutes before the run (old
+  blocks, past-epoch rewards, 12 hours of performance samples, an
+  earlier epoch's leader schedule); Agave sends one finalized
+  `logsNotification` twice where this sends it once; and this answers
+  ordinary calls over the websocket where Agave does not. Checked by
+  hand after the next epoch started: `getInflationReward` matched
+  Agave, and the reward list of the epoch's first blocks had the same
+  entries except one vote account that Agave lists with a reward of 0.
+  The test transactions covered system, nonce, stake, vote, lookup
+  table, SPL token and Token-2022 (transfer fee, interest, metadata,
+  memo, CPI guard, default state, pause, scaled UI amount, group,
+  transfer hook, non-transferable, confidential transfer mint and
+  account setup) instructions and a program deploy.
+- **How it was checked (earlier rounds).** Each call was issued to an Agave 4.5.0-beta.0
   node and to a Firedancer node running this patch on the Alpenglow
   community cluster, and the answers compared. That is one small
   cluster with Alpenglow active. Nothing here has been run on mainnet
-  or testnet, with pre-v4 vote accounts, or with Token-2022 accounts.
+  or testnet, or with pre-v4 vote accounts.
 - `sendTransaction` landed one transaction: a `solana transfer` from
   the 4.5.0-beta.0 CLI pointed at the patched node, finalized and
   confirmed on the Agave node too. That is one transaction, sent from
