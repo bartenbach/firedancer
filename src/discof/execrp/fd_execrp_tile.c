@@ -374,6 +374,52 @@ returnable_frag( fd_execrp_tile_t *  ctx,
           }
           meta->has_token = (uchar)has_token;
 
+          /* Token balances before and after.  An acquired account
+             still has its state from before the transaction next to
+             the state the transaction left.  A failed transaction
+             leaves token accounts as they were. */
+          {
+            ulong pre_cnt = 0UL, post_cnt = 0UL;
+            int   known   = ctx->txn_out.accounts.is_setup && ctx->txn_out.accounts.cnt<=255UL;
+            int   failed  = !!ctx->txn_out.err.txn_err;
+            uchar * pre_e  = meta->tok;
+            uchar * post_e = meta->tok+FD_EXECRP_TXN_META_TOK_MAX*FD_EXECRP_TXN_META_TOK_SZ;
+            for( ulong i=0UL; known && i<ctx->txn_out.accounts.cnt; i++ ) {
+              fd_acc_t const * acc = ctx->txn_out.accounts.account[ i ];
+              if( FD_UNLIKELY( !acc ) ) { known = 0; break; }
+              for( int side=0; side<2; side++ ) { /* 0 before, 1 after */
+                uchar const * owner; uchar const * data; ulong data_len; ulong lamports;
+                if( !side || failed ) {
+                  if( FD_UNLIKELY( !ctx->txn_out.accounts.account_acquired[ i ] ) ) {
+                    /* no record of the earlier state: fine unless it is a token account */
+                    if( !memcmp( acc->owner, fd_solana_spl_token_id.uc, 32UL ) || !memcmp( acc->owner, ctx->token_2022_id.uc, 32UL ) ) known = 0;
+                    continue;
+                  }
+                  owner = acc->prior_owner; data = acc->prior_data; data_len = acc->prior_data_len; lamports = acc->prior_lamports;
+                } else {
+                  owner = acc->owner; data = acc->data; data_len = acc->data_len; lamports = acc->lamports;
+                }
+                int t22 = !memcmp( owner, ctx->token_2022_id.uc, 32UL );
+                if( !t22 && memcmp( owner, fd_solana_spl_token_id.uc, 32UL ) ) continue;
+                /* an initialized token account: 165 bytes, or longer with the account tag */
+                if( !lamports || !data || data_len<165UL || !data[ 108 ] ) continue;
+                if( data_len>165UL && ( !t22 || data_len==355UL || data[ 165 ]!=2 ) ) continue;
+                ulong * cnt = side ? &post_cnt : &pre_cnt;
+                if( FD_UNLIKELY( *cnt>=FD_EXECRP_TXN_META_TOK_MAX ) ) { known = 0; break; }
+                uchar * e = ( side ? post_e : pre_e )+(*cnt)*FD_EXECRP_TXN_META_TOK_SZ;
+                e[ 0 ] = (uchar)i;
+                e[ 1 ] = (uchar)t22;
+                memcpy( e+2UL,  data,       32UL ); /* mint */
+                memcpy( e+34UL, data+32UL,  32UL ); /* owner */
+                memcpy( e+66UL, data+64UL,  8UL  ); /* amount */
+                (*cnt)++;
+              }
+            }
+            meta->tok_known    = (uchar)known;
+            meta->tok_pre_cnt  = known ? (uchar)pre_cnt  : (uchar)0;
+            meta->tok_post_cnt = known ? (uchar)post_cnt : (uchar)0;
+          }
+
           ulong return_sz = ran ? ctx->txn_out.details.return_data.len : 0UL;
           meta->has_return = (uchar)( return_sz>0UL && return_sz<=FD_EXECRP_TXN_META_RETURN_MAX );
           meta->return_sz  = meta->has_return ? (uint)return_sz : 0U;

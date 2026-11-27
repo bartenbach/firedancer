@@ -1288,14 +1288,17 @@ main( int     argc,
           "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getLeaderSchedule\",\"params\":[0,{\"identity\":\"%s\"}]}", leader_id_b58 ) );
       expect_rpc_response( ctx, req_buf, res_buf );
 
-      /* identity filter matching no leader -> empty map */
+      /* identity filter matching no leader -> Agave's
+         LEADER_SCHEDULE_IDENTITY_NOT_FOUND error */
       {
         fd_pubkey_t other; memset( other.uc, 0x55, 32 );
         FD_BASE58_ENCODE_32_BYTES( other.uc, other_b58 );
         FD_TEST( fd_cstr_printf_check( req_buf, sizeof(req_buf), NULL,
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getLeaderSchedule\",\"params\":[0,{\"identity\":\"%s\"}]}", other_b58 ) );
-        expect_rpc_response( ctx, req_buf,
-            "{\"jsonrpc\":\"2.0\",\"result\":{},\"id\":1}" );
+        char exp_buf[ 512 ];
+        FD_TEST( fd_cstr_printf_check( exp_buf, sizeof(exp_buf), NULL,
+            "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32022,\"message\":\"Node %s was not in the leader schedule for specified epoch\"},\"id\":1}", other_b58 ) );
+        expect_rpc_response( ctx, req_buf, exp_buf );
       }
 
       /* slot in an untracked epoch -> null result (NOT an error) */

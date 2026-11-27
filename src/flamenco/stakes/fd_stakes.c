@@ -8,6 +8,7 @@
 #include "../runtime/fd_runtime_stack_tmpl.h"
 #include "../runtime/fd_system_ids.h"
 #include "../runtime/fd_accdb_svm.h"
+#include "../rewards/fd_rewards.h"
 #include "../../util/bits/fd_sat.h"
 
 /**********************************************************************/
@@ -648,6 +649,7 @@ fd_stakes_burn_vat( fd_bank_t *         bank,
     fd_acc_t              acc = fd_accdb_svm_open_rw( bank, accdb, update, &ele->pubkey, 0 );
     FD_TEST( acc.lamports>=burn_per_epoch );
     total_vat    += burn_per_epoch;
+    fd_reward_log_push( FD_REWARD_KIND_VAT, ele->pubkey.uc, bank->f.slot, acc.lamports, acc.lamports-burn_per_epoch );
     acc.lamports -= burn_per_epoch;
     update->skip_event_diff = 1;
     fd_accdb_svm_close_rw( bank, accdb, capture_ctx, &acc, update );

@@ -204,6 +204,8 @@ typedef struct fd_execrp_txn_exec_done_msg fd_execrp_txn_exec_done_msg_t;
 
 #define FD_EXECRP_TXN_META_INNER_MAX  (6144UL)
 #define FD_EXECRP_TXN_META_RETURN_MAX (1024UL)
+#define FD_EXECRP_TXN_META_TOK_MAX    (24UL)
+#define FD_EXECRP_TXN_META_TOK_SZ     (74UL)
 #define FD_EXECRP_TXN_META_LOG_MAX    (14000UL) /* FD_LOG_COLLECTOR_MAX + FD_LOG_COLLECTOR_EXTRA */
 
 struct fd_execrp_txn_meta {
@@ -218,6 +220,15 @@ struct fd_execrp_txn_meta {
   uchar  has_cu;
   uint   cu_consumed;  /* compute units the programs used (not the block cost) */
   uchar  return_program[ 32 ];
+  /* SPL token accounts among the transaction's accounts, before and
+     after it ran: tok_pre_cnt entries, then tok_post_cnt entries, each
+     FD_EXECRP_TXN_META_TOK_SZ bytes: account index (1), token program
+     (1: 0 Token, 1 Token-2022), mint (32), owner (32), amount (8).
+     tok_known is 0 if they could not all be recorded. */
+  uchar  tok_known;
+  uchar  tok_pre_cnt;
+  uchar  tok_post_cnt;
+  uchar  tok[ 2UL*FD_EXECRP_TXN_META_TOK_MAX*FD_EXECRP_TXN_META_TOK_SZ ];
   uchar  return_data[ FD_EXECRP_TXN_META_RETURN_MAX ];
   uchar  inner[ FD_EXECRP_TXN_META_INNER_MAX ];
   uchar  log[ FD_EXECRP_TXN_META_LOG_MAX ];

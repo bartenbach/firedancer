@@ -66,7 +66,7 @@
 
 #define FD_RPC_AGAVE_API_VERSION "4.4.0"
 
-#define FD_HTTP_SERVER_RPC_MAX_REQUEST_LEN       8192UL
+#define FD_HTTP_SERVER_RPC_MAX_REQUEST_LEN       51200UL /* 50 KiB, Agave's default body limit */
 
 /* FD_RPC_ID_MAX_SZ is the longest JSON-RPC request id (as raw JSON
    text) that is echoed back in responses. */
@@ -426,7 +426,11 @@ struct fd_rpc_meta_ent {
   uchar has_cu;
   uint  cu_consumed;
   uchar return_program[ 32 ];
-  /* inner_sz, log_sz and return_sz bytes follow, in that order */
+  uchar tok_known;     /* token balances recorded: tok_pre_cnt then tok_post_cnt entries */
+  uchar tok_pre_cnt;
+  uchar tok_post_cnt;
+  /* inner_sz, log_sz and return_sz bytes follow, in that order, then
+     the token balance entries (FD_EXECRP_TXN_META_TOK_SZ bytes each) */
 };
 typedef struct fd_rpc_meta_ent fd_rpc_meta_ent_t;
 
@@ -436,15 +440,16 @@ typedef struct fd_rpc_meta_ent fd_rpc_meta_ent_t;
    block is on the queried fork.  The memory is anonymous and only
    paged in as it fills. */
 
-#define FD_RPC_REWARD_EPOCH_CNT (2UL)
+#define FD_RPC_REWARD_EPOCH_CNT (8UL) /* tables are untouched memory until an epoch uses them */
 #define FD_RPC_REWARD_ENT_CNT   (1UL<<22)
 #define FD_RPC_REWARD_ENT_MAX   (3UL<<20) /* stop filling at 75% load */
 
 struct fd_rpc_reward_ent {
   uchar pubkey[ 32 ];
   ulong slot;          /* 0 if the entry is unused */
-  ulong amount;
+  ulong amount;        /* lamports paid, or taken for kind 3 */
   ulong post_balance;
+  uint  kind;          /* 0 vote reward, 1 stake reward, 3 vote account burn */
 };
 typedef struct fd_rpc_reward_ent fd_rpc_reward_ent_t;
 
@@ -454,6 +459,7 @@ struct fd_rpc_reward_epoch {
   int                   incomplete; /* some rewards of this epoch were not seen */
   ulong                 slot_lo;    /* first and last slot a reward of this epoch was paid in */
   ulong                 slot_hi;
+  ulong                 num_partitions; /* blocks the stake rewards were spread over, 0 if unknown */
   fd_rpc_reward_ent_t * ents;       /* NULL if the memory could not be reserved */
 };
 typedef struct fd_rpc_reward_epoch fd_rpc_reward_epoch_t;
@@ -700,6 +706,19 @@ typedef struct fd_rpc_send_pending fd_rpc_send_pending_t;
 #define FD_RPC_SCAN_CHAIN_BUDGET (1UL<<20)
 #define FD_RPC_PRIO_FEE_CNT      (150UL)
 
+#define FD_RPC_GPA_FILTER_MAX       (4UL)
+#define FD_RPC_GPA_MEMCMP_BYTES_MAX (128UL)
+
+struct fd_rpc_gpa_filter {
+  int   is_memcmp;  /* else dataSize */
+  int   is_token_state; /* tokenAccountState: an initialized SPL token account */
+  ulong data_size;
+  ulong offset;
+  ulong bytes_len;
+  uchar bytes[ FD_RPC_GPA_MEMCMP_BYTES_MAX ];
+};
+typedef struct fd_rpc_gpa_filter fd_rpc_gpa_filter_t;
+
 struct fd_rpc_tile {
   int delay_startup;
   int waker_rearm_pending;
@@ -727,8 +746,56 @@ struct fd_rpc_tile {
     ulong ws_conn_id;
     int   level;    /* 0 processed, 1 confirmed, 2 finalized */
     uchar sig[ 64 ];
+    int   recv;     /* enableReceivedNotification: 1 wanted, 2 sent */
   } ws_sig_subs[ FD_RPC_WS_SIG_SUB_MAX ];
   ulong ws_sig_sub_cnt;
+
+  /* rootSubscribe: one notification per new root */
+# define FD_RPC_WS_ROOT_SUB_MAX (64UL)
+  struct {
+    ulong sub_id;   /* subscription id plus one, 0 if unused */
+    ulong ws_conn_id;
+  } ws_root_subs[ FD_RPC_WS_ROOT_SUB_MAX ];
+  ulong ws_root_sub_cnt;
+
+  /* logsSubscribe: every transaction that reaches the subscribed
+     commitment level and passes the filter.  seq is the next record of
+     the transaction window the subscription has yet to look at. */
+# define FD_RPC_WS_LOGS_SUB_MAX (64UL)
+  struct {
+    ulong sub_id;   /* subscription id plus one, 0 if unused */
+    ulong ws_conn_id;
+    int   level;    /* 0 processed, 1 confirmed, 2 finalized */
+    int   filter;   /* 0 all (no vote transactions), 1 allWithVotes, 2 mentions */
+    uchar mention[ 32 ];
+    ulong seq;
+  } ws_logs_subs[ FD_RPC_WS_LOGS_SUB_MAX ];
+  ulong ws_logs_sub_cnt;
+
+  /* slotsUpdatesSubscribe */
+# define FD_RPC_WS_SUPD_SUB_MAX (32UL)
+  struct {
+    ulong sub_id;   /* subscription id plus one, 0 if unused */
+    ulong ws_conn_id;
+  } ws_supd_subs[ FD_RPC_WS_SUPD_SUB_MAX ];
+  ulong ws_supd_sub_cnt;
+
+  /* programSubscribe: every account a transaction could write is
+     re-read once the transaction reaches the subscribed commitment
+     level; those owned by the program and passing the filters are
+     reported.  seq is as for logsSubscribe. */
+# define FD_RPC_WS_PROG_SUB_MAX (32UL)
+  struct {
+    ulong sub_id;   /* subscription id plus one, 0 if unused */
+    ulong ws_conn_id;
+    int   level;    /* 0 processed, 1 confirmed, 2 finalized */
+    uchar program[ 32 ];
+    char  encoding[ 16 ];
+    ulong filter_cnt;
+    fd_rpc_gpa_filter_t filters[ FD_RPC_GPA_FILTER_MAX ];
+    ulong seq;
+  } ws_prog_subs[ FD_RPC_WS_PROG_SUB_MAX ];
+  ulong ws_prog_sub_cnt;
 
   /* accountSubscribe: the account is re-read whenever the subscribed
      commitment level moves and a notification goes out if it changed. */
@@ -819,6 +886,8 @@ struct fd_rpc_tile {
   ulong                     vote_stake_amt [ FD_RPC_VOTE_STAKE_MAX ];
   ulong                     vote_stake_cnt;
   int                       vote_stake_valid;
+  ulong                     vote_stake_slot;       /* slot of the bank the table was built from */
+  ulong                     vote_stake_dirty_slot; /* last slot with a vote program transaction, 0 if none seen */
   int                       vote_stake_rewards_active; /* built while epoch rewards were being paid out */
   ulong                     vote_stake_epoch;
   long                      vote_stake_ts;
@@ -1084,6 +1153,30 @@ fd_rpc_ws_unsubscribe( fd_rpc_tile_t * ctx,
     ctx->ws_acct_sub_cnt--;
     return 1;
   }
+  for( ulong i=0UL; i<FD_RPC_WS_ROOT_SUB_MAX; i++ ) {
+    if( ctx->ws_root_subs[ i ].sub_id!=sub_id+1UL || ctx->ws_root_subs[ i ].ws_conn_id!=ws_conn_id ) continue;
+    ctx->ws_root_subs[ i ].sub_id = 0UL;
+    ctx->ws_root_sub_cnt--;
+    return 1;
+  }
+  for( ulong i=0UL; i<FD_RPC_WS_LOGS_SUB_MAX; i++ ) {
+    if( ctx->ws_logs_subs[ i ].sub_id!=sub_id+1UL || ctx->ws_logs_subs[ i ].ws_conn_id!=ws_conn_id ) continue;
+    ctx->ws_logs_subs[ i ].sub_id = 0UL;
+    ctx->ws_logs_sub_cnt--;
+    return 1;
+  }
+  for( ulong i=0UL; i<FD_RPC_WS_PROG_SUB_MAX; i++ ) {
+    if( ctx->ws_prog_subs[ i ].sub_id!=sub_id+1UL || ctx->ws_prog_subs[ i ].ws_conn_id!=ws_conn_id ) continue;
+    ctx->ws_prog_subs[ i ].sub_id = 0UL;
+    ctx->ws_prog_sub_cnt--;
+    return 1;
+  }
+  for( ulong i=0UL; i<FD_RPC_WS_SUPD_SUB_MAX; i++ ) {
+    if( ctx->ws_supd_subs[ i ].sub_id!=sub_id+1UL || ctx->ws_supd_subs[ i ].ws_conn_id!=ws_conn_id ) continue;
+    ctx->ws_supd_subs[ i ].sub_id = 0UL;
+    ctx->ws_supd_sub_cnt--;
+    return 1;
+  }
   return 0;
 }
 
@@ -1341,7 +1434,10 @@ fd_rpc_meta_ingest( fd_rpc_tile_t *              ctx,
   ulong log_sz = msg->log_sz, inner_sz = msg->inner_sz, return_sz = msg->has_return ? msg->return_sz : 0UL;
   if( FD_UNLIKELY( inner_sz>FD_EXECRP_TXN_META_INNER_MAX || return_sz>FD_EXECRP_TXN_META_RETURN_MAX ||
                    log_sz>FD_EXECRP_TXN_META_LOG_MAX || offsetof( fd_execrp_txn_meta_t, log )+log_sz>msg_sz ) ) return;
-  ulong ent_sz = fd_ulong_align_up( sizeof(fd_rpc_meta_ent_t)+inner_sz+log_sz+return_sz, 8UL );
+  ulong tok_pre = msg->tok_known ? (ulong)msg->tok_pre_cnt : 0UL, tok_post = msg->tok_known ? (ulong)msg->tok_post_cnt : 0UL;
+  if( FD_UNLIKELY( tok_pre>FD_EXECRP_TXN_META_TOK_MAX || tok_post>FD_EXECRP_TXN_META_TOK_MAX ) ) return;
+  ulong tok_sz = ( tok_pre+tok_post )*FD_EXECRP_TXN_META_TOK_SZ;
+  ulong ent_sz = fd_ulong_align_up( sizeof(fd_rpc_meta_ent_t)+inner_sz+log_sz+return_sz+tok_sz, 8UL );
   ulong pos    = ctx->meta_head & (FD_RPC_META_RING_SZ-1UL);
   if( FD_UNLIKELY( pos+ent_sz>FD_RPC_META_RING_SZ ) ) { ctx->meta_head += FD_RPC_META_RING_SZ-pos; pos = 0UL; }
   fd_rpc_meta_ent_t * ent = (fd_rpc_meta_ent_t *)( ctx->meta_ring+pos );
@@ -1360,6 +1456,12 @@ fd_rpc_meta_ingest( fd_rpc_tile_t *              ctx,
   memcpy( body,                 msg->inner,       inner_sz  );
   memcpy( body+inner_sz,        msg->log,         log_sz    );
   memcpy( body+inner_sz+log_sz, msg->return_data, return_sz );
+  ent->tok_known    = msg->tok_known;
+  ent->tok_pre_cnt  = (uchar)tok_pre;
+  ent->tok_post_cnt = (uchar)tok_post;
+  uchar * tok_body = body+inner_sz+log_sz+return_sz;
+  memcpy( tok_body,                                    msg->tok,                                                             tok_pre *FD_EXECRP_TXN_META_TOK_SZ );
+  memcpy( tok_body+tok_pre*FD_EXECRP_TXN_META_TOK_SZ,  msg->tok+FD_EXECRP_TXN_META_TOK_MAX*FD_EXECRP_TXN_META_TOK_SZ,        tok_post*FD_EXECRP_TXN_META_TOK_SZ );
 
   /* Index it: the signature's own slot if there is one, else a free or
      expired slot nearby, else the home slot. */
@@ -1411,6 +1513,7 @@ fd_rpc_reward_table( fd_rpc_tile_t * ctx,
   oldest->cnt     = 0UL;
   oldest->slot_lo = ULONG_MAX;
   oldest->slot_hi = 0UL;
+  oldest->num_partitions = 0UL;
   /* Rewards earned in epoch are paid from the first slot of the next
      one.  If this tile was not up before that, some were missed. */
   ulong pay_slot0 = fd_epoch_slot0( &ctx->epoch_schedule, epoch+1UL );
@@ -1461,6 +1564,8 @@ fd_rpc_reward_ingest( fd_rpc_tile_t *             ctx,
     }
     /* Agave records no reward for a stake account that was paid nothing */
     if( msg->recs[ i ].kind==1U && msg->recs[ i ].lamports_post==msg->recs[ i ].lamports_pre ) continue;
+    uint  kind   = msg->recs[ i ].kind;
+    ulong amount = kind==3U ? msg->recs[ i ].lamports_pre-msg->recs[ i ].lamports_post : msg->recs[ i ].lamports_post-msg->recs[ i ].lamports_pre;
     ulong pay_epoch = fd_slot_to_epoch( &ctx->epoch_schedule, slot, NULL );
     if( FD_UNLIKELY( !pay_epoch ) ) continue;
     fd_rpc_reward_epoch_t * t = fd_rpc_reward_table( ctx, pay_epoch-1UL, 1 );
@@ -1471,15 +1576,22 @@ fd_rpc_reward_ingest( fd_rpc_tile_t *             ctx,
     ulong idx = fd_ulong_hash( FD_LOAD( ulong, msg->recs[ i ].pubkey ) ^ FD_LOAD( ulong, msg->recs[ i ].pubkey+8UL ) ) & (FD_RPC_REWARD_ENT_CNT-1UL);
     int   dup = 0;
     while( t->ents[ idx ].slot ) {
-      if( FD_UNLIKELY( t->ents[ idx ].slot==slot && !memcmp( t->ents[ idx ].pubkey, msg->recs[ i ].pubkey, 32UL ) ) ) { dup = 1; break; }
+      if( FD_UNLIKELY( t->ents[ idx ].slot==slot && t->ents[ idx ].kind==kind && !memcmp( t->ents[ idx ].pubkey, msg->recs[ i ].pubkey, 32UL ) ) ) { dup = 1; break; }
       idx = (idx+1UL) & (FD_RPC_REWARD_ENT_CNT-1UL);
     }
     if( FD_UNLIKELY( dup ) ) continue;
     memcpy( t->ents[ idx ].pubkey, msg->recs[ i ].pubkey, 32UL );
     t->ents[ idx ].slot         = slot;
-    t->ents[ idx ].amount       = msg->recs[ i ].lamports_post-msg->recs[ i ].lamports_pre;
+    t->ents[ idx ].amount       = amount;
     t->ents[ idx ].post_balance = msg->recs[ i ].lamports_post;
+    t->ents[ idx ].kind         = kind;
     t->cnt++;
+    if( FD_UNLIKELY( !t->num_partitions && ctx->processed_idx!=ULONG_MAX ) ) {
+      /* the EpochRewards sysvar holds the partition count while the rewards are being paid */
+      ulong lamports; int executable; uchar owner[ 32UL ]; ulong data_len;
+      fd_accdb_read_one_nocache( ctx->accdb, ctx->banks[ ctx->processed_idx ].accdb_fork_id, fd_sysvar_epoch_rewards_id.uc, &lamports, &executable, owner, ctx->scratch.accdb_data_buf, &data_len );
+      if( lamports && data_len>=81UL && ctx->scratch.accdb_data_buf[ 80 ] ) t->num_partitions = FD_LOAD( ulong, ctx->scratch.accdb_data_buf+8UL );
+    }
   }
 }
 
@@ -1514,6 +1626,55 @@ fd_rpc_ws_sig_check( fd_rpc_tile_t * ctx );
    account changed at its commitment level. */
 static void
 fd_rpc_ws_acct_check( fd_rpc_tile_t * ctx );
+
+/* fd_rpc_ws_logs_check sends each logs subscription the transactions
+   that reached its commitment level since it last looked. */
+static void
+fd_rpc_ws_logs_check( fd_rpc_tile_t * ctx );
+
+static void
+fd_rpc_ws_prog_check( fd_rpc_tile_t * ctx );
+
+static void
+fd_rpc_ws_root_notify( fd_rpc_tile_t * ctx,
+                       ulong           root_slot ) {
+  for( ulong i=0UL; i<FD_RPC_WS_ROOT_SUB_MAX; i++ ) {
+    if( !ctx->ws_root_subs[ i ].sub_id ) continue;
+    ulong ws_conn_id = ctx->ws_root_subs[ i ].ws_conn_id;
+    fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"method\":\"rootNotification\",\"params\":{\"result\":%lu,\"subscription\":%lu}}\n", root_slot, ctx->ws_root_subs[ i ].sub_id-1UL );
+    if( FD_UNLIKELY( fd_http_server_ws_send( ctx->http, ws_conn_id ) ) ) {
+      ctx->ws_root_subs[ i ].sub_id = 0UL;
+      ctx->ws_root_sub_cnt--;
+      fd_http_server_ws_close( ctx->http, ws_conn_id, FD_HTTP_SERVER_CONNECTION_CLOSE_TOO_SLOW );
+    }
+  }
+}
+
+/* fd_rpc_ws_supd_notify sends one slotsUpdatesNotification to every
+   subscriber.  extra is the JSON members that go between "slot" and
+   "timestamp" (with a trailing comma), or "".  ts_nanos is wall clock
+   time; a time that was never taken (<=0) sends nothing. */
+static void
+fd_rpc_ws_supd_notify( fd_rpc_tile_t * ctx,
+                       char const *    type,
+                       ulong           slot,
+                       ulong           parent, /* ULONG_MAX: none */
+                       char const *    extra,
+                       long            ts_nanos ) {
+  if( FD_UNLIKELY( ts_nanos<=0L ) ) return;
+  for( ulong i=0UL; i<FD_RPC_WS_SUPD_SUB_MAX; i++ ) {
+    if( !ctx->ws_supd_subs[ i ].sub_id ) continue;
+    ulong ws_conn_id = ctx->ws_supd_subs[ i ].ws_conn_id;
+    fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"method\":\"slotsUpdatesNotification\",\"params\":{\"result\":{" );
+    if( parent!=ULONG_MAX ) fd_http_server_printf( ctx->http, "\"parent\":%lu,", parent );
+    fd_http_server_printf( ctx->http, "\"slot\":%lu,%s\"timestamp\":%ld,\"type\":\"%s\"},\"subscription\":%lu}}\n",
+                           slot, extra, ts_nanos/1000000L, type, ctx->ws_supd_subs[ i ].sub_id-1UL );
+    if( FD_UNLIKELY( fd_http_server_ws_send( ctx->http, ws_conn_id ) ) ) {
+      /* closing the connection clears every subscription it holds */
+      fd_http_server_ws_close( ctx->http, ws_conn_id, FD_HTTP_SERVER_CONNECTION_CLOSE_TOO_SLOW );
+    }
+  }
+}
 
 /* fd_rpc_send_to_leaders sends a transaction to the TPU UDP port of
    the leaders of the next few rotations starting at from_slot, as
@@ -1659,6 +1820,23 @@ returnable_frag( fd_rpc_tile_t *     ctx,
 
         fd_rpc_publish_slot_event( ctx, slot_completed );
 
+        if( FD_UNLIKELY( ctx->ws_supd_sub_cnt ) ) {
+          /* Replay reports a slot once, when it is done, so the whole
+             sequence goes out together, each with the time it was
+             taken at.  Nothing here records the moment the last shred
+             arrived: "completed" carries the time replay finished,
+             which is at most the replay time late.  Entry counts are
+             not kept either. */
+          char stats[ 192 ];
+          ulong ok  = ( slot_completed->vote_success==ULONG_MAX ? 0UL : slot_completed->vote_success ) + ( slot_completed->nonvote_success==ULONG_MAX ? 0UL : slot_completed->nonvote_success );
+          ulong bad = ( slot_completed->vote_failed ==ULONG_MAX ? 0UL : slot_completed->vote_failed  ) + ( slot_completed->nonvote_failed ==ULONG_MAX ? 0UL : slot_completed->nonvote_failed  );
+          snprintf( stats, sizeof(stats), "\"stats\":{\"maxTransactionsPerEntry\":0,\"numFailedTransactions\":%lu,\"numSuccessfulTransactions\":%lu,\"numTransactionEntries\":0},", bad, ok );
+          if( !slot_completed->is_leader ) fd_rpc_ws_supd_notify( ctx, "firstShredReceived", slot_completed->slot, ULONG_MAX, "", slot_completed->first_fec_set_received_nanos );
+          fd_rpc_ws_supd_notify( ctx, "createdBank", slot_completed->slot, slot_completed->parent_slot, "",    slot_completed->preparation_begin_nanos );
+          fd_rpc_ws_supd_notify( ctx, "completed",   slot_completed->slot, ULONG_MAX,                   "",    slot_completed->completion_time_nanos   );
+          fd_rpc_ws_supd_notify( ctx, "frozen",      slot_completed->slot, ULONG_MAX,                   stats, slot_completed->completion_time_nanos   );
+        }
+
         /* In Agave, "processed" confirmation is the bank we've just
            voted for (handle_votable_bank), which is also guaranteed to
            have been replayed.
@@ -1681,6 +1859,8 @@ returnable_frag( fd_rpc_tile_t *     ctx,
         ctx->processed_idx = slot_completed->bank_idx;
         if( FD_UNLIKELY( ctx->ws_sig_sub_cnt ) ) fd_rpc_ws_sig_check( ctx );
         if( FD_UNLIKELY( ctx->ws_acct_sub_cnt ) ) fd_rpc_ws_acct_check( ctx );
+        if( FD_UNLIKELY( ctx->ws_logs_sub_cnt ) ) fd_rpc_ws_logs_check( ctx );
+        if( FD_UNLIKELY( ctx->ws_prog_sub_cnt ) ) fd_rpc_ws_prog_check( ctx );
         break;
       }
       case REPLAY_SIG_OC_ADVANCED: {
@@ -1688,8 +1868,11 @@ returnable_frag( fd_rpc_tile_t *     ctx,
         if( FD_LIKELY( ctx->confirmed_idx!=ULONG_MAX ) ) fd_stem_publish( stem, ctx->replay_out->idx, ctx->confirmed_idx, 0UL, 0UL, 0UL, 0UL, 0UL );
         FD_TEST( msg->bank_idx<ctx->max_live_slots );
         ctx->confirmed_idx = msg->bank_idx;
+        if( FD_UNLIKELY( ctx->ws_supd_sub_cnt ) ) fd_rpc_ws_supd_notify( ctx, "optimisticConfirmation", ctx->banks[ msg->bank_idx ].slot, ULONG_MAX, "", fd_clock_tile_now( ctx->clock ) );
         if( FD_UNLIKELY( ctx->ws_sig_sub_cnt ) ) fd_rpc_ws_sig_check( ctx );
         if( FD_UNLIKELY( ctx->ws_acct_sub_cnt ) ) fd_rpc_ws_acct_check( ctx );
+        if( FD_UNLIKELY( ctx->ws_logs_sub_cnt ) ) fd_rpc_ws_logs_check( ctx );
+        if( FD_UNLIKELY( ctx->ws_prog_sub_cnt ) ) fd_rpc_ws_prog_check( ctx );
         break;
       }
       case REPLAY_SIG_ROOT_ADVANCED: {
@@ -1702,8 +1885,18 @@ returnable_frag( fd_rpc_tile_t *     ctx,
         ctx->confirmed_idx = msg->bank_idx;
 
         if( FD_LIKELY( ctx->cluster_confirmed_slot!=ULONG_MAX ) ) fd_rpc_cluster_finalized( ctx, msg->slot );
+        if( FD_UNLIKELY( ctx->ws_root_sub_cnt ) ) fd_rpc_ws_root_notify( ctx, msg->slot );
+        if( FD_UNLIKELY( ctx->ws_supd_sub_cnt ) ) {
+          /* this node's confirmed level moves with its root (see
+             confirmed_idx above), so both are reported here */
+          long now = fd_clock_tile_now( ctx->clock );
+          fd_rpc_ws_supd_notify( ctx, "optimisticConfirmation", msg->slot, ULONG_MAX, "", now );
+          fd_rpc_ws_supd_notify( ctx, "root",                   msg->slot, ULONG_MAX, "", now );
+        }
         if( FD_UNLIKELY( ctx->ws_sig_sub_cnt ) ) fd_rpc_ws_sig_check( ctx );
         if( FD_UNLIKELY( ctx->ws_acct_sub_cnt ) ) fd_rpc_ws_acct_check( ctx );
+        if( FD_UNLIKELY( ctx->ws_logs_sub_cnt ) ) fd_rpc_ws_logs_check( ctx );
+        if( FD_UNLIKELY( ctx->ws_prog_sub_cnt ) ) fd_rpc_ws_prog_check( ctx );
         break;
       }
       case REPLAY_SIG_DROP_BANK_REF: {
@@ -1814,7 +2007,23 @@ returnable_frag( fd_rpc_tile_t *     ctx,
     ulong seq_now = fd_frag_meta_seq_query( ctx->in_mcache[ in_idx ]+fd_mcache_line_idx( seq, ctx->in_depth[ in_idx ] ) );
     /* Only a record that was copied whole is published; otherwise the
        ring position is simply reused by the next transaction. */
-    if( FD_LIKELY( seq_now==seq && landed && sane ) ) fd_rpc_txn_commit( ctx );
+    if( FD_LIKELY( seq_now==seq && landed && sane ) ) {
+      /* A vote program transaction may have created a vote account:
+         have getVoteAccounts rebuild its table once a bank holds it.
+         (Under Alpenglow votes are not transactions, so these are
+         rare.) */
+      uchar own_buf[ FD_TXN_MAX_SZ ] __attribute__((aligned(alignof(fd_txn_t))));
+      if( !rec->txn_err && fd_txn_parse( rec->payload, rec->payload_sz, own_buf, NULL ) ) { /* the copy: the frag may be gone by now */
+        fd_txn_t const * own = (fd_txn_t const *)own_buf;
+        for( ulong k=0UL; k<own->instr_cnt; k++ ) {
+          if( !memcmp( rec->payload+own->acct_addr_off+32UL*(ulong)own->instr[ k ].program_id, fd_solana_vote_program_id.uc, 32UL ) ) {
+            ctx->vote_stake_dirty_slot = fd_ulong_max( ctx->vote_stake_dirty_slot, rec->slot );
+            break;
+          }
+        }
+      }
+      fd_rpc_txn_commit( ctx );
+    }
   } else if( ctx->in_kind[ in_idx ]==IN_KIND_SNAPMK ) {
     /* unreliable link: copy, then check the frag was not overwritten */
     fd_snapmk_msg_t const * msg = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
@@ -2487,6 +2696,24 @@ fd_rpc_cfg_bank( fd_rpc_tile_t *             ctx,
                                  bank_idx, NULL, NULL, NULL, NULL, res );
 }
 
+static fd_http_server_response_t fd_rpc_err_msg( fd_rpc_tile_t * ctx, char const * id_cstr, int code, char const * msg );
+
+/* getBlock, getTransaction and getSignaturesForAddress only serve
+   confirmed or finalized data.  Returns 0 and fills res if the config
+   asks for "processed". */
+static int
+fd_rpc_cfg_at_least_confirmed( fd_rpc_tile_t *             ctx,
+                               char const *                id_cstr,
+                               fd_rpc_val_t const *        config,
+                               fd_http_server_response_t * res ) {
+  fd_rpc_val_t v[1];
+  if( fd_rpc_cfg_member( config, "commitment", v ) && v->kind==FD_RPC_VAL_STR && fd_jtok_str_eq( &v->str, "processed" ) ) {
+    *res = fd_rpc_err_msg( ctx, id_cstr, -32602, "Method does not support commitment below `confirmed`" );
+    return 0;
+  }
+  return 1;
+}
+
 /* fd_rpc_slot_history_load reads the SlotHistory sysvar of a bank into
    the scratch buffer.  The sysvar is a bit vector of the last 1M slots
    on this fork: a set bit means a block was produced in that slot.
@@ -2533,25 +2760,135 @@ fd_rpc_err_msg( fd_rpc_tile_t * ctx,
   return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":%d,\"message\":\"%s\"},\"id\":%s}\n", code, msg, id_cstr );
 }
 
+/* Token-2022 extensions live after byte 165 of a mint or token account:
+   one byte of account type (1 mint, 2 account) and then records of
+   { type u16, length u16, value }. */
+
+static uchar const *
+fd_rpc_token_ext_find( uchar const * d,
+                       ulong         sz,
+                       ushort        want,
+                       ulong *       len ) {
+  ulong off = 166UL;
+  while( off+4UL<=sz ) {
+    ushort t = FD_LOAD( ushort, d+off );
+    ulong  l = (ulong)FD_LOAD( ushort, d+off+2UL );
+    if( !t || off+4UL+l>sz ) break;
+    if( t==want ) { *len = l; return d+off+4UL; }
+    off += 4UL+l;
+  }
+  return NULL;
+}
+
+/* fd_rpc_f64_text writes v as Rust's Display does (the shortest text
+   that reads back as v, no exponent for ordinary magnitudes), in
+   quotes if quoted. */
+static void
+fd_rpc_f64_text( double v,
+                 char   out[ 64 ],
+                 int    quoted ) {
+  char t[ 48 ];
+  for( int prec=1; prec<=17; prec++ ) {
+    snprintf( t, sizeof(t), "%.*g", prec, v );
+    if( strtod( t, NULL )==v ) break;
+  }
+  if( strpbrk( t, "eE" ) && fabs( v )<1e300 && fabs( v )>1e-300 ) {
+    /* Rust never prints an exponent: expand it */
+    for( int prec=0; prec<=340; prec++ ) {
+      char w[ 400 ];
+      snprintf( w, sizeof(w), "%.*f", prec, v );
+      if( strtod( w, NULL )==v ) { if( strlen( w )<sizeof(t) ) strcpy( t, w ); break; }
+    }
+  }
+  snprintf( out, 64UL, quoted ? "\"%s\"" : "%s", t );
+}
+
+/* A mint with the interest-bearing extension shows amounts with the
+   interest accrued up to the bank's clock, as Agave does.  The mint
+   readers arm this before an amount of that mint is printed and the
+   caller disarms it afterwards. */
+
+static struct {
+  int   on;
+  short pre_rate;
+  short cur_rate;
+  long  init_ts;
+  long  last_ts;
+  long  now;
+  double mult; /* on==2: the scaled UI amount extension's multiplier in effect */
+} fd_rpc_ui_interest;
+
+/* Reads the clock into the account scratch buffer: mint_data may point
+   into that buffer and is not used after the clock is read. */
+static void
+fd_rpc_ui_interest_load( fd_rpc_tile_t *    ctx,
+                         fd_accdb_fork_id_t accdb_fork_id,
+                         uchar const *   mint_data,
+                         ulong           mint_len ) {
+  fd_rpc_ui_interest.on = 0;
+  ulong len;
+  /* interest first, then the scaled UI amount, as Agave picks */
+  int mode = 0; double mult[ 2 ] = { 1.0, 1.0 }; long eff_ts = 0L;
+  uchar const * e = fd_rpc_token_ext_find( mint_data, mint_len, (ushort)10, &len );
+  if( e && len>=52UL ) {
+    mode = 1;
+    fd_rpc_ui_interest.init_ts  = FD_LOAD( long,  e+32UL );
+    fd_rpc_ui_interest.pre_rate = FD_LOAD( short, e+40UL );
+    fd_rpc_ui_interest.last_ts  = FD_LOAD( long,  e+42UL );
+    fd_rpc_ui_interest.cur_rate = FD_LOAD( short, e+50UL );
+  } else {
+    e = fd_rpc_token_ext_find( mint_data, mint_len, (ushort)25, &len );
+    if( !e || len<56UL ) return;
+    mode = 2;
+    mult[ 0 ] = FD_LOAD( double, e+32UL ); eff_ts = FD_LOAD( long, e+40UL ); mult[ 1 ] = FD_LOAD( double, e+48UL );
+  }
+  ulong lamports; int executable; uchar owner[ 32UL ]; ulong data_sz;
+  fd_accdb_read_one_nocache( ctx->accdb, accdb_fork_id, fd_sysvar_clock_id.uc, &lamports, &executable, owner, ctx->scratch.accdb_data_buf, &data_sz );
+  if( FD_UNLIKELY( !lamports || data_sz<40UL ) ) return;
+  fd_rpc_ui_interest.now  = FD_LOAD( long, ctx->scratch.accdb_data_buf+32UL );
+  fd_rpc_ui_interest.mult = fd_rpc_ui_interest.now>=eff_ts ? mult[ 1 ] : mult[ 0 ];
+  fd_rpc_ui_interest.on   = mode;
+}
+
+static int fd_rpc_ui_null_zero; /* set while printing transaction token balances */
+
 /* fd_rpc_print_ui_amount_fields prints the members of the SPL token
    amount object; fd_rpc_print_ui_amount wraps them in braces. */
 static void
 fd_rpc_print_ui_amount_fields( fd_rpc_tile_t * ctx,
                                ulong           amount,
                                uchar           decimals ) {
-  char s[ 64 ];
+  char s[ 400 ];
   ulong len;
-  if( decimals==0 ) {
-    len = (ulong)snprintf( s, sizeof(s), "%lu", amount );
+  double ui;
+  if( FD_UNLIKELY( fd_rpc_ui_interest.on ) ) {
+    /* spl-token-2022 InterestBearingConfig::amount_to_ui_amount */
+    double pre  = exp( (double)( (long)fd_rpc_ui_interest.pre_rate*( fd_rpc_ui_interest.last_ts-fd_rpc_ui_interest.init_ts ) ) / 31556736.0 / 10000.0 );
+    double post = exp( (double)( (long)fd_rpc_ui_interest.cur_rate*( fd_rpc_ui_interest.now    -fd_rpc_ui_interest.last_ts ) ) / 31556736.0 / 10000.0 );
+    double v    = (double)amount * ( pre*post / pow( 10.0, (double)decimals ) );
+    /* spl-token-2022 ScaledUiAmountConfig::amount_to_ui_amount: scaled, cut to a whole number of base units */
+    if( fd_rpc_ui_interest.on==2 ) v = trunc( (double)amount*fd_rpc_ui_interest.mult ) / pow( 10.0, (double)decimals );
+    len = (ulong)snprintf( s, sizeof(s), "%.*f", (int)decimals, v );
+    if( len>=sizeof(s) ) len = sizeof(s)-1UL;
+    if( decimals ) {
+      while( len && s[ len-1UL ]=='0' ) len--;
+      if( len && s[ len-1UL ]=='.' ) len--;
+      s[ len ] = '\0';
+    }
+    ui = strtod( s, NULL );
   } else {
-    ulong div = 1UL; uint d = fd_uint_min( (uint)decimals, 19U );
-    for( uint i=0U; i<d; i++ ) div *= 10UL;
-    len = (ulong)snprintf( s, sizeof(s), "%lu.%0*lu", amount/div, (int)d, amount%div );
-    while( len && s[ len-1UL ]=='0' ) len--;
-    if( len && s[ len-1UL ]=='.' ) len--;
-    s[ len ] = '\0';
+    if( decimals==0 ) {
+      len = (ulong)snprintf( s, sizeof(s), "%lu", amount );
+    } else {
+      ulong div = 1UL; uint d = fd_uint_min( (uint)decimals, 19U );
+      for( uint i=0U; i<d; i++ ) div *= 10UL;
+      len = (ulong)snprintf( s, sizeof(s), "%lu.%0*lu", amount/div, (int)d, amount%div );
+      while( len && s[ len-1UL ]=='0' ) len--;
+      if( len && s[ len-1UL ]=='.' ) len--;
+      s[ len ] = '\0';
+    }
+    ui = (double)amount / pow( 10.0, (double)decimals ); /* one division, as Agave does */
   }
-  double ui = (double)amount / pow( 10.0, (double)decimals ); /* one division, as Agave does */
   /* shortest text that reads back as the same double, with ".0" on a
      whole number, as Agave prints floats */
   char ui_cstr[ 40 ];
@@ -2560,6 +2897,9 @@ fd_rpc_print_ui_amount_fields( fd_rpc_tile_t * ctx,
     if( strtod( ui_cstr, NULL )==ui ) break;
   }
   if( !strpbrk( ui_cstr, ".eEn" ) ) strcat( ui_cstr, ".0" );
+  /* Transaction token balances go through Agave's stored form, which
+     turns a zero uiAmount into null. */
+  if( fd_rpc_ui_null_zero && !( fabs( ui )>2.220446049250313e-16 ) ) strcpy( ui_cstr, "null" );
   fd_http_server_printf( ctx->http, "\"amount\":\"%lu\",\"decimals\":%u,\"uiAmount\":%s,\"uiAmountString\":\"%s\"",
                          amount, (uint)decimals, ui_cstr, s );
 }
@@ -2599,6 +2939,161 @@ getBlockCommitment( fd_rpc_tile_t *         ctx,
 static inline int
 fd_rpc_owner_is_token_program_early( char const * owner_b58 ) {
   return !strcmp( owner_b58, "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" ) || !strcmp( owner_b58, "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb" );
+}
+
+static void fd_rpc_print_json_text( fd_rpc_tile_t * ctx, uchar const * t, ulong sz );
+
+static void
+fd_rpc_print_opt_key( fd_rpc_tile_t * ctx,
+                      char const *    name,
+                      uchar const *   key ) {
+  static uchar const zero[ 32 ] = {0};
+  if( !memcmp( key, zero, 32UL ) ) { fd_http_server_printf( ctx->http, "\"%s\":null", name ); return; }
+  FD_BASE58_ENCODE_32_BYTES( key, b58 );
+  fd_http_server_printf( ctx->http, "\"%s\":\"%s\"", name, b58 );
+}
+
+/* fd_rpc_token_ext_print prints the "extensions" array of a Token-2022
+   mint or account as Agave's parse_token_extension does, in the order
+   the records are stored.  With dry set nothing is printed.  Returns
+   the number of extensions, or -1 if one of them is a kind this code
+   does not decode (the confidential transfer family and the scaled UI
+   amount) or is malformed. */
+static long
+fd_rpc_token_ext_print( fd_rpc_tile_t * ctx,
+                        uchar const *   d,
+                        ulong           sz,
+                        int             dry ) {
+  long  cnt = 0L;
+  ulong off = 166UL;
+# define P(...) do { if( !dry ) fd_http_server_printf( ctx->http, __VA_ARGS__ ); } while(0)
+# define K(name,ptr) do { if( !dry ) fd_rpc_print_opt_key( ctx, (name), (ptr) ); } while(0)
+# define B64(name,ptr,n) do { if( !dry ) { char b64_[ 128 ]; ulong k_ = fd_base64_encode( b64_, (ptr), (n) ); b64_[ k_ ] = '\0'; fd_http_server_printf( ctx->http, "\"%s\":\"%s\"", (name), b64_ ); } } while(0)
+# define B64O(name,ptr,n) do { int z_ = 1; for( ulong i_=0UL; i_<(n); i_++ ) z_ &= !(ptr)[ i_ ]; if( z_ ) P( "\"%s\":null", (name) ); else B64( name, ptr, n ); } while(0)
+  while( off+4UL<=sz ) {
+    uint  t = (uint)FD_LOAD( ushort, d+off );
+    ulong l = (ulong)FD_LOAD( ushort, d+off+2UL );
+    if( !t ) break;
+    if( FD_UNLIKELY( off+4UL+l>sz ) ) return -1L;
+    uchar const * e = d+off+4UL;
+    off += 4UL+l;
+    P( "%s{\"extension\":", cnt ? "," : "" );
+    cnt++;
+#   define NEED(n) if( FD_UNLIKELY( l<(n) ) ) return -1L
+    switch( t ) {
+    case 1U: NEED( 108UL );
+      P( "\"transferFeeConfig\",\"state\":{\"newerTransferFee\":{\"epoch\":%lu,\"maximumFee\":%lu,\"transferFeeBasisPoints\":%u},\"olderTransferFee\":{\"epoch\":%lu,\"maximumFee\":%lu,\"transferFeeBasisPoints\":%u},",
+         FD_LOAD( ulong, e+90UL ), FD_LOAD( ulong, e+98UL ), (uint)FD_LOAD( ushort, e+106UL ), FD_LOAD( ulong, e+72UL ), FD_LOAD( ulong, e+80UL ), (uint)FD_LOAD( ushort, e+88UL ) );
+      K( "transferFeeConfigAuthority", e ); P( "," ); K( "withdrawWithheldAuthority", e+32UL );
+      P( ",\"withheldAmount\":%lu}}", FD_LOAD( ulong, e+64UL ) );
+      break;
+    case 2U: NEED( 8UL ); P( "\"transferFeeAmount\",\"state\":{\"withheldAmount\":%lu}}", FD_LOAD( ulong, e ) ); break;
+    case 3U: NEED( 32UL ); P( "\"mintCloseAuthority\",\"state\":{" ); K( "closeAuthority", e ); P( "}}" ); break;
+    case 6U: NEED( 1UL ); P( "\"defaultAccountState\",\"state\":{\"accountState\":\"%s\"}}", e[ 0 ]==1 ? "initialized" : e[ 0 ]==2 ? "frozen" : "uninitialized" ); break;
+    case 7U: P( "\"immutableOwner\"}" ); break;
+    case 8U: NEED( 1UL ); P( "\"memoTransfer\",\"state\":{\"requireIncomingTransferMemos\":%s}}", e[ 0 ] ? "true" : "false" ); break;
+    case 9U: P( "\"nonTransferable\"}" ); break;
+    case 10U: NEED( 52UL );
+      P( "\"interestBearingConfig\",\"state\":{\"currentRate\":%d,\"initializationTimestamp\":%ld,\"lastUpdateTimestamp\":%ld,\"preUpdateAverageRate\":%d,",
+         (int)FD_LOAD( short, e+50UL ), FD_LOAD( long, e+32UL ), FD_LOAD( long, e+42UL ), (int)FD_LOAD( short, e+40UL ) );
+      K( "rateAuthority", e ); P( "}}" );
+      break;
+    case 11U: NEED( 1UL ); P( "\"cpiGuard\",\"state\":{\"lockCpi\":%s}}", e[ 0 ] ? "true" : "false" ); break;
+    case 12U: NEED( 32UL ); P( "\"permanentDelegate\",\"state\":{" ); K( "delegate", e ); P( "}}" ); break;
+    case 13U: P( "\"nonTransferableAccount\"}" ); break;
+    case 14U: NEED( 64UL ); P( "\"transferHook\",\"state\":{" ); K( "authority", e ); P( "," ); K( "programId", e+32UL ); P( "}}" ); break;
+    case 15U: NEED( 1UL ); P( "\"transferHookAccount\",\"state\":{\"transferring\":%s}}", e[ 0 ] ? "true" : "false" ); break;
+    case 18U: NEED( 64UL ); P( "\"metadataPointer\",\"state\":{" ); K( "authority", e ); P( "," ); K( "metadataAddress", e+32UL ); P( "}}" ); break;
+    case 19U: {
+      /* borsh: update authority, mint, name, symbol, uri, then a list of key/value pairs */
+      NEED( 64UL );
+      ulong o = 64UL;
+      uchar const * str[ 3 ]; ulong str_sz[ 3 ];
+      for( ulong i=0UL; i<3UL; i++ ) {
+        if( FD_UNLIKELY( o+4UL>l ) ) return -1L;
+        ulong n = (ulong)FD_LOAD( uint, e+o ); o += 4UL;
+        if( FD_UNLIKELY( n>l-o ) ) return -1L;
+        str[ i ] = e+o; str_sz[ i ] = n; o += n;
+      }
+      if( FD_UNLIKELY( o+4UL>l ) ) return -1L;
+      ulong pairs = (ulong)FD_LOAD( uint, e+o ); o += 4UL;
+      P( "\"tokenMetadata\",\"state\":{\"additionalMetadata\":[" );
+      for( ulong i=0UL; i<pairs; i++ ) {
+        P( "%s[", i ? "," : "" );
+        for( ulong h=0UL; h<2UL; h++ ) {
+          if( FD_UNLIKELY( o+4UL>l ) ) return -1L;
+          ulong n = (ulong)FD_LOAD( uint, e+o ); o += 4UL;
+          if( FD_UNLIKELY( n>l-o ) ) return -1L;
+          P( "%s\"", h ? "," : "" ); if( !dry ) fd_rpc_print_json_text( ctx, e+o, n ); P( "\"" );
+          o += n;
+        }
+        P( "]" );
+      }
+      { if( !dry ) { FD_BASE58_ENCODE_32_BYTES( e+32UL, mint_b58 ); fd_http_server_printf( ctx->http, "],\"mint\":\"%s\",\"name\":\"", mint_b58 ); } }
+      if( !dry ) fd_rpc_print_json_text( ctx, str[ 0 ], str_sz[ 0 ] );
+      P( "\",\"symbol\":\"" ); if( !dry ) fd_rpc_print_json_text( ctx, str[ 1 ], str_sz[ 1 ] );
+      P( "\"," ); K( "updateAuthority", e );
+      P( ",\"uri\":\"" ); if( !dry ) fd_rpc_print_json_text( ctx, str[ 2 ], str_sz[ 2 ] );
+      P( "\"}}" );
+      break;
+    }
+    case 20U: NEED( 64UL ); P( "\"groupPointer\",\"state\":{" ); K( "authority", e ); P( "," ); K( "groupAddress", e+32UL ); P( "}}" ); break;
+    case 21U: NEED( 80UL ); {
+      if( !dry ) { FD_BASE58_ENCODE_32_BYTES( e+32UL, mint_b58 ); fd_http_server_printf( ctx->http, "\"tokenGroup\",\"state\":{\"maxSize\":%lu,\"mint\":\"%s\",\"size\":%lu,", FD_LOAD( ulong, e+72UL ), mint_b58, FD_LOAD( ulong, e+64UL ) ); }
+      K( "updateAuthority", e ); P( "}}" );
+      break;
+    }
+    case 22U: NEED( 64UL ); P( "\"groupMemberPointer\",\"state\":{" ); K( "authority", e ); P( "," ); K( "memberAddress", e+32UL ); P( "}}" ); break;
+    case 23U: NEED( 72UL ); {
+      if( !dry ) {
+        FD_BASE58_ENCODE_32_BYTES( e,       mint_b58  );
+        FD_BASE58_ENCODE_32_BYTES( e+32UL,  group_b58 );
+        fd_http_server_printf( ctx->http, "\"tokenGroupMember\",\"state\":{\"group\":\"%s\",\"memberNumber\":%lu,\"mint\":\"%s\"}}", group_b58, FD_LOAD( ulong, e+64UL ), mint_b58 );
+      }
+      break;
+    }
+    case 26U: NEED( 33UL ); P( "\"pausableConfig\",\"state\":{" ); K( "authority", e ); P( ",\"paused\":%s}}", e[ 32 ] ? "true" : "false" ); break;
+    case 27U: P( "\"pausableAccount\"}" ); break;
+    /* The confidential transfer families: ElGamal keys and ciphertexts
+       are shown in base64, an all-zero optional key as null. */
+    case 4U: NEED( 65UL );
+      P( "\"confidentialTransferMint\",\"state\":{" ); B64O( "auditorElgamalPubkey", e+33UL, 32UL ); P( "," ); K( "authority", e );
+      P( ",\"autoApproveNewAccounts\":%s}}", e[ 32 ] ? "true" : "false" );
+      break;
+    case 5U: NEED( 295UL );
+      P( "\"confidentialTransferAccount\",\"state\":{\"actualPendingBalanceCreditCounter\":%lu,\"allowConfidentialCredits\":%s,\"allowNonConfidentialCredits\":%s,\"approved\":%s,",
+         FD_LOAD( ulong, e+287UL ), e[ 261 ] ? "true" : "false", e[ 262 ] ? "true" : "false", e[ 0 ] ? "true" : "false" );
+      B64( "availableBalance", e+161UL, 64UL ); P( "," ); B64( "decryptableAvailableBalance", e+225UL, 36UL ); P( "," ); B64( "elgamalPubkey", e+1UL, 32UL );
+      P( ",\"expectedPendingBalanceCreditCounter\":%lu,\"maximumPendingBalanceCreditCounter\":%lu,\"pendingBalanceCreditCounter\":%lu,",
+         FD_LOAD( ulong, e+279UL ), FD_LOAD( ulong, e+271UL ), FD_LOAD( ulong, e+263UL ) );
+      B64( "pendingBalanceHi", e+97UL, 64UL ); P( "," ); B64( "pendingBalanceLo", e+33UL, 64UL ); P( "}}" );
+      break;
+    case 16U: NEED( 129UL );
+      P( "\"confidentialTransferFeeConfig\",\"state\":{" ); K( "authority", e ); P( ",\"harvestToMintEnabled\":%s,", e[ 64 ] ? "true" : "false" );
+      B64( "withheldAmount", e+65UL, 64UL ); P( "," ); B64O( "withdrawWithheldAuthorityElgamalPubkey", e+32UL, 32UL ); P( "}}" );
+      break;
+    case 17U: NEED( 64UL ); P( "\"confidentialTransferFeeAmount\",\"state\":{" ); B64( "withheldAmount", e, 64UL ); P( "}}" ); break;
+    case 24U: NEED( 196UL );
+      P( "\"confidentialMintBurn\",\"state\":{" ); B64( "confidentialSupply", e, 64UL ); P( "," ); B64( "decryptableSupply", e+64UL, 36UL ); P( "," );
+      B64( "pendingBurn", e+132UL, 64UL ); P( "," ); B64( "supplyElgamalPubkey", e+100UL, 32UL ); P( "}}" );
+      break;
+    case 25U: NEED( 56UL ); {
+      char m0[ 64 ], m1[ 64 ];
+      fd_rpc_f64_text( FD_LOAD( double, e+32UL ), m0, 1 ); fd_rpc_f64_text( FD_LOAD( double, e+48UL ), m1, 1 );
+      P( "\"scaledUiAmountConfig\",\"state\":{" ); K( "authority", e );
+      P( ",\"multiplier\":%s,\"newMultiplier\":%s,\"newMultiplierEffectiveTimestamp\":%ld}}", m0, m1, FD_LOAD( long, e+40UL ) );
+      break;
+    }
+    case 28U: NEED( 32UL ); P( "\"permissionedBurnConfig\",\"state\":{" ); K( "authority", e ); P( "}}" ); break;
+    default: P( "\"unparseableExtension\"}" ); break;
+    }
+#   undef NEED
+  }
+# undef P
+# undef K
+# undef B64
+# undef B64O
+  return cnt;
 }
 
 /* fd_rpc_encode_account_parsed prints an account in Agave's jsonParsed
@@ -2651,8 +3146,16 @@ fd_rpc_encode_account_parsed( fd_rpc_tile_t * ctx,
        either token program.  Token-2022 accounts with extensions and
        multisigs are not parsed. */
     char const * program = !strcmp( owner_b58, "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" ) ? "spl-token" : "spl-token-2022";
-    if( sz==82UL ) {
+    int ext_mint = sz>165UL && d[ 165 ]==1;
+    int ext_acct = sz>165UL && d[ 165 ]==2;
+    if( FD_UNLIKELY( ( ext_mint || ext_acct ) && fd_rpc_token_ext_print( ctx, d, sz, 1 )<0L ) ) return -1;
+    if( sz==82UL || ext_mint ) {
       fd_http_server_printf( ctx->http, "{\"data\":{\"parsed\":{\"info\":{\"decimals\":%u,", (uint)d[ 44 ] );
+      if( ext_mint && fd_rpc_token_ext_print( ctx, d, sz, 1 )>0L ) {
+        fd_http_server_printf( ctx->http, "\"extensions\":[" );
+        fd_rpc_token_ext_print( ctx, d, sz, 0 );
+        fd_http_server_printf( ctx->http, "]," );
+      }
       if( FD_LOAD( uint, d+46UL ) ) { FD_BASE58_ENCODE_32_BYTES( d+50UL, k ); fd_http_server_printf( ctx->http, "\"freezeAuthority\":\"%s\",", k ); }
       else                            fd_http_server_printf( ctx->http, "\"freezeAuthority\":null," );
       fd_http_server_printf( ctx->http, "\"isInitialized\":%s,", d[ 45 ] ? "true" : "false" );
@@ -2662,10 +3165,13 @@ fd_rpc_encode_account_parsed( fd_rpc_tile_t * ctx,
                              FD_LOAD( ulong, d+36UL ), program, sz, executable ? "true" : "false", lamports, owner_b58, sz );
       return 1;
     }
-    if( FD_UNLIKELY( sz!=165UL ) ) return -1;
+    if( FD_UNLIKELY( sz!=165UL && !ext_acct ) ) return -1;
 
     /* Copy what is needed out of the account first: reading the mint
        for its decimals reuses the buffer d may point into. */
+    static uchar ext_copy[ 4096 ];
+    if( FD_UNLIKELY( ext_acct && sz>sizeof(ext_copy) ) ) return -1;
+    if( ext_acct ) memcpy( ext_copy, d, sz );
     uchar mint[ 32 ], tok_owner[ 32 ], delegate[ 32 ], close_auth[ 32 ];
     memcpy( mint, d, 32UL ); memcpy( tok_owner, d+32UL, 32UL ); memcpy( delegate, d+76UL, 32UL ); memcpy( close_auth, d+133UL, 32UL );
     ulong amount        = FD_LOAD( ulong, d+64UL  );
@@ -2682,6 +3188,7 @@ fd_rpc_encode_account_parsed( fd_rpc_tile_t * ctx,
     fd_accdb_read_one_nocache( ctx->accdb, ctx->banks[ bank_idx ].accdb_fork_id, mint, &m_lamports, &m_exec, m_owner, ctx->scratch.accdb_data_buf, &m_len );
     if( FD_UNLIKELY( !m_lamports || m_len<82UL || memcmp( m_owner, owner, 32UL ) ) ) return -1;
     uchar decimals = ctx->scratch.accdb_data_buf[ 44 ];
+    fd_rpc_ui_interest_load( ctx, ctx->banks[ bank_idx ].accdb_fork_id, ctx->scratch.accdb_data_buf, m_len );
 
     FD_BASE58_ENCODE_32_BYTES( mint,      mint_b58      );
     FD_BASE58_ENCODE_32_BYTES( tok_owner, tok_owner_b58 );
@@ -2693,6 +3200,11 @@ fd_rpc_encode_account_parsed( fd_rpc_tile_t * ctx,
       fd_rpc_print_ui_amount( ctx, delegated_amt, decimals );
       fd_http_server_printf( ctx->http, "," );
     }
+    if( ext_acct && fd_rpc_token_ext_print( ctx, ext_copy, sz, 1 )>0L ) {
+      fd_http_server_printf( ctx->http, "\"extensions\":[" );
+      fd_rpc_token_ext_print( ctx, ext_copy, sz, 0 );
+      fd_http_server_printf( ctx->http, "]," );
+    }
     fd_http_server_printf( ctx->http, "\"isNative\":%s,\"mint\":\"%s\",\"owner\":\"%s\",", is_native ? "true" : "false", mint_b58, tok_owner_b58 );
     if( is_native ) {
       fd_http_server_printf( ctx->http, "\"rentExemptReserve\":" );
@@ -2701,6 +3213,7 @@ fd_rpc_encode_account_parsed( fd_rpc_tile_t * ctx,
     }
     fd_http_server_printf( ctx->http, "\"state\":\"%s\",\"tokenAmount\":", state==1 ? "initialized" : state==2 ? "frozen" : "uninitialized" );
     fd_rpc_print_ui_amount( ctx, amount, decimals );
+    fd_rpc_ui_interest.on = 0;
     fd_http_server_printf( ctx->http, "},\"type\":\"account\"},\"program\":\"%s\",\"space\":%lu},\"executable\":%s,\"lamports\":%lu,\"owner\":\"%s\",\"rentEpoch\":18446744073709551615,\"space\":%lu}",
                            program, sz, executable ? "true" : "false", lamports, owner_b58, sz );
     return 1;
@@ -3519,7 +4032,7 @@ getClusterNodes( fd_rpc_tile_t *         ctx,
         case FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_FORWARDS:      name = "tpuForwards"; break;
         case FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_FORWARDS_QUIC: name = "tpuForwardsQuic"; break;
         case FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_QUIC:          name = "tpuQuic"; break;
-        case FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_VOTE:          name = "tpuVote"; break;
+        case FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_VOTE:          name = NULL; break; /* Agave 4.5 no longer reports tpuVote */
         case FD_GOSSIP_CONTACT_INFO_SOCKET_TVU:               name = "tvu"; break;
         case FD_GOSSIP_CONTACT_INFO_SOCKET_TVU_QUIC:          name = NULL; break;
         case FD_GOSSIP_CONTACT_INFO_SOCKET_TPU_VOTE_QUIC:     name = NULL; break;
@@ -4028,7 +4541,7 @@ getInflationReward( fd_rpc_tile_t *         ctx,
     ulong idx = fd_ulong_hash( FD_LOAD( ulong, key ) ^ FD_LOAD( ulong, key+8UL ) ) & (FD_RPC_REWARD_ENT_CNT-1UL);
     for( ; t->ents[ idx ].slot; idx = (idx+1UL) & (FD_RPC_REWARD_ENT_CNT-1UL) ) {
       fd_rpc_reward_ent_t const * e = &t->ents[ idx ];
-      if( memcmp( e->pubkey, key, 32UL ) ) continue;
+      if( e->kind==3U || memcmp( e->pubkey, key, 32UL ) ) continue;
       /* only a block on the queried fork counts */
       if( e->slot==bank->slot || fd_rpc_slot_history_has( ctx, next_slot, e->slot ) ) { hit = e; break; }
     }
@@ -4188,6 +4701,12 @@ getLeaderSchedule( fd_rpc_tile_t *         ctx,
     pair_cnt++;
   }
   sort_gls_pairs_by_id_inplace( pairs, pair_cnt );
+
+  if( FD_UNLIKELY( have_identity && !pair_cnt ) ) {
+    /* Agave: LEADER_SCHEDULE_IDENTITY_NOT_FOUND */
+    FD_BASE58_ENCODE_32_BYTES( identity_filter->uc, ident_b58 );
+    return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32022,\"message\":\"Node %s was not in the leader schedule for specified epoch\"},\"id\":%s}\n", ident_b58, id_cstr );
+  }
 
   fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"result\":{" );
   int first = 1;
@@ -4459,17 +4978,6 @@ fd_rpc_base58_decode( char const * in,
   return zeros+tmp_len;
 }
 
-#define FD_RPC_GPA_FILTER_MAX       (4UL)
-#define FD_RPC_GPA_MEMCMP_BYTES_MAX (128UL)
-
-struct fd_rpc_gpa_filter {
-  int   is_memcmp;  /* else dataSize */
-  ulong data_size;
-  ulong offset;
-  ulong bytes_len;
-  uchar bytes[ FD_RPC_GPA_MEMCMP_BYTES_MAX ];
-};
-typedef struct fd_rpc_gpa_filter fd_rpc_gpa_filter_t;
 
 struct fd_rpc_gpa_arg {
   char const *        id_cstr;
@@ -4540,10 +5048,35 @@ fd_rpc_gpa_filters_read( fd_rpc_tile_t *             ctx,
       out->is_memcmp = 1;
       out->offset    = off->u;
       out->bytes_len = len;
+    } else if( ( f->kind==FD_RPC_VAL_STR && fd_jtok_str_eq( &f->str, "tokenAccountState" ) ) || fd_rpc_cfg_member( f, "tokenAccountState", v ) ) {
+      out->is_token_state = 1;
     } else {
-      *res = fd_rpc_err_msg( ctx, id_cstr, -32602, "Invalid params: unsupported filter (supported: memcmp, dataSize)." ); return 0;
+      *res = fd_rpc_err_msg( ctx, id_cstr, -32602, "Invalid params: unsupported filter (supported: memcmp, dataSize, tokenAccountState)." ); return 0;
     }
     arg->filter_cnt++;
+  }
+  return 1;
+}
+
+/* fd_rpc_gpa_match returns 1 if the account data passes every filter. */
+static int
+fd_rpc_gpa_match( fd_rpc_gpa_filter_t const * filters,
+                  ulong                       filter_cnt,
+                  uchar const *               data,
+                  ulong                       data_len ) {
+  for( ulong i=0UL; i<filter_cnt; i++ ) {
+    fd_rpc_gpa_filter_t const * f = &filters[ i ];
+    if( f->is_token_state ) {
+      /* Same test as spl-token's valid_account_data: 165 bytes, or
+         longer (but not multisig sized) with the account type byte,
+         and a state other than uninitialized. */
+      if( data_len<FD_RPC_TOKEN_ACCOUNT_MIN_SZ ) return 0;
+      if( data_len>FD_RPC_TOKEN_ACCOUNT_MIN_SZ && ( data_len==355UL || data[ FD_RPC_TOKEN_ACCOUNT_MIN_SZ ]!=2 ) ) return 0;
+      if( !data[ 108UL ] ) return 0;
+    } else if( f->is_memcmp ) {
+      if( f->offset>data_len || f->bytes_len>data_len-f->offset ) return 0;
+      if( memcmp( data+f->offset, f->bytes, f->bytes_len ) ) return 0;
+    } else if( data_len!=f->data_size ) return 0;
   }
   return 1;
 }
@@ -4558,13 +5091,7 @@ fd_rpc_gpa_emit( fd_rpc_tile_t * ctx,
                  uchar const *   data,
                  ulong           data_len ) {
   fd_rpc_gpa_arg_t * arg = _arg;
-  for( ulong i=0UL; i<arg->filter_cnt; i++ ) {
-    fd_rpc_gpa_filter_t const * f = &arg->filters[ i ];
-    if( f->is_memcmp ) {
-      if( f->offset>data_len || f->bytes_len>data_len-f->offset ) return 1;
-      if( memcmp( data+f->offset, f->bytes, f->bytes_len ) ) return 1;
-    } else if( data_len!=f->data_size ) return 1;
-  }
+  if( !fd_rpc_gpa_match( arg->filters, arg->filter_cnt, data, data_len ) ) return 1;
   if( arg->token_mode ) {
     /* SPL token account: mint 0, owner 32, amount 64, delegate option 72 */
     if( data_len>FD_RPC_TOKEN_ACCOUNT_MIN_SZ && data[ FD_RPC_TOKEN_ACCOUNT_MIN_SZ ]!=2 ) return 1;
@@ -4620,6 +5147,8 @@ getProgramAccounts( fd_rpc_tile_t *         ctx,
   return STAGE_JSON( ctx );
 }
 
+static int fd_rpc_read_mint( fd_rpc_tile_t * ctx, bank_info_t const * info, uchar const * mint, uchar * decimals, ulong * supply );
+
 /* getTokenAccountsByOwner / getTokenAccountsByDelegate */
 static fd_http_server_response_t
 fd_rpc_token_accounts_by( fd_rpc_tile_t *         ctx,
@@ -4659,6 +5188,17 @@ fd_rpc_token_accounts_by( fd_rpc_tile_t *         ctx,
                                             &bank_idx, &arg->encoding_cstr, &arg->slice_length, &arg->slice_offset, NULL, &response ) ) ) return response;
   bank_info_t const * info = &ctx->banks[ bank_idx ];
 
+  if( arg->has_mint ) {
+    /* Agave reads the mint first and refuses an address that is not one */
+    uchar decimals; ulong supply;
+    ulong m_lamports; int m_exec; uchar m_owner[ 32UL ]; ulong m_len;
+    fd_accdb_read_one_nocache( ctx->accdb, info->accdb_fork_id, arg->mint, &m_lamports, &m_exec, m_owner, ctx->scratch.accdb_data_buf, &m_len );
+    if( FD_UNLIKELY( !m_lamports ) ) return fd_rpc_err_msg( ctx, id_cstr, -32602, "Invalid param: could not find mint" );
+    int ok = fd_rpc_read_mint( ctx, info, arg->mint, &decimals, &supply );
+    fd_rpc_ui_interest.on = 0;
+    if( FD_UNLIKELY( !ok ) ) return fd_rpc_err_msg( ctx, id_cstr, -32602, "Invalid param: Token mint could not be unpacked" );
+  }
+
   fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"result\":{\"context\":{\"apiVersion\":\"%s\",\"slot\":%lu},\"value\":[", FD_RPC_AGAVE_API_VERSION, info->slot );
   if( all_programs ) {
     fd_pubkey_t token2022;
@@ -4681,15 +5221,52 @@ struct fd_rpc_largest {
   ulong total;        /* sum over everything visited */
   int   token_mode;
   uchar mint[ 32 ];
+  /* non-circulating supply, as Agave works it out */
+  fd_accdb_fork_id_t fork_id;
+  int   filter;       /* 0 all, 1 circulating only, 2 non-circulating only */
+  int   print_list;   /* print each non-circulating stake account as it is found */
+  ulong printed;      /* entries already in the printed list */
+  ulong noncirc;      /* lamports held by non-circulating accounts */
+  long  clock_ts;
+  ulong clock_epoch;
 };
 typedef struct fd_rpc_largest fd_rpc_largest_t;
+
+#include "fd_rpc_noncirc.h"
+
+static int
+fd_rpc_noncirc_has( uchar const (* set)[ 32 ],
+                    ulong          cnt,
+                    uchar const *  key ) {
+  ulong lo = 0UL, hi = cnt;
+  while( lo<hi ) {
+    ulong mid = (lo+hi)/2UL;
+    int   c   = memcmp( set[ mid ], key, 32UL );
+    if( !c ) return 1;
+    if( c<0 ) lo = mid+1UL; else hi = mid;
+  }
+  return 0;
+}
+
+static void
+fd_rpc_largest_clock( fd_rpc_tile_t *     ctx,
+                      bank_info_t const * info,
+                      fd_rpc_largest_t *  l ) {
+  ulong lamports; int executable; uchar owner[ 32UL ]; ulong data_sz;
+  fd_accdb_read_one_nocache( ctx->accdb, info->accdb_fork_id, fd_sysvar_clock_id.uc, &lamports, &executable, owner, ctx->scratch.accdb_data_buf, &data_sz );
+  if( FD_LIKELY( lamports && data_sz>=40UL ) ) {
+    l->clock_epoch = FD_LOAD( ulong, ctx->scratch.accdb_data_buf+16UL );
+    l->clock_ts    = FD_LOAD( long,  ctx->scratch.accdb_data_buf+32UL );
+  }
+}
 
 static void
 fd_rpc_largest_insert( fd_rpc_largest_t * l,
                        uchar const *      key,
                        ulong              amount ) {
+  /* largest first; equal amounts in descending key order, as Agave lists them */
   ulong pos = l->cnt;
-  while( pos && l->e[ pos-1UL ].amount<amount ) pos--;
+  while( pos && ( l->e[ pos-1UL ].amount<amount || ( l->e[ pos-1UL ].amount==amount && memcmp( l->e[ pos-1UL ].key, key, 32UL )<0 ) ) ) pos--;
   if( pos>=FD_RPC_LARGEST_CNT ) return;
   ulong last = fd_ulong_min( l->cnt, FD_RPC_LARGEST_CNT-1UL );
   for( ulong i=last; i>pos; i-- ) l->e[ i ] = l->e[ i-1UL ];
@@ -4707,7 +5284,7 @@ fd_rpc_largest_visit( fd_rpc_tile_t * ctx,
                       uchar const *   owner,
                       uchar const *   data,
                       ulong           data_len ) {
-  (void)ctx; (void)executable; (void)owner;
+  (void)executable;
   fd_rpc_largest_t * l = _arg;
   if( l->token_mode ) {
     if( FD_UNLIKELY( !data ) ) return 1;
@@ -4717,6 +5294,29 @@ fd_rpc_largest_visit( fd_rpc_tile_t * ctx,
     return 1;
   }
   l->total += lamports;
+  /* Non-circulating: an account on Agave's list, or a stake account
+     that is still locked up or whose withdraw authority is on Agave's
+     list of authorities. */
+  int listed = fd_rpc_noncirc_has( fd_rpc_noncirc_accounts, FD_RPC_NONCIRC_ACCOUNTS_CNT, pubkey );
+  int locked = 0;
+  if( !memcmp( owner, fd_solana_stake_program_id.uc, 32UL ) && data_len>=124UL ) {
+    ulong sl; int se; uchar so[ 32UL ]; ulong sdl;
+    fd_accdb_read_one_nocache( ctx->accdb, l->fork_id, pubkey, &sl, &se, so, ctx->scratch.accdb_data_buf, &sdl );
+    uchar const * st = ctx->scratch.accdb_data_buf;
+    uint tag = FD_LOAD( uint, st );
+    if( sl && sdl>=124UL && ( tag==1U || tag==2U ) ) {
+      locked = FD_LOAD( long, st+76UL )>l->clock_ts || FD_LOAD( ulong, st+84UL )>l->clock_epoch ||
+               fd_rpc_noncirc_has( fd_rpc_noncirc_withdrawers, FD_RPC_NONCIRC_WITHDRAWERS_CNT, st+44UL );
+    }
+  }
+  if( listed || locked ) {
+    l->noncirc += lamports;
+    if( l->print_list && !listed ) {
+      FD_BASE58_ENCODE_32_BYTES( pubkey, key_b58 );
+      fd_http_server_printf( ctx->http, "%s\"%s\"", l->printed++ ? "," : "", key_b58 );
+    }
+  }
+  if( ( l->filter==1 && ( listed || locked ) ) || ( l->filter==2 && !( listed || locked ) ) ) return 1;
   fd_rpc_largest_insert( l, pubkey, lamports );
   return 1;
 }
@@ -4733,6 +5333,14 @@ getLargestAccounts( fd_rpc_tile_t *         ctx,
 
   static fd_rpc_largest_t l[1];
   memset( l, 0, sizeof(l) );
+  l->fork_id = info->accdb_fork_id;
+  fd_rpc_val_t fv[1];
+  if( fd_rpc_cfg_member( &params->v[ 0 ], "filter", fv ) && fv->kind==FD_RPC_VAL_STR ) {
+    if(      fd_jtok_str_eq( &fv->str, "circulating"    ) ) l->filter = 1;
+    else if( fd_jtok_str_eq( &fv->str, "nonCirculating" ) ) l->filter = 2;
+    else return fd_rpc_err_msg( ctx, id_cstr, -32602, "Invalid params: unknown variant, expected `circulating` or `nonCirculating`." );
+  }
+  fd_rpc_largest_clock( ctx, info, l );
   fd_rpc_scan( ctx, info, NULL, 0UL, 0, fd_rpc_largest_visit, l );
 
   fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"result\":{\"context\":{\"apiVersion\":\"%s\",\"slot\":%lu},\"value\":[", FD_RPC_AGAVE_API_VERSION, info->slot );
@@ -4895,7 +5503,20 @@ fd_rpc_ws_sig_check( fd_rpc_tile_t * ctx ) {
   for( ulong i=0UL; i<FD_RPC_WS_SIG_SUB_MAX; i++ ) {
     if( !ctx->ws_sig_subs[ i ].sub_id ) continue;
     fd_rpc_txn_rec_t const * rec = fd_rpc_txn_query( ctx, ctx->ws_sig_subs[ i ].sig, tip, next_slot );
-    if( !rec || rec->slot>level_slot[ ctx->ws_sig_subs[ i ].level ] ) continue;
+    if( !rec ) continue;
+    if( ctx->ws_sig_subs[ i ].recv==1 ) {
+      /* seen for the first time: Agave tells the subscriber before the outcome */
+      ctx->ws_sig_subs[ i ].recv = 2;
+      fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"method\":\"signatureNotification\",\"params\":{\"result\":{\"context\":{\"slot\":%lu},\"value\":\"receivedSignature\"},\"subscription\":%lu}}\n", rec->slot, ctx->ws_sig_subs[ i ].sub_id-1UL );
+      if( FD_UNLIKELY( fd_http_server_ws_send( ctx->http, ctx->ws_sig_subs[ i ].ws_conn_id ) ) ) {
+        ulong dead = ctx->ws_sig_subs[ i ].ws_conn_id;
+        ctx->ws_sig_subs[ i ].sub_id = 0UL;
+        ctx->ws_sig_sub_cnt--;
+        fd_http_server_ws_close( ctx->http, dead, FD_HTTP_SERVER_CONNECTION_CLOSE_TOO_SLOW );
+        continue;
+      }
+    }
+    if( rec->slot>level_slot[ ctx->ws_sig_subs[ i ].level ] ) continue;
     ulong ws_conn_id = ctx->ws_sig_subs[ i ].ws_conn_id;
     fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"method\":\"signatureNotification\",\"params\":{\"result\":{\"context\":{\"slot\":%lu},\"value\":{\"err\":", rec->slot );
     if( !rec->txn_err ) fd_http_server_printf( ctx->http, "null" );
@@ -5122,6 +5743,12 @@ fd_rpc_b58_32( uchar const * key,
    a JSON map, which it prints with the keys in alphabetical order, so
    the fields are collected first and printed sorted. */
 
+static inline int
+fd_rpc_zero32( uchar const * p ) {
+  for( ulong i=0UL; i<32UL; i++ ) if( p[ i ] ) return 0;
+  return 1;
+}
+
 #define FD_RPC_PIX_FIELD_MAX (24UL)
 #define FD_RPC_PIX_KEY    (0)  /* a 32 byte address, base58 */
 #define FD_RPC_PIX_U64    (1)
@@ -5205,7 +5832,7 @@ fd_rpc_pix_emit( fd_rpc_tile_t * ctx,
       }
       case FD_RPC_PIX_KEYS:
         fd_http_server_printf( h, "[" );
-        for( ulong k=f->u; k<x->acct_cnt; k++ ) {
+        for( ulong k=f->u; k<( f->len ? fd_ulong_min( f->len, x->acct_cnt ) : x->acct_cnt ); k++ ) {
           fd_base58_encode_32( x->keys[ x->accts[ k ] ], NULL, b58 );
           fd_http_server_printf( h, "%s\"%s\"", k>f->u ? "," : "", b58 );
         }
@@ -5669,6 +6296,25 @@ fd_rpc_print_parsed_ix_more( fd_rpc_tile_t *       ctx,
     } while(0)
 #   define AMT( name, v )      fd_rpc_pix_add( x, name, FD_RPC_PIX_U64STR, NULL, (v), 0UL )
 #   define TOK( v, decimals )  fd_rpc_pix_add( x, "tokenAmount", FD_RPC_PIX_TOKAMT, NULL, (v), (ulong)(decimals) )
+#   define I64( name, v )      fd_rpc_pix_add( x, name, FD_RPC_PIX_I64, NULL, (ulong)(long)(v), 0UL )
+    /* an all-zero address stands for "none" */
+#   define OPK( name, p )      do { if( !fd_rpc_zero32( p ) ) PK( name, p ); } while(0)
+#   define OPK_NUL( name, p )  do { if( !fd_rpc_zero32( p ) ) PK( name, p ); else NUL( name ); } while(0)
+    /* a borsh string at offset o of a, which moves past it */
+#   define BSTR( o, ptr, len ) do {                                                    \
+      if( n<(o)+4UL ) return 0;                                                        \
+      (len) = (ulong)FD_LOAD( uint, a+(o) );                                           \
+      if( (len)>n-(o)-4UL ) return 0;                                                  \
+      (ptr) = a+(o)+4UL; (o) += 4UL+(len);                                             \
+      if( !fd_utf8_verify( (char const *)(ptr), (len) ) ) return 0;                    \
+    } while(0)
+    static char const * const ext_name[ 29 ] = {
+      "uninitialized", "transferFeeConfig", "transferFeeAmount", "mintCloseAuthority", "confidentialTransferMint",
+      "confidentialTransferAccount", "defaultAccountState", "immutableOwner", "memoTransfer", "nonTransferable",
+      "interestBearingConfig", "cpiGuard", "permanentDelegate", "nonTransferableAccount", "transferHook", "transferHookAccount",
+      "confidentialTransferFeeConfig", "confidentialTransferFeeAmount", "metadataPointer", "tokenMetadata", "groupPointer",
+      "tokenGroup", "groupMemberPointer", "tokenGroupMember", "confidentialMintBurn", "scaledUiAmount", "pausable",
+      "pausableAccount", "permissionedBurn" };
     switch( tag ) {
       case 0U: case 20U: { /* InitializeMint, InitializeMint2: decimals, mint authority, optional freeze authority */
         if( n<34UL ) return 0;
@@ -5797,13 +6443,6 @@ fd_rpc_print_parsed_ix_more( fd_rpc_tile_t *       ctx,
       }
       case 17U: NEED( 1 ); A( "account", 0 ); EMIT( "syncNative", "spl-token" );
       case 21U: { /* GetAccountDataSize { extension_types } */
-        static char const * const ext_name[ 29 ] = {
-          "uninitialized", "transferFeeConfig", "transferFeeAmount", "mintCloseAuthority", "confidentialTransferMint",
-          "confidentialTransferAccount", "defaultAccountState", "immutableOwner", "memoTransfer", "nonTransferable",
-          "interestBearingConfig", "cpiGuard", "permanentDelegate", "nonTransferableAccount", "transferHook", "transferHookAccount",
-          "confidentialTransferFeeConfig", "confidentialTransferFeeAmount", "metadataPointer", "tokenMetadata", "groupPointer",
-          "tokenGroup", "groupMemberPointer", "tokenGroupMember", "confidentialMintBurn", "scaledUiAmount", "pausable",
-          "pausableAccount", "permissionedBurn" };
         if( (n & 1UL) || n>128UL ) return 0;
         NEED( 1 );
         A( "mint", 0 );
@@ -5866,8 +6505,344 @@ fd_rpc_print_parsed_ix_more( fd_rpc_tile_t *       ctx,
         A( "mint", 0 ); T( "uiAmount", a, n );
         EMIT( "uiAmountToAmount", "spl-token" );
       }
-      default: return 0; /* the Token-2022 extension families are not decoded */
+      case 26U: { /* TransferFeeExtension */
+        if( n<1UL ) return 0;
+        uchar const * b = a+1UL; ulong m = n-1UL;
+        switch( a[ 0 ] ) {
+          case 0U: { /* InitializeTransferFeeConfig { config authority, withdraw authority, basis points, maximum fee } */
+            uchar const * auth[ 2 ] = { NULL, NULL };
+            for( ulong k=0UL; k<2UL; k++ ) {
+              if( m<1UL || b[ 0 ]>1 ) return 0;
+              if( b[ 0 ]==1 ) { if( m<33UL ) return 0; auth[ k ] = b+1UL; b += 33UL; m -= 33UL; }
+              else            { b += 1UL; m -= 1UL; }
+            }
+            if( m<10UL ) return 0;
+            NEED( 1 );
+            A( "mint", 0 ); U( "transferFeeBasisPoints", FD_LOAD( ushort, b ) ); U( "maximumFee", FD_LOAD( ulong, b+2UL ) );
+            if( auth[ 0 ] ) PK( "transferFeeConfigAuthority", auth[ 0 ] );
+            if( auth[ 1 ] ) PK( "withdrawWithheldAuthority",  auth[ 1 ] );
+            EMIT( "initializeTransferFeeConfig", "spl-token" );
+          }
+          case 1U: { /* TransferCheckedWithFee { amount, decimals, fee } */
+            if( m<17UL ) return 0;
+            NEED( 4 );
+            A( "source", 0 ); A( "mint", 1 ); A( "destination", 2 ); TOK( FD_LOAD( ulong, b ), b[ 8 ] );
+            fd_rpc_pix_add( x, "feeAmount", FD_RPC_PIX_TOKAMT, NULL, FD_LOAD( ulong, b+9UL ), (ulong)b[ 8 ] );
+            SIGNERS( 3, "authority", "multisigAuthority" );
+            EMIT( "transferCheckedWithFee", "spl-token" );
+          }
+          case 2U: { /* WithdrawWithheldTokensFromMint */
+            NEED( 3 );
+            A( "mint", 0 ); A( "feeRecipient", 1 );
+            SIGNERS( 2, "withdrawWithheldAuthority", "multisigWithdrawWithheldAuthority" );
+            EMIT( "withdrawWithheldTokensFromMint", "spl-token" );
+          }
+          case 3U: { /* WithdrawWithheldTokensFromAccounts { num_token_accounts }: the sources are the last accounts */
+            if( m<1UL ) return 0;
+            NEED( 3UL+(ulong)b[ 0 ] );
+            ulong first_src = acct_cnt-(ulong)b[ 0 ];
+            A( "mint", 0 ); A( "feeRecipient", 1 );
+            fd_rpc_pix_add( x, "sourceAccounts", FD_RPC_PIX_KEYS, NULL, first_src, 0UL );
+            if( first_src>3UL ) { A( "multisigWithdrawWithheldAuthority", 2 ); fd_rpc_pix_add( x, "signers", FD_RPC_PIX_KEYS, NULL, 3UL, first_src ); }
+            else                A( "withdrawWithheldAuthority", 2 );
+            EMIT( "withdrawWithheldTokensFromAccounts", "spl-token" );
+          }
+          case 4U: { /* HarvestWithheldTokensToMint */
+            NEED( 1 );
+            A( "mint", 0 );
+            if( acct_cnt>1UL ) fd_rpc_pix_add( x, "sourceAccounts", FD_RPC_PIX_KEYS, NULL, 1UL, 0UL ); else R( "sourceAccounts", "[]" );
+            EMIT( "harvestWithheldTokensToMint", "spl-token" );
+          }
+          case 5U: { /* SetTransferFee { basis points, maximum fee } */
+            if( m<10UL ) return 0;
+            NEED( 2 );
+            A( "mint", 0 ); U( "transferFeeBasisPoints", FD_LOAD( ushort, b ) ); U( "maximumFee", FD_LOAD( ulong, b+2UL ) );
+            SIGNERS( 1, "transferFeeConfigAuthority", "multisigtransferFeeConfigAuthority" );
+            EMIT( "setTransferFee", "spl-token" );
+          }
+          default: return 0;
+        }
+      }
+      case 27U: { /* ConfidentialTransferExtension.  The instructions that carry zero-knowledge
+                     proofs (withdraw, transfer, transfer with fee, configure with registry)
+                     are not decoded. */
+#       define QB64( k, ptr, len ) do { raw[ k ][ 0 ] = '"'; ulong k_ = fd_base64_encode( raw[ k ]+1UL, (ptr), (len) ); raw[ k ][ 1UL+k_ ] = '"'; raw[ k ][ 2UL+k_ ] = '\0'; } while(0)
+        if( n<1UL ) return 0;
+        uchar const * b = a+1UL; ulong m = n-1UL;
+        switch( a[ 0 ] ) {
+          case 0U: /* InitializeMint { authority, auto approve, auditor key } */
+            if( m!=65UL ) return 0;
+            NEED( 1 );
+            A( "mint", 0 ); R( "autoApproveNewAccounts", b[ 32 ] ? "true" : "false" );
+            if( fd_rpc_zero32( b+33UL ) ) NUL( "auditorElGamalPubkey" ); else { QB64( 0, b+33UL, 32UL ); R( "auditorElGamalPubkey", raw[ 0 ] ); }
+            OPK( "authority", b );
+            EMIT( "initializeConfidentialTransferMint", "spl-token" );
+          case 1U: /* UpdateMint { auto approve, auditor key } */
+            if( m!=33UL ) return 0;
+            NEED( 2 );
+            A( "mint", 0 ); A( "confidentialTransferMintAuthority", 1 ); R( "autoApproveNewAccounts", b[ 0 ] ? "true" : "false" );
+            if( fd_rpc_zero32( b+1UL ) ) NUL( "auditorElGamalPubkey" ); else { QB64( 0, b+1UL, 32UL ); R( "auditorElGamalPubkey", raw[ 0 ] ); }
+            EMIT( "updateConfidentialTransferMint", "spl-token" );
+          case 2U: /* ConfigureAccount { decryptable zero balance, maximum counter, proof offset } */
+            if( m!=45UL ) return 0;
+            NEED( 4 );
+            QB64( 0, b, 36UL );
+            A( "account", 0 ); A( "mint", 1 ); R( "decryptableZeroBalance", raw[ 0 ] );
+            U( "maximumPendingBalanceCreditCounter", FD_LOAD( ulong, b+36UL ) ); I64( "proofInstructionOffset", (schar)b[ 44 ] );
+            A( b[ 44 ] ? "instructionsSysvar" : "proofContextStateAccount", 2 );
+            SIGNERS( 3, "owner", "multisigOwner" );
+            EMIT( "configureConfidentialTransferAccount", "spl-token" );
+          case 3U: /* ApproveAccount */
+            NEED( 3 );
+            A( "account", 0 ); A( "mint", 1 ); A( "confidentialTransferAuditorAuthority", 2 );
+            EMIT( "approveConfidentialTransferAccount", "spl-token" );
+          case 4U: /* EmptyAccount { proof offset } */
+            if( m!=1UL ) return 0;
+            NEED( 3 );
+            A( "account", 0 ); I64( "proofInstructionOffset", (schar)b[ 0 ] );
+            A( b[ 0 ] ? "instructionsSysvar" : "proofContextStateAccount", 1 );
+            SIGNERS( 2, "owner", "multisigOwner" );
+            EMIT( "emptyConfidentialTransferAccount", "spl-token" );
+          case 5U: /* Deposit { amount, decimals } */
+            if( m!=9UL ) return 0;
+            NEED( 3 );
+            A( "account", 0 ); A( "mint", 1 ); U( "amount", FD_LOAD( ulong, b ) ); U( "decimals", b[ 8 ] );
+            SIGNERS( 2, "owner", "multisigOwner" );
+            EMIT( "depositConfidentialTransfer", "spl-token" );
+          case 8U: /* ApplyPendingBalance { expected counter, new decryptable balance } */
+            if( m!=44UL ) return 0;
+            NEED( 2 );
+            QB64( 0, b+8UL, 36UL );
+            A( "account", 0 ); R( "newDecryptableAvailableBalance", raw[ 0 ] ); U( "expectedPendingBalanceCreditCounter", FD_LOAD( ulong, b ) );
+            SIGNERS( 1, "owner", "multisigOwner" );
+            EMIT( "applyPendingConfidentialTransferBalance", "spl-token" );
+          case 9U: case 10U: case 11U: case 12U: /* enable or disable confidential or plain credits */
+            NEED( 2 );
+            A( "account", 0 );
+            SIGNERS( 1, "owner", "multisigOwner" );
+            EMIT( a[ 0 ]==9U  ? "enableConfidentialTransferConfidentialCredits"    : a[ 0 ]==10U ? "disableConfidentialTransferConfidentialCredits" :
+                  a[ 0 ]==11U ? "enableConfidentialTransferNonConfidentialCredits" : "disableConfidentialTransferNonConfidentialCredits", "spl-token" );
+          default: return 0;
+        }
+#       undef QB64
+      }
+      case 28U: { /* DefaultAccountStateExtension { instruction, state } */
+        static char const * const state_name[ 3 ] = { "uninitialized", "initialized", "frozen" };
+        if( n!=2UL || a[ 0 ]>1 || a[ 1 ]>2 ) return 0;
+        NEED( a[ 0 ] ? 2 : 1 );
+        A( "mint", 0 ); S( "accountState", state_name[ a[ 1 ] ] );
+        if( a[ 0 ] ) SIGNERS( 1, "freezeAuthority", "multisigFreezeAuthority" );
+        EMIT( a[ 0 ] ? "updateDefaultAccountState" : "initializeDefaultAccountState", "spl-token" );
+      }
+      case 29U: { /* Reallocate { extension_types } */
+        if( (n & 1UL) || n>128UL ) return 0;
+        NEED( 4 );
+        A( "account", 0 ); A( "payer", 1 ); A( "systemProgram", 2 );
+        {
+          char * p = raw[ 0 ]; char * e = raw[ 0 ]+sizeof(raw[ 0 ]);
+          p += snprintf( p, (ulong)(e-p), "[" );
+          for( ulong i=0UL; i<n; i+=2UL ) {
+            ushort t = FD_LOAD( ushort, a+i );
+            if( t>=29 ) return 0;
+            p += snprintf( p, (ulong)(e-p), "%s\"%s\"", i ? "," : "", ext_name[ t ] );
+          }
+          snprintf( p, (ulong)(e-p), "]" );
+          R( "extensionTypes", raw[ 0 ] );
+        }
+        SIGNERS( 3, "owner", "multisigOwner" );
+        EMIT( "reallocate", "spl-token" );
+      }
+      case 30U: case 34U: { /* MemoTransferExtension, CpiGuardExtension { enable or disable } */
+        if( n<1UL || a[ 0 ]>1 ) return 0;
+        NEED( 2 );
+        A( "account", 0 );
+        SIGNERS( 1, "owner", "multisigOwner" );
+        EMIT( tag==30U ? ( a[ 0 ] ? "disableRequiredMemoTransfers" : "enableRequiredMemoTransfers" )
+                       : ( a[ 0 ] ? "disableCpiGuard"              : "enableCpiGuard"              ), "spl-token" );
+      }
+      case 33U: { /* InterestBearingMintExtension */
+        if( n<1UL ) return 0;
+        if( a[ 0 ]==0 ) { /* Initialize { rate authority, rate } */
+          if( n!=35UL ) return 0;
+          NEED( 1 );
+          A( "mint", 0 ); OPK_NUL( "rateAuthority", a+1UL ); I64( "rate", FD_LOAD( short, a+33UL ) );
+          EMIT( "initializeInterestBearingConfig", "spl-token" );
+        } else if( a[ 0 ]==1 ) { /* UpdateRate { rate } */
+          if( n!=3UL ) return 0;
+          NEED( 2 );
+          A( "mint", 0 ); I64( "newRate", FD_LOAD( short, a+1UL ) );
+          SIGNERS( 1, "rateAuthority", "multisigRateAuthority" );
+          EMIT( "updateInterestBearingConfigRate", "spl-token" );
+        }
+        return 0;
+      }
+      case 36U: case 39U: case 40U: case 41U: { /* TransferHook, MetadataPointer, GroupPointer, GroupMemberPointer:
+                                                   Initialize { authority, address }, Update { address } */
+        char const * addr_name = tag==36U ? "programId" : tag==39U ? "metadataAddress" : tag==40U ? "groupAddress" : "memberAddress";
+        if( n<1UL ) return 0;
+        if( a[ 0 ]==0 ) {
+          if( n!=65UL ) return 0;
+          NEED( 1 );
+          A( "mint", 0 ); OPK( "authority", a+1UL ); OPK( addr_name, a+33UL );
+          EMIT( tag==36U ? "initializeTransferHook" : tag==39U ? "initializeMetadataPointer" : tag==40U ? "initializeGroupPointer" : "initializeGroupMemberPointer", "spl-token" );
+        } else if( a[ 0 ]==1 ) {
+          if( n!=33UL ) return 0;
+          NEED( 2 );
+          A( "mint", 0 ); OPK( addr_name, a+1UL );
+          SIGNERS( 1, "authority", "multisigAuthority" );
+          EMIT( tag==36U ? "updateTransferHook" : tag==39U ? "updateMetadataPointer" : tag==40U ? "updateGroupPointer" : "updateGroupMemberPointer", "spl-token" );
+        }
+        return 0;
+      }
+      case 43U: { /* ScaledUiAmountExtension */
+        if( n<1UL ) return 0;
+        if( a[ 0 ]==0 ) { /* Initialize { authority, multiplier } */
+          if( n!=41UL ) return 0;
+          NEED( 1 );
+          fd_rpc_f64_text( FD_LOAD( double, a+33UL ), raw[ 0 ], 1 );
+          A( "mint", 0 ); OPK_NUL( "authority", a+1UL ); R( "multiplier", raw[ 0 ] );
+          EMIT( "initializeScaledUiAmountConfig", "spl-token" );
+        } else if( a[ 0 ]==1 ) { /* UpdateMultiplier { multiplier, effective timestamp } */
+          if( n!=17UL ) return 0;
+          NEED( 2 );
+          fd_rpc_f64_text( FD_LOAD( double, a+1UL ), raw[ 0 ], 1 );
+          A( "mint", 0 ); R( "newMultiplier", raw[ 0 ] ); I64( "newMultiplierTimestamp", FD_LOAD( long, a+9UL ) );
+          SIGNERS( 1, "authority", "multisigAuthority" );
+          EMIT( "updateMultiplier", "spl-token" );
+        }
+        return 0;
+      }
+      case 44U: { /* PausableExtension */
+        if( n<1UL ) return 0;
+        if( a[ 0 ]==0 ) { /* Initialize { authority } */
+          if( n!=33UL ) return 0;
+          NEED( 1 );
+          A( "mint", 0 ); OPK_NUL( "authority", a+1UL );
+          EMIT( "initializePausableConfig", "spl-token" );
+        } else if( a[ 0 ]==1 || a[ 0 ]==2 ) {
+          NEED( 2 );
+          A( "mint", 0 );
+          SIGNERS( 1, "authority", "multisigAuthority" );
+          EMIT( a[ 0 ]==1 ? "pause" : "resume", "spl-token" );
+        }
+        return 0;
+      }
+      case 46U: { /* PermissionedBurnExtension (the confidential burn is not decoded) */
+        if( n<1UL ) return 0;
+        if( a[ 0 ]==0 ) { /* Initialize { authority } */
+          if( n!=33UL ) return 0;
+          NEED( 1 );
+          A( "mint", 0 ); PK( "authority", a+1UL );
+          EMIT( "initializePermissionedBurnConfig", "spl-token" );
+        } else if( a[ 0 ]==1 ) { /* Burn { amount } */
+          if( n!=9UL ) return 0;
+          NEED( 4 );
+          A( "account", 0 ); A( "mint", 1 ); A( "permissionedBurnAuthority", 2 ); AMT( "amount", FD_LOAD( ulong, a+1UL ) );
+          SIGNERS( 3, "authority", "multisigAuthority" );
+          EMIT( "permissionedBurn", "spl-token" );
+        } else if( a[ 0 ]==2 ) { /* BurnChecked { amount, decimals } */
+          if( n!=10UL ) return 0;
+          NEED( 4 );
+          A( "account", 0 ); A( "mint", 1 ); A( "permissionedBurnAuthority", 2 ); TOK( FD_LOAD( ulong, a+1UL ), a[ 9 ] );
+          SIGNERS( 3, "authority", "multisigAuthority" );
+          EMIT( "permissionedBurnChecked", "spl-token" );
+        }
+        return 0;
+      }
+      default: {
+        /* Not a token instruction: the token group and token metadata
+           interfaces, told apart by an 8 byte discriminator.  The
+           confidential transfer families are not decoded. */
+        static uchar const disc[ 9 ][ 8 ] = {
+          { 121, 113, 108,  39,  54,  51,   0,   4 }, /* group: initialize group */
+          { 108,  37, 171, 143, 248,  30,  18, 110 }, /* group: update max size */
+          { 161, 105,  88,   1, 237, 221, 216, 203 }, /* group: update authority */
+          { 152,  32, 222, 176, 223, 237, 116, 134 }, /* group: initialize member */
+          { 210, 225,  30, 162,  88, 184,  77, 141 }, /* metadata: initialize */
+          { 221, 233,  49,  45, 181, 202, 220, 200 }, /* metadata: update field */
+          { 234,  18,  32,  56,  89, 141,  37, 181 }, /* metadata: remove key */
+          { 215, 228, 166, 228,  84, 100,  86, 123 }, /* metadata: update authority */
+          { 250, 166, 180, 250,  13,  12, 184,  70 }  /* metadata: emit */
+        };
+        if( sz<8UL ) return 0;
+        ulong which = 0UL;
+        while( which<9UL && memcmp( d, disc[ which ], 8UL ) ) which++;
+        a = d+8UL; n = sz-8UL;
+        uchar const * sp[ 3 ] = { NULL, NULL, NULL }; ulong sl[ 3 ] = { 0UL, 0UL, 0UL }; ulong o = 0UL;
+        switch( which ) {
+          case 0UL: /* InitializeGroup { update authority, max size } */
+            if( n!=40UL ) return 0;
+            NEED( 3 );
+            A( "group", 0 ); U( "maxSize", FD_LOAD( ulong, a+32UL ) ); A( "mint", 1 ); A( "mintAuthority", 2 ); OPK_NUL( "updateAuthority", a );
+            EMIT( "initializeTokenGroup", "spl-token" );
+          case 1UL: /* UpdateGroupMaxSize { max size } */
+            if( n!=8UL ) return 0;
+            NEED( 2 );
+            A( "group", 0 ); U( "maxSize", FD_LOAD( ulong, a ) ); A( "updateAuthority", 1 );
+            EMIT( "updateTokenGroupMaxSize", "spl-token" );
+          case 2UL: /* UpdateGroupAuthority { new authority } */
+            if( n!=32UL ) return 0;
+            NEED( 2 );
+            A( "group", 0 ); A( "updateAuthority", 1 ); OPK_NUL( "newAuthority", a );
+            EMIT( "updateTokenGroupAuthority", "spl-token" );
+          case 3UL: /* InitializeMember */
+            if( n ) return 0;
+            NEED( 5 );
+            A( "member", 0 ); A( "memberMint", 1 ); A( "memberMintAuthority", 2 ); A( "group", 3 ); A( "groupUpdateAuthority", 4 );
+            EMIT( "initializeTokenGroupMember", "spl-token" );
+          case 4UL: /* Initialize { name, symbol, uri } */
+            BSTR( o, sp[ 0 ], sl[ 0 ] ); BSTR( o, sp[ 1 ], sl[ 1 ] ); BSTR( o, sp[ 2 ], sl[ 2 ] );
+            if( o!=n ) return 0;
+            NEED( 4 );
+            A( "metadata", 0 ); A( "updateAuthority", 1 ); A( "mint", 2 ); A( "mintAuthority", 3 );
+            T( "name", sp[ 0 ], sl[ 0 ] ); T( "symbol", sp[ 1 ], sl[ 1 ] ); T( "uri", sp[ 2 ], sl[ 2 ] );
+            EMIT( "initializeTokenMetadata", "spl-token" );
+          case 5UL: /* UpdateField { field, value } */
+            if( n<1UL || a[ 0 ]>3 ) return 0;
+            o = 1UL;
+            if( a[ 0 ]==3 ) BSTR( o, sp[ 0 ], sl[ 0 ] );
+            BSTR( o, sp[ 1 ], sl[ 1 ] );
+            if( o!=n ) return 0;
+            NEED( 2 );
+            A( "metadata", 0 ); A( "updateAuthority", 1 );
+            if( a[ 0 ]==3 ) T( "field", sp[ 0 ], sl[ 0 ] ); else S( "field", a[ 0 ]==0 ? "name" : a[ 0 ]==1 ? "symbol" : "uri" );
+            T( "value", sp[ 1 ], sl[ 1 ] );
+            EMIT( "updateTokenMetadataField", "spl-token" );
+          case 6UL: /* RemoveKey { idempotent, key } */
+            if( n<1UL || a[ 0 ]>1 ) return 0;
+            o = 1UL;
+            BSTR( o, sp[ 0 ], sl[ 0 ] );
+            if( o!=n ) return 0;
+            NEED( 2 );
+            A( "metadata", 0 ); A( "updateAuthority", 1 ); T( "key", sp[ 0 ], sl[ 0 ] ); R( "idempotent", a[ 0 ] ? "true" : "false" );
+            EMIT( "removeTokenMetadataKey", "spl-token" );
+          case 7UL: /* UpdateAuthority { new authority } */
+            if( n!=32UL ) return 0;
+            NEED( 2 );
+            A( "metadata", 0 ); A( "updateAuthority", 1 ); OPK_NUL( "newAuthority", a );
+            EMIT( "updateTokenMetadataAuthority", "spl-token" );
+          case 8UL: { /* Emit { start, end } */
+            ulong se[ 2 ] = { 0UL, 0UL }; int has[ 2 ] = { 0, 0 };
+            for( ulong k=0UL; k<2UL; k++ ) {
+              if( n<o+1UL || a[ o ]>1 ) return 0;
+              has[ k ] = a[ o ]; o += 1UL;
+              if( has[ k ] ) { if( n<o+8UL ) return 0; se[ k ] = FD_LOAD( ulong, a+o ); o += 8UL; } else se[ k ] = 0UL;
+            }
+            if( o!=n ) return 0;
+            NEED( 1 );
+            A( "metadata", 0 );
+            if( has[ 0 ] ) U( "start", se[ 0 ] );
+            if( has[ 1 ] ) U( "end",   se[ 1 ] );
+            EMIT( "emitTokenMetadata", "spl-token" );
+          }
+          default: return 0;
+        }
+      }
     }
+#   undef I64
+#   undef OPK
+#   undef OPK_NUL
+#   undef BSTR
 #   undef SIGNERS
 #   undef AMT
 #   undef TOK
@@ -6210,6 +7185,55 @@ fd_rpc_txn_rec_version( fd_rpc_txn_rec_t const * rec ) {
 
 /* Prints "transaction":…,"meta":{…},"version":… for one record.
    Returns 0 if the stored payload does not parse (should not happen). */
+/* Prints a transaction's pre or post token balances from the entries
+   the exec tile recorded.  The mint's decimals are read from the bank
+   (they never change).  null if the balances were not recorded. */
+static void
+fd_rpc_print_token_balances( fd_rpc_tile_t *           ctx,
+                             bank_info_t const *       info,
+                             fd_rpc_meta_ent_t const * meta,
+                             uchar const *             ents,
+                             ulong                     cnt ) {
+  if( !meta || ( !meta->tok_known && meta->has_token ) ) { fd_http_server_printf( ctx->http, "null" ); return; }
+  fd_http_server_printf( ctx->http, "[" );
+  ulong printed = 0UL;
+  for( ulong i=0UL; meta->tok_known && i<cnt; i++ ) {
+    uchar const * e = ents+i*FD_EXECRP_TXN_META_TOK_SZ;
+    ulong ml; int me; uchar mo[ 32UL ]; ulong mdl;
+    fd_accdb_read_one_nocache( ctx->accdb, info->accdb_fork_id, e+2UL, &ml, &me, mo, ctx->scratch.accdb_data_buf, &mdl );
+    if( FD_UNLIKELY( !ml || mdl<82UL ) ) continue; /* Agave lists no balance for a mint it cannot read */
+    uchar decimals = ctx->scratch.accdb_data_buf[ 44 ];
+    FD_BASE58_ENCODE_32_BYTES( e+2UL,  mint_b58  );
+    FD_BASE58_ENCODE_32_BYTES( e+34UL, owner_b58 );
+    fd_http_server_printf( ctx->http, "%s{\"accountIndex\":%u,\"mint\":\"%s\",\"owner\":\"%s\",\"programId\":\"%s\",\"uiTokenAmount\":",
+                           printed++ ? "," : "", (uint)e[ 0 ], mint_b58, owner_b58,
+                           e[ 1 ] ? "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb" : "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" );
+    fd_rpc_ui_null_zero = 1;
+    fd_rpc_print_ui_amount( ctx, FD_LOAD( ulong, e+66UL ), decimals );
+    fd_rpc_ui_null_zero = 0;
+    fd_http_server_printf( ctx->http, "}" );
+  }
+  fd_http_server_printf( ctx->http, "]" );
+}
+
+/* Agave refuses base58 (and its old name, binary) once the caller
+   accepts transaction versions past 0.  Returns 0 with *res set when
+   it applies. */
+static int
+fd_rpc_cfg_base58_version_ok( fd_rpc_tile_t *             ctx,
+                              char const *                id_cstr,
+                              fd_rpc_val_t const *        config,
+                              fd_http_server_response_t * res ) {
+  fd_rpc_val_t v[1], e[1];
+  if( !fd_rpc_cfg_member( config, "maxSupportedTransactionVersion", v ) || v->kind!=FD_RPC_VAL_INT || v->neg || v->u<1UL ) return 1;
+  if( !fd_rpc_cfg_member( config, "encoding", e ) || e->kind!=FD_RPC_VAL_STR ) return 1;
+  if( !fd_jtok_str_eq( &e->str, "base58" ) && !fd_jtok_str_eq( &e->str, "binary" ) ) return 1;
+  *res = fd_rpc_err_msg( ctx, id_cstr, -32602, "base58 encoding is not supported with maxSupportedTransactionVersion >= 1" );
+  return 0;
+}
+
+static int fd_rpc_txn_show_version = 1; /* set by getBlock / getTransaction before printing */
+
 static int
 fd_rpc_print_txn( fd_rpc_tile_t *          ctx,
                   bank_info_t const *      info,
@@ -6397,19 +7421,25 @@ fd_rpc_print_txn( fd_rpc_tile_t *          ctx,
   for( ulong i=0UL; i<rec->bal_cnt; i++ ) fd_http_server_printf( ctx->http, "%s%lu", i ? "," : "", rec->post_lamports[ i ] );
   /* Token balances are not reported.  They are known to be empty if
      no token program and no token-owned account is involved. */
-  char const * tok = meta && !meta->has_token ? "[]" : "null";
-  fd_http_server_printf( ctx->http, "],\"postTokenBalances\":%s,\"preBalances\":[", tok );
+  uchar const * tok_body = meta ? meta_body+meta->inner_sz+meta->log_sz+meta->return_sz : NULL;
+  fd_http_server_printf( ctx->http, "],\"postTokenBalances\":" );
+  fd_rpc_print_token_balances( ctx, info, meta, tok_body ? tok_body+(ulong)meta->tok_pre_cnt*FD_EXECRP_TXN_META_TOK_SZ : NULL, meta ? meta->tok_post_cnt : 0UL );
+  fd_http_server_printf( ctx->http, ",\"preBalances\":[" );
   for( ulong i=0UL; i<rec->bal_cnt; i++ ) fd_http_server_printf( ctx->http, "%s%lu", i ? "," : "", rec->pre_lamports[ i ] );
-  fd_http_server_printf( ctx->http, "],\"preTokenBalances\":%s", tok );
+  fd_http_server_printf( ctx->http, "],\"preTokenBalances\":" );
+  fd_rpc_print_token_balances( ctx, info, meta, tok_body, meta ? meta->tok_pre_cnt : 0UL );
   if( meta && meta->has_return && enc!=FD_RPC_TXN_ENC_ACCOUNTS ) {
     static char b64[ FD_BASE64_ENC_SZ( FD_EXECRP_TXN_META_RETURN_MAX )+1UL ];
     ulong n = fd_base64_encode( b64, meta_body+meta->inner_sz+meta->log_sz, meta->return_sz );
     FD_BASE58_ENCODE_32_BYTES( meta->return_program, prog_b58 );
     fd_http_server_printf( ctx->http, ",\"returnData\":{\"data\":[\"%.*s\",\"base64\"],\"programId\":\"%s\"}", (int)n, b64, prog_b58 );
   }
-  fd_http_server_printf( ctx->http, ",\"rewards\":[]}," );
-  if( txn->transaction_version==FD_TXN_VLEGACY ) fd_http_server_printf( ctx->http, "\"version\":\"legacy\"" );
-  else                                           fd_http_server_printf( ctx->http, "\"version\":%u", (uint)txn->transaction_version );
+  fd_http_server_printf( ctx->http, ",\"rewards\":[]}" );
+  /* Agave leaves the version out unless the caller named a maxSupportedTransactionVersion */
+  if( fd_rpc_txn_show_version ) {
+    if( txn->transaction_version==FD_TXN_VLEGACY ) fd_http_server_printf( ctx->http, ",\"version\":\"legacy\"" );
+    else                                           fd_http_server_printf( ctx->http, ",\"version\":%u", (uint)txn->transaction_version );
+  }
   return 1;
 }
 
@@ -6452,6 +7482,8 @@ getTransaction( fd_rpc_tile_t *         ctx,
   ulong bank_idx = ULONG_MAX;
   if( FD_UNLIKELY( !fd_rpc_cfg_bank( ctx, id_cstr, config, &bank_idx, &response ) ) ) return response;
   bank_info_t const * info = &ctx->banks[ bank_idx ];
+  if( FD_UNLIKELY( !fd_rpc_cfg_at_least_confirmed( ctx, id_cstr, config, &response ) ) ) return response;
+  if( FD_UNLIKELY( !fd_rpc_cfg_base58_version_ok( ctx, id_cstr, config, &response ) ) ) return response;
 
   ulong next_slot;
   if( FD_UNLIKELY( !fd_rpc_slot_history_load( ctx, info, &next_slot ) ) ) return fd_rpc_err_msg( ctx, id_cstr, -32065, "Firedancer Error: slot history unavailable" );
@@ -6460,6 +7492,7 @@ getTransaction( fd_rpc_tile_t *         ctx,
 
   fd_rpc_val_t v[1];
   long max_version = ( fd_rpc_cfg_member( config, "maxSupportedTransactionVersion", v ) && v->kind==FD_RPC_VAL_INT && !v->neg ) ? (long)fd_ulong_min( v->u, 255UL ) : -1L;
+  fd_rpc_txn_show_version = max_version>=0L;
   if( FD_UNLIKELY( (long)fd_rpc_txn_rec_version( rec )>max_version ) ) {
     return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32015,\"message\":\"Transaction version (%d) is not supported by the requesting client. Please try the request again with the following configuration parameter: \\\"maxSupportedTransactionVersion\\\": %d\"},\"id\":%s}\n", fd_rpc_txn_rec_version( rec ), fd_rpc_txn_rec_version( rec ), id_cstr );
   }
@@ -6491,6 +7524,7 @@ getSignaturesForAddress( fd_rpc_tile_t *         ctx,
   ulong bank_idx = ULONG_MAX;
   if( FD_UNLIKELY( !fd_rpc_cfg_bank( ctx, id_cstr, config, &bank_idx, &response ) ) ) return response;
   bank_info_t const * info = &ctx->banks[ bank_idx ];
+  if( FD_UNLIKELY( !fd_rpc_cfg_at_least_confirmed( ctx, id_cstr, config, &response ) ) ) return response;
   ulong finalized = ctx->finalized_idx!=ULONG_MAX ? ctx->banks[ ctx->finalized_idx ].slot : 0UL;
 
   fd_rpc_val_t v[1];
@@ -6546,7 +7580,8 @@ getSignaturesForAddress( fd_rpc_tile_t *         ctx,
         fd_txn_instr_t const * ix = &txn->instr[ i ];
         if( ix->program_id>=txn->acct_addr_cnt ) continue;
         FD_BASE58_ENCODE_32_BYTES( rec->payload+txn->acct_addr_off+32UL*(ulong)ix->program_id, prog_b58 );
-        if( strcmp( prog_b58, "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr" ) && strcmp( prog_b58, "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo" ) ) continue;
+        if( strcmp( prog_b58, "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr" ) && strcmp( prog_b58, "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo" ) &&
+            strcmp( prog_b58, "Memo4c2pN8afCj432Lb7RMVKi9PbQnnW7ewFFaV3oAH" ) ) continue;
         fd_http_server_printf( ctx->http, has_memo ? "; [%u] " : "\"memo\":\"[%u] ", (uint)ix->data_sz );
         fd_rpc_print_json_text( ctx, rec->payload+ix->data_off, ix->data_sz );
         has_memo = 1;
@@ -6576,6 +7611,7 @@ getBlock( fd_rpc_tile_t *         ctx,
   ulong bank_idx = ULONG_MAX;
   if( FD_UNLIKELY( !fd_rpc_cfg_bank( ctx, id_cstr, config, &bank_idx, &response ) ) ) return response;
   bank_info_t const * info = &ctx->banks[ bank_idx ];
+  if( FD_UNLIKELY( !fd_rpc_cfg_at_least_confirmed( ctx, id_cstr, config, &response ) ) ) return response;
 
   fd_rpc_val_t v[1];
   char details[ 16 ] = "full";
@@ -6592,6 +7628,8 @@ getBlock( fd_rpc_tile_t *         ctx,
   int want_rewards    = !( fd_rpc_cfg_member( config, "rewards", v ) && v->kind==FD_RPC_VAL_BOOL && v->raw_sz==5UL );
   long max_version = ( fd_rpc_cfg_member( config, "maxSupportedTransactionVersion", v ) && v->kind==FD_RPC_VAL_INT && !v->neg ) ? (long)fd_ulong_min( v->u, 255UL ) : -1L;
 
+  fd_rpc_txn_show_version = max_version>=0L;
+  if( FD_UNLIKELY( !fd_rpc_cfg_base58_version_ok( ctx, id_cstr, config, &response ) ) ) return response;
   if( FD_UNLIKELY( slot>info->slot ) ) {
     return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32004,\"message\":\"Block not available for slot %lu\"},\"id\":%s}\n", slot, id_cstr );
   }
@@ -6649,9 +7687,10 @@ getBlock( fd_rpc_tile_t *         ctx,
     /* A block that paid no fees and no epoch rewards has an empty
        list.  Anything else is not reported. */
     int epoch_rewards = 0;
+    fd_rpc_reward_epoch_t const * rt = NULL; /* table holding this block's epoch rewards */
     for( ulong i=0UL; i<FD_RPC_REWARD_EPOCH_CNT; i++ ) {
       fd_rpc_reward_epoch_t const * t = &ctx->reward_epochs[ i ];
-      if( t->epoch!=ULONG_MAX && t->slot_lo<=slot && slot<=t->slot_hi ) epoch_rewards = 1;
+      if( t->epoch!=ULONG_MAX && t->slot_lo<=slot && slot<=t->slot_hi ) { epoch_rewards = 1; rt = t; }
     }
     /* The EpochRewards sysvar says which blocks of the current epoch
        paid epoch rewards: the one before distribution starts (vote
@@ -6666,7 +7705,31 @@ getBlock( fd_rpc_tile_t *         ctx,
         epoch_rewards = 1; /* cannot tell */
       }
     }
-    if( epoch_rewards || !meta->has_leader ) {
+    if( rt && !rt->incomplete && rt->ents && meta->has_leader ) {
+      /* An epoch reward block: the vote account burns and vote rewards
+         in the first one, a share of the stake rewards in each after. */
+      if( slot==rt->slot_lo && rt->num_partitions ) fd_http_server_printf( ctx->http, ",\"numRewardPartitions\":%lu", rt->num_partitions );
+      fd_http_server_printf( ctx->http, ",\"rewards\":[" );
+      ulong found = 0UL;
+      /* in Agave's order: vote account burns, vote rewards, stake rewards, then the block's fee */
+      static uint const kind_order[ 3 ] = { 3U, 0U, 1U };
+      for( ulong pass=0UL; pass<3UL; pass++ ) {
+        for( ulong j=0UL; j<FD_RPC_REWARD_ENT_CNT; j++ ) {
+          fd_rpc_reward_ent_t const * e = &rt->ents[ j ];
+          if( e->slot!=slot || e->kind!=kind_order[ pass ] ) continue;
+          FD_BASE58_ENCODE_32_BYTES( e->pubkey, rk_b58 );
+          fd_http_server_printf( ctx->http, "%s{\"commission\":null,\"lamports\":%s%lu,\"postBalance\":%lu,\"pubkey\":\"%s\",\"rewardType\":\"%s\"}",
+                                 found++ ? "," : "", e->kind==3U ? "-" : "", e->amount, e->post_balance, rk_b58, e->kind==3U ? "VATDebit" : e->kind==0U ? "Voting" : "Staking" );
+        }
+      }
+      for( ulong j=0UL; j<FD_RPC_FEE_REWARD_CNT; j++ ) {
+        if( ctx->fee_rewards[ j ].slot!=slot ) continue;
+        FD_BASE58_ENCODE_32_BYTES( ctx->fee_rewards[ j ].pubkey, fee_b58 );
+        fd_http_server_printf( ctx->http, "%s{\"commission\":null,\"lamports\":%lu,\"postBalance\":%lu,\"pubkey\":\"%s\",\"rewardType\":\"Fee\"}",
+                               found++ ? "," : "", ctx->fee_rewards[ j ].lamports, ctx->fee_rewards[ j ].post_balance, fee_b58 );
+      }
+      fd_http_server_printf( ctx->http, "]" );
+    } else if( epoch_rewards || !meta->has_leader ) {
       fd_http_server_printf( ctx->http, ",\"rewards\":null" );
     } else if( !meta->fee_reward ) {
       fd_http_server_printf( ctx->http, ",\"rewards\":[]" );
@@ -6830,15 +7893,26 @@ getSupply( fd_rpc_tile_t *         ctx,
   if( FD_UNLIKELY( !fd_rpc_cfg_bank( ctx, id_cstr, &params->v[ 0 ], &bank_idx, &response ) ) ) return response;
   bank_info_t const * info = &ctx->banks[ bank_idx ];
 
-  /* Total supply is the sum of every account's lamports.  Firedancer
-     has no list of non-circulating accounts (Agave's is a hard-coded
-     mainnet list plus locked stake), so all of it is reported as
-     circulating. */
+  /* Total supply is the sum of every account's lamports.  The
+     non-circulating part follows Agave: its fixed list of accounts plus
+     locked or foundation-controlled stake accounts. */
+  fd_rpc_val_t v[1];
+  int exclude = fd_rpc_cfg_member( &params->v[ 0 ], "excludeNonCirculatingAccountsList", v ) && v->kind==FD_RPC_VAL_BOOL && v->raw_sz==4UL;
   static fd_rpc_largest_t l[1];
   memset( l, 0, sizeof(l) );
+  l->fork_id    = info->accdb_fork_id;
+  l->print_list = !exclude;
+  fd_rpc_largest_clock( ctx, info, l );
+  fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"result\":{\"context\":{\"apiVersion\":\"%s\",\"slot\":%lu},\"value\":{\"nonCirculatingAccounts\":[", FD_RPC_AGAVE_API_VERSION, info->slot );
+  if( !exclude ) {
+    for( ulong i=0UL; i<FD_RPC_NONCIRC_ACCOUNTS_CNT; i++ ) {
+      FD_BASE58_ENCODE_32_BYTES( fd_rpc_noncirc_accounts[ i ], key_b58 );
+      fd_http_server_printf( ctx->http, "%s\"%s\"", l->printed++ ? "," : "", key_b58 );
+    }
+  }
   fd_rpc_scan( ctx, info, NULL, 0UL, 0, fd_rpc_largest_visit, l );
-  return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"result\":{\"context\":{\"apiVersion\":\"%s\",\"slot\":%lu},\"value\":{\"circulating\":%lu,\"nonCirculating\":0,\"nonCirculatingAccounts\":[],\"total\":%lu}},\"id\":%s}\n",
-                      FD_RPC_AGAVE_API_VERSION, info->slot, l->total, l->total, id_cstr );
+  fd_http_server_printf( ctx->http, "],\"circulating\":%lu,\"nonCirculating\":%lu,\"total\":%lu}},\"id\":%s}\n", l->total-l->noncirc, l->noncirc, l->total, id_cstr );
+  return STAGE_JSON( ctx );
 }
 /* Reads a mint and returns its decimals and supply.  Returns 0 if the
    account is not a token mint. */
@@ -6857,6 +7931,7 @@ fd_rpc_read_mint( fd_rpc_tile_t *     ctx,
   if( FD_UNLIKELY( data_len>FD_RPC_TOKEN_ACCOUNT_MIN_SZ && ctx->scratch.accdb_data_buf[ FD_RPC_TOKEN_ACCOUNT_MIN_SZ ]!=1 ) ) return 0;
   *supply   = FD_LOAD( ulong, ctx->scratch.accdb_data_buf+36UL );
   *decimals = ctx->scratch.accdb_data_buf[ 44UL ];
+  fd_rpc_ui_interest_load( ctx, info->accdb_fork_id, ctx->scratch.accdb_data_buf, data_len );
   return 1;
 }
 
@@ -6888,6 +7963,7 @@ getTokenAccountBalance( fd_rpc_tile_t *         ctx,
 
   fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"result\":{\"context\":{\"apiVersion\":\"%s\",\"slot\":%lu},\"value\":", FD_RPC_AGAVE_API_VERSION, info->slot );
   fd_rpc_print_ui_amount( ctx, amount, decimals );
+  fd_rpc_ui_interest.on = 0;
   fd_http_server_printf( ctx->http, "},\"id\":%s}\n", id_cstr );
   return STAGE_JSON( ctx );
 }
@@ -6937,6 +8013,7 @@ getTokenLargestAccounts( fd_rpc_tile_t *         ctx,
     fd_rpc_print_ui_amount_fields( ctx, l->e[ i ].amount, decimals );
     fd_http_server_printf( ctx->http, "}" );
   }
+  fd_rpc_ui_interest.on = 0;
   fd_http_server_printf( ctx->http, "]},\"id\":%s}\n", id_cstr );
   return STAGE_JSON( ctx );
 }
@@ -6957,6 +8034,7 @@ getTokenSupply( fd_rpc_tile_t *         ctx,
 
   fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"result\":{\"context\":{\"apiVersion\":\"%s\",\"slot\":%lu},\"value\":", FD_RPC_AGAVE_API_VERSION, info->slot );
   fd_rpc_print_ui_amount( ctx, supply, decimals );
+  fd_rpc_ui_interest.on = 0;
   fd_http_server_printf( ctx->http, "},\"id\":%s}\n", id_cstr );
   return STAGE_JSON( ctx );
 }
@@ -7121,6 +8199,309 @@ accountSubscribe( fd_rpc_tile_t *         ctx,
   return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"result\":%lu,\"id\":%s}\n", sub_id, id_cstr );
 }
 
+static void
+fd_rpc_ws_logs_check( fd_rpc_tile_t * ctx ) {
+  if( FD_UNLIKELY( ctx->processed_idx==ULONG_MAX || ctx->confirmed_idx==ULONG_MAX || ctx->finalized_idx==ULONG_MAX ) ) return;
+  bank_info_t const * tip = &ctx->banks[ ctx->processed_idx ];
+  ulong next_slot;
+  if( FD_UNLIKELY( !fd_rpc_slot_history_load( ctx, tip, &next_slot ) ) ) return;
+  ulong level_slot[ 3 ] = { tip->slot, ctx->banks[ ctx->confirmed_idx ].slot, ctx->banks[ ctx->finalized_idx ].slot };
+  for( ulong i=0UL; i<FD_RPC_WS_LOGS_SUB_MAX; i++ ) {
+    if( !ctx->ws_logs_subs[ i ].sub_id ) continue;
+    ulong ws_conn_id = ctx->ws_logs_subs[ i ].ws_conn_id;
+    ulong seq        = ctx->ws_logs_subs[ i ].seq;
+    /* records the window has already dropped are gone */
+    if( seq+FD_RPC_TXN_REC_CNT<ctx->txn_rec_next ) seq = ctx->txn_rec_next-FD_RPC_TXN_REC_CNT;
+    int dead = 0;
+    for( ; seq<ctx->txn_rec_next && !dead; seq++ ) {
+      fd_rpc_txn_rec_t const * rec = &ctx->txn_recs[ seq % FD_RPC_TXN_REC_CNT ];
+      if( rec->slot>level_slot[ ctx->ws_logs_subs[ i ].level ] ) break; /* not there yet: look again next time */
+      /* only a block on this node's fork counts */
+      if( rec->slot!=tip->slot && !fd_rpc_slot_history_has( ctx, next_slot, rec->slot ) ) continue;
+      fd_rpc_meta_ent_t const * meta = fd_rpc_meta_query( ctx, rec->sig );
+      /* the logs travel on another link and may be a moment behind */
+      if( !meta && rec->slot==tip->slot ) break;
+
+      uchar txn_buf[ FD_TXN_MAX_SZ ] __attribute__((aligned(alignof(fd_txn_t))));
+      if( FD_UNLIKELY( !fd_txn_parse( rec->payload, rec->payload_sz, txn_buf, NULL ) ) ) continue;
+      fd_txn_t const * txn   = (fd_txn_t const *)txn_buf;
+      uchar const *    accts = rec->payload+txn->acct_addr_off;
+      int match = 1;
+      if( ctx->ws_logs_subs[ i ].filter==0 ) {
+        for( ulong k=0UL; k<txn->instr_cnt && match; k++ ) match = memcmp( accts+32UL*(ulong)txn->instr[ k ].program_id, fd_solana_vote_program_id.uc, 32UL )!=0;
+      } else if( ctx->ws_logs_subs[ i ].filter==2 ) {
+        match = 0;
+        for( ulong k=0UL; k<txn->acct_addr_cnt && !match; k++ ) match = !memcmp( accts+32UL*k, ctx->ws_logs_subs[ i ].mention, 32UL );
+      }
+      if( !match ) continue;
+
+      FD_BASE58_ENCODE_64_BYTES( rec->sig, sig_b58 );
+      fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"method\":\"logsNotification\",\"params\":{\"result\":{\"context\":{\"slot\":%lu},\"value\":{\"signature\":\"%s\",\"err\":", rec->slot, sig_b58 );
+      if( !rec->txn_err ) fd_http_server_printf( ctx->http, "null" );
+      else                fd_rpc_print_rec_err( ctx, rec );
+      fd_http_server_printf( ctx->http, ",\"logs\":[" );
+      if( meta ) {
+        uchar const * log = (uchar const *)( meta+1 )+meta->inner_sz;
+        ulong off = 0UL, logs = 0UL;
+        while( off+2UL<=meta->log_sz ) {
+          ulong len = (ulong)( log[ off+1UL ] & 0x7F );
+          ulong hdr = 2UL;
+          if( log[ off+1UL ] & 0x80 ) { if( off+3UL>meta->log_sz ) break; len |= (ulong)log[ off+2UL ]<<7; hdr = 3UL; }
+          if( off+hdr+len>meta->log_sz ) break;
+          fd_http_server_printf( ctx->http, "%s\"", logs++ ? "," : "" );
+          fd_rpc_print_json_text( ctx, log+off+hdr, len );
+          fd_http_server_printf( ctx->http, "\"" );
+          off += hdr+len;
+        }
+      }
+      fd_http_server_printf( ctx->http, "]}},\"subscription\":%lu}}\n", ctx->ws_logs_subs[ i ].sub_id-1UL );
+      if( FD_UNLIKELY( fd_http_server_ws_send( ctx->http, ws_conn_id ) ) ) dead = 1;
+    }
+    if( FD_UNLIKELY( dead ) ) {
+      /* closing the connection clears every subscription it holds */
+      fd_http_server_ws_close( ctx->http, ws_conn_id, FD_HTTP_SERVER_CONNECTION_CLOSE_TOO_SLOW );
+      continue;
+    }
+    if( ctx->ws_logs_subs[ i ].sub_id ) ctx->ws_logs_subs[ i ].seq = seq;
+  }
+}
+
+static fd_http_server_response_t
+rootSubscribe( fd_rpc_tile_t *         ctx,
+               char const *            id_cstr,
+               fd_rpc_params_t const * params,
+               ulong                   ws_conn_id ) {
+  fd_http_server_response_t response;
+  if( FD_UNLIKELY( !fd_rpc_validate_params( ctx, id_cstr, params, 0, 0, &response ) ) ) return response;
+  if( FD_UNLIKELY( ws_conn_id==ULONG_MAX ) ) return fd_rpc_err_msg( ctx, id_cstr, -32601, "Method not found" );
+  FD_CHECK_CRIT( ws_conn_id < ctx->http->max_ws_conns, "OOB ws_conn_id" );
+  ulong pick = 0UL;
+  for( ulong i=0UL; i<FD_RPC_WS_ROOT_SUB_MAX; i++ ) {
+    if( !ctx->ws_root_subs[ i ].sub_id ) { pick = i; break; }
+    if( ctx->ws_root_subs[ i ].sub_id<ctx->ws_root_subs[ pick ].sub_id ) pick = i;
+  }
+  if( !ctx->ws_root_subs[ pick ].sub_id ) ctx->ws_root_sub_cnt++;
+  ulong sub_id = ctx->ws_sub_id_next++;
+  ctx->ws_root_subs[ pick ].sub_id     = sub_id+1UL;
+  ctx->ws_root_subs[ pick ].ws_conn_id = ws_conn_id;
+  return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"result\":%lu,\"id\":%s}\n", sub_id, id_cstr );
+}
+
+/* logsSubscribe: "all", "allWithVotes" or { "mentions": [ <one address> ] }.
+   A mention matches the addresses written in the transaction itself,
+   not ones it reaches through an address lookup table. */
+static fd_http_server_response_t
+logsSubscribe( fd_rpc_tile_t *         ctx,
+               char const *            id_cstr,
+               fd_rpc_params_t const * params,
+               ulong                   ws_conn_id ) {
+  fd_http_server_response_t response;
+  if( FD_UNLIKELY( !fd_rpc_validate_params( ctx, id_cstr, params, 1, 2, &response ) ) ) return response;
+  if( FD_UNLIKELY( ws_conn_id==ULONG_MAX ) ) return fd_rpc_err_msg( ctx, id_cstr, -32601, "Method not found" );
+  FD_CHECK_CRIT( ws_conn_id < ctx->http->max_ws_conns, "OOB ws_conn_id" );
+
+  int   filter = 0;
+  uchar mention[ 32 ] = {0};
+  fd_rpc_val_t const * f = &params->v[ 0 ];
+  fd_rpc_val_t m[1];
+  if( f->kind==FD_RPC_VAL_STR && fd_jtok_str_eq( &f->str, "all" ) ) filter = 0;
+  else if( f->kind==FD_RPC_VAL_STR && fd_jtok_str_eq( &f->str, "allWithVotes" ) ) filter = 1;
+  else if( f->kind==FD_RPC_VAL_MAP && fd_rpc_cfg_member( f, "mentions", m ) && m->kind==FD_RPC_VAL_SEQ ) {
+    fd_jtok_t j[1]; ulong n = 0UL;
+    fd_jtok_arr_enter( fd_jtok_init( j, m->raw, m->raw_sz ) );
+    while( fd_jtok_arr_next( j ) ) {
+      fd_rpc_val_t a[1]; fd_rpc_val_read( j, a );
+      char key_cstr[ 64 ];
+      if( FD_UNLIKELY( ++n>1UL ) ) return fd_rpc_err_msg( ctx, id_cstr, -32602, "Invalid Request: Only 1 address supported" );
+      if( FD_UNLIKELY( !fd_rpc_val_cstr( a, key_cstr, sizeof(key_cstr) ) || !fd_base58_decode_32( key_cstr, mention ) ) ) return fd_rpc_err_msg( ctx, id_cstr, -32602, "Invalid Request: Invalid pubkey provided" );
+    }
+    if( FD_UNLIKELY( n!=1UL ) ) return fd_rpc_err_msg( ctx, id_cstr, -32602, "Invalid Request: Only 1 address supported" );
+    filter = 2;
+  } else {
+    return fd_rpc_err_msg( ctx, id_cstr, -32602, "Invalid params: unknown variant, expected one of `all`, `allWithVotes`, `mentions`." );
+  }
+  int level = 2;
+  fd_rpc_val_t cv[1];
+  if( fd_rpc_cfg_member( &params->v[ 1 ], "commitment", cv ) ) {
+    char c[ 16 ];
+    if( FD_LIKELY( fd_rpc_val_cstr( cv, c, sizeof(c) ) ) ) level = !strcmp( c, "processed" ) ? 0 : !strcmp( c, "confirmed" ) ? 1 : 2;
+  }
+
+  ulong pick = 0UL;
+  for( ulong i=0UL; i<FD_RPC_WS_LOGS_SUB_MAX; i++ ) {
+    if( !ctx->ws_logs_subs[ i ].sub_id ) { pick = i; break; }
+    if( ctx->ws_logs_subs[ i ].sub_id<ctx->ws_logs_subs[ pick ].sub_id ) pick = i;
+  }
+  if( !ctx->ws_logs_subs[ pick ].sub_id ) ctx->ws_logs_sub_cnt++;
+  ulong sub_id = ctx->ws_sub_id_next++;
+  ctx->ws_logs_subs[ pick ].sub_id     = sub_id+1UL;
+  ctx->ws_logs_subs[ pick ].ws_conn_id = ws_conn_id;
+  ctx->ws_logs_subs[ pick ].level      = level;
+  ctx->ws_logs_subs[ pick ].filter     = filter;
+  ctx->ws_logs_subs[ pick ].seq        = ctx->txn_rec_next; /* only what arrives from now on */
+  memcpy( ctx->ws_logs_subs[ pick ].mention, mention, 32UL );
+  return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"result\":%lu,\"id\":%s}\n", sub_id, id_cstr );
+}
+
+static void
+fd_rpc_ws_prog_check( fd_rpc_tile_t * ctx ) {
+  if( FD_UNLIKELY( ctx->processed_idx==ULONG_MAX || ctx->confirmed_idx==ULONG_MAX || ctx->finalized_idx==ULONG_MAX ) ) return;
+  bank_info_t const * tip = &ctx->banks[ ctx->processed_idx ];
+  ulong next_slot;
+  if( FD_UNLIKELY( !fd_rpc_slot_history_load( ctx, tip, &next_slot ) ) ) return;
+  ulong level_idx[ 3 ] = { ctx->processed_idx, ctx->confirmed_idx, ctx->finalized_idx };
+  for( ulong i=0UL; i<FD_RPC_WS_PROG_SUB_MAX; i++ ) {
+    if( !ctx->ws_prog_subs[ i ].sub_id ) continue;
+    bank_info_t const * info = &ctx->banks[ level_idx[ ctx->ws_prog_subs[ i ].level ] ];
+    ulong ws_conn_id = ctx->ws_prog_subs[ i ].ws_conn_id;
+    ulong seq        = ctx->ws_prog_subs[ i ].seq;
+    if( seq+FD_RPC_TXN_REC_CNT<ctx->txn_rec_next ) seq = ctx->txn_rec_next-FD_RPC_TXN_REC_CNT;
+    /* an account written several times in one block is reported once */
+#   define FD_RPC_WS_PROG_SEEN_MAX (128UL)
+    static struct { ulong slot; uchar key[ 32 ]; } seen[ FD_RPC_WS_PROG_SEEN_MAX ];
+    ulong seen_cnt = 0UL;
+    int dead = 0;
+    for( ; seq<ctx->txn_rec_next && !dead; seq++ ) {
+      fd_rpc_txn_rec_t const * rec = &ctx->txn_recs[ seq % FD_RPC_TXN_REC_CNT ];
+      if( rec->slot>info->slot ) break; /* not there yet: look again next time */
+      if( rec->slot!=tip->slot && !fd_rpc_slot_history_has( ctx, next_slot, rec->slot ) ) continue;
+
+      uchar txn_buf[ FD_TXN_MAX_SZ ] __attribute__((aligned(alignof(fd_txn_t))));
+      if( FD_UNLIKELY( !fd_txn_parse( rec->payload, rec->payload_sz, txn_buf, NULL ) ) ) continue;
+      fd_txn_t const * txn = (fd_txn_t const *)txn_buf;
+      uchar const *    p   = rec->payload;
+
+      /* every address the transaction could have written; a failed
+         transaction only charges its fee payer */
+      static uchar cand[ 256 ][ 32 ];
+      ulong cand_cnt = 0UL;
+      for( ulong k=0UL; k<txn->acct_addr_cnt && cand_cnt<256UL; k++ ) {
+        if( !fd_txn_is_writable( txn, (ushort)k ) ) continue;
+        if( rec->txn_err && k ) break;
+        memcpy( cand[ cand_cnt++ ], p+txn->acct_addr_off+32UL*k, 32UL );
+      }
+      if( !rec->txn_err && txn->addr_table_lookup_cnt ) {
+        fd_txn_acct_addr_lut_t const * luts = fd_txn_get_address_tables_const( txn );
+        for( ulong t=0UL; t<txn->addr_table_lookup_cnt; t++ ) {
+          ulong lamports; int executable; uchar owner[ 32UL ]; ulong data_len;
+          fd_accdb_read_one_nocache( ctx->accdb, info->accdb_fork_id, p+luts[ t ].addr_off, &lamports, &executable, owner, ctx->scratch.accdb_data_buf, &data_len );
+          if( FD_UNLIKELY( !lamports || data_len<56UL ) ) continue;
+          uchar const * idxs = p+luts[ t ].writable_off;
+          for( ulong k=0UL; k<luts[ t ].writable_cnt && cand_cnt<256UL; k++ ) {
+            ulong off = 56UL+32UL*(ulong)idxs[ k ];
+            if( FD_UNLIKELY( off+32UL>data_len ) ) continue;
+            memcpy( cand[ cand_cnt++ ], ctx->scratch.accdb_data_buf+off, 32UL );
+          }
+        }
+      }
+
+      for( ulong c=0UL; c<cand_cnt && !dead; c++ ) {
+        int dup = 0;
+        for( ulong k=0UL; k<seen_cnt && !dup; k++ ) dup = seen[ k ].slot==rec->slot && !memcmp( seen[ k ].key, cand[ c ], 32UL );
+        if( dup ) continue;
+        ulong lamports; int executable; uchar owner[ 32UL ]; ulong data_len;
+        fd_accdb_read_one_nocache( ctx->accdb, info->accdb_fork_id, cand[ c ], &lamports, &executable, owner, ctx->scratch.accdb_data_buf, &data_len );
+        if( !lamports ) continue;
+        if( memcmp( owner, ctx->ws_prog_subs[ i ].program, 32UL ) ) continue;
+        if( !fd_rpc_gpa_match( ctx->ws_prog_subs[ i ].filters, ctx->ws_prog_subs[ i ].filter_cnt, ctx->scratch.accdb_data_buf, data_len ) ) continue;
+        if( seen_cnt<FD_RPC_WS_PROG_SEEN_MAX ) { seen[ seen_cnt ].slot = rec->slot; memcpy( seen[ seen_cnt ].key, cand[ c ], 32UL ); seen_cnt++; }
+
+        FD_BASE58_ENCODE_32_BYTES( cand[ c ], key_b58 );
+        fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"method\":\"programNotification\",\"params\":{\"result\":{\"context\":{\"slot\":%lu},\"value\":{\"pubkey\":\"%s\",\"account\":", rec->slot, key_b58 );
+        fd_http_server_response_t err_response;
+        ctx->encode_key = cand[ c ];
+        int encoded = fd_rpc_encode_account_data( ctx, ctx->scratch.accdb_data_buf, data_len, owner, lamports, executable, ctx->ws_prog_subs[ i ].encoding, 0UL, ULONG_MAX, "null", &err_response );
+        ctx->encode_key = NULL;
+        if( FD_UNLIKELY( !encoded ) ) { fd_http_server_unstage( ctx->http ); continue; } /* e.g. too large for base58 */
+        fd_http_server_printf( ctx->http, "}},\"subscription\":%lu}}\n", ctx->ws_prog_subs[ i ].sub_id-1UL );
+        if( FD_UNLIKELY( fd_http_server_ws_send( ctx->http, ws_conn_id ) ) ) dead = 1;
+      }
+    }
+    if( FD_UNLIKELY( dead ) ) {
+      /* closing the connection clears every subscription it holds */
+      fd_http_server_ws_close( ctx->http, ws_conn_id, FD_HTTP_SERVER_CONNECTION_CLOSE_TOO_SLOW );
+      continue;
+    }
+    if( ctx->ws_prog_subs[ i ].sub_id ) ctx->ws_prog_subs[ i ].seq = seq;
+  }
+}
+
+static fd_http_server_response_t
+slotsUpdatesSubscribe( fd_rpc_tile_t *         ctx,
+                       char const *            id_cstr,
+                       fd_rpc_params_t const * params,
+                       ulong                   ws_conn_id ) {
+  fd_http_server_response_t response;
+  if( FD_UNLIKELY( !fd_rpc_validate_params( ctx, id_cstr, params, 0, 0, &response ) ) ) return response;
+  if( FD_UNLIKELY( ws_conn_id==ULONG_MAX ) ) return fd_rpc_err_msg( ctx, id_cstr, -32601, "Method not found" );
+  FD_CHECK_CRIT( ws_conn_id < ctx->http->max_ws_conns, "OOB ws_conn_id" );
+  ulong pick = 0UL;
+  for( ulong i=0UL; i<FD_RPC_WS_SUPD_SUB_MAX; i++ ) {
+    if( !ctx->ws_supd_subs[ i ].sub_id ) { pick = i; break; }
+    if( ctx->ws_supd_subs[ i ].sub_id<ctx->ws_supd_subs[ pick ].sub_id ) pick = i;
+  }
+  if( !ctx->ws_supd_subs[ pick ].sub_id ) ctx->ws_supd_sub_cnt++;
+  ulong sub_id = ctx->ws_sub_id_next++;
+  ctx->ws_supd_subs[ pick ].sub_id     = sub_id+1UL;
+  ctx->ws_supd_subs[ pick ].ws_conn_id = ws_conn_id;
+  return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"result\":%lu,\"id\":%s}\n", sub_id, id_cstr );
+}
+
+/* programSubscribe: accounts owned by a program, with the same filters
+   as getProgramAccounts. */
+static fd_http_server_response_t
+programSubscribe( fd_rpc_tile_t *         ctx,
+                  char const *            id_cstr,
+                  fd_rpc_params_t const * params,
+                  ulong                   ws_conn_id ) {
+  fd_http_server_response_t response;
+  if( FD_UNLIKELY( !fd_rpc_validate_params( ctx, id_cstr, params, 1, 2, &response ) ) ) return response;
+  if( FD_UNLIKELY( ws_conn_id==ULONG_MAX ) ) return fd_rpc_err_msg( ctx, id_cstr, -32601, "Method not found" );
+  FD_CHECK_CRIT( ws_conn_id < ctx->http->max_ws_conns, "OOB ws_conn_id" );
+
+  fd_pubkey_t program;
+  if( FD_UNLIKELY( !fd_rpc_validate_address( ctx, id_cstr, &params->v[ 0 ], &program, &response ) ) ) return response;
+
+  int  level = 2;
+  char encoding[ 16 ] = "binary";
+  fd_rpc_val_t cv[1];
+  if( fd_rpc_cfg_member( &params->v[ 1 ], "commitment", cv ) ) {
+    char c[ 16 ];
+    if( FD_LIKELY( fd_rpc_val_cstr( cv, c, sizeof(c) ) ) ) level = !strcmp( c, "processed" ) ? 0 : !strcmp( c, "confirmed" ) ? 1 : 2;
+  }
+  if( fd_rpc_cfg_member( &params->v[ 1 ], "encoding", cv ) ) {
+    char e[ 16 ];
+    if( FD_UNLIKELY( !fd_rpc_val_cstr( cv, e, sizeof(e) ) ||
+                     ( strcmp( e, "binary" ) && strcmp( e, "base58" ) && strcmp( e, "base64" ) && strcmp( e, "base64+zstd" ) && strcmp( e, "jsonParsed" ) ) ) ) {
+      fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32602,\"message\":\"Invalid params: unknown variant `" );
+      if( cv->kind==FD_RPC_VAL_STR ) fd_rpc_print_str( ctx, &cv->str );
+      fd_http_server_printf( ctx->http, "`, expected one of `binary`, `base58`, `base64`, `jsonParsed`, `base64+zstd`.\"},\"id\":%s}\n", id_cstr );
+      return STAGE_JSON( ctx );
+    }
+    strcpy( encoding, e );
+  }
+  static fd_rpc_gpa_arg_t arg[1];
+  memset( arg, 0, sizeof(arg) );
+  if( FD_UNLIKELY( !fd_rpc_gpa_filters_read( ctx, id_cstr, &params->v[ 1 ], arg, &response ) ) ) return response;
+
+  ulong pick = 0UL;
+  for( ulong i=0UL; i<FD_RPC_WS_PROG_SUB_MAX; i++ ) {
+    if( !ctx->ws_prog_subs[ i ].sub_id ) { pick = i; break; }
+    if( ctx->ws_prog_subs[ i ].sub_id<ctx->ws_prog_subs[ pick ].sub_id ) pick = i;
+  }
+  if( !ctx->ws_prog_subs[ pick ].sub_id ) ctx->ws_prog_sub_cnt++;
+  ulong sub_id = ctx->ws_sub_id_next++;
+  ctx->ws_prog_subs[ pick ].sub_id     = sub_id+1UL;
+  ctx->ws_prog_subs[ pick ].ws_conn_id = ws_conn_id;
+  ctx->ws_prog_subs[ pick ].level      = level;
+  ctx->ws_prog_subs[ pick ].seq        = ctx->txn_rec_next; /* only what arrives from now on */
+  ctx->ws_prog_subs[ pick ].filter_cnt = arg->filter_cnt;
+  memcpy( ctx->ws_prog_subs[ pick ].filters, arg->filters, sizeof(arg->filters) );
+  memcpy( ctx->ws_prog_subs[ pick ].program, program.uc, 32UL );
+  strcpy( ctx->ws_prog_subs[ pick ].encoding, encoding );
+  return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"result\":%lu,\"id\":%s}\n", sub_id, id_cstr );
+}
+
 static fd_http_server_response_t
 signatureSubscribe( fd_rpc_tile_t *         ctx,
                     char const *            id_cstr,
@@ -7156,6 +8537,7 @@ signatureSubscribe( fd_rpc_tile_t *         ctx,
   ctx->ws_sig_subs[ pick ].sub_id     = sub_id+1UL;
   ctx->ws_sig_subs[ pick ].ws_conn_id = ws_conn_id;
   ctx->ws_sig_subs[ pick ].level      = level;
+  ctx->ws_sig_subs[ pick ].recv       = fd_rpc_cfg_member( &params->v[ 1 ], "enableReceivedNotification", cv ) && cv->kind==FD_RPC_VAL_BOOL && cv->raw_sz==4UL;
   memcpy( ctx->ws_sig_subs[ pick ].sig, sig, 64UL );
   /* A transaction that is already there is notified on the next slot,
      after this reply. */
@@ -7311,7 +8693,8 @@ static int
 fd_rpc_vote_stakes_refresh( fd_rpc_tile_t *     ctx,
                             bank_info_t const * bank ) {
   long now = fd_log_wallclock();
-  if( FD_LIKELY( ctx->vote_stake_valid && ctx->vote_stake_epoch==bank->epoch &&
+  int new_vote_txn = ctx->vote_stake_dirty_slot && bank->slot>=ctx->vote_stake_dirty_slot && ctx->vote_stake_slot<ctx->vote_stake_dirty_slot;
+  if( FD_LIKELY( ctx->vote_stake_valid && ctx->vote_stake_epoch==bank->epoch && !new_vote_txn &&
                  now-ctx->vote_stake_ts < ( ctx->vote_stake_rewards_active ? 30L : 600L )*1000000000L ) ) return 1;
   if( FD_UNLIKELY( !ctx->has_features || !ctx->has_epoch_schedule ) ) return 0;
 
@@ -7397,6 +8780,7 @@ fd_rpc_vote_stakes_refresh( fd_rpc_tile_t *     ctx,
 
   ctx->vote_stake_cnt            = vote_cnt;
   ctx->vote_stake_epoch          = bank->epoch;
+  ctx->vote_stake_slot           = bank->slot;
   ctx->vote_stake_ts             = now;
   ctx->vote_stake_rewards_active = active;
   ctx->vote_stake_valid          = 1;
@@ -7558,13 +8942,30 @@ minimumLedgerSlot( fd_rpc_tile_t *         ctx,
                    fd_rpc_params_t const * params ) {
   return fd_rpc_first_slot( ctx, id_cstr, params );
 }
-UNIMPLEMENTED(requestAirdrop)
-/* sendTransaction checks what it can without executing the transaction
-   (well formed, signatures valid and, unless skipPreflight, a recent
-   blockhash), then sends it to the upcoming leaders over UDP and keeps
-   resending it each leader rotation until it lands or expires.  There
-   is no simulation: a transaction that would fail on chain is still
-   sent, and lands as a failed transaction. */
+/* No faucet here.  Agave without a faucet answers the same way. */
+static fd_http_server_response_t
+requestAirdrop( fd_rpc_tile_t *         ctx,
+                char const *            id_cstr,
+                fd_rpc_params_t const * params ) {
+  fd_http_server_response_t response;
+  if( FD_UNLIKELY( !fd_rpc_validate_params( ctx, id_cstr, params, 2, 3, &response ) ) ) return response;
+  return fd_rpc_err_msg( ctx, id_cstr, -32600, "Invalid request" );
+}
+/* sendTransaction checks that the transaction is well formed and its
+   signatures valid.  Unless skipPreflight is set it also checks for a
+   recent blockhash, refuses a transaction that has already landed and
+   simulates it, refusing one that would fail, as Agave does.  It then
+   sends it to the upcoming leaders over UDP and keeps resending it
+   each leader rotation until it lands or expires. */
+static int
+fd_rpc_send_preflight( fd_rpc_tile_t *             ctx,
+                       char const *                id_cstr,
+                       fd_rpc_val_t const *        config,
+                       uchar *                     payload,
+                       ulong                       payload_sz,
+                       fd_txn_t const *            txn,
+                       fd_http_server_response_t * res );
+
 static fd_http_server_response_t
 sendTransaction( fd_rpc_tile_t *         ctx,
                  char const *            id_cstr,
@@ -7608,6 +9009,8 @@ sendTransaction( fd_rpc_tile_t *         ctx,
   ulong         msg_sz = fd_txn_msg_sz( txn, payload_sz );
   for( ulong i=0UL; i<txn->signature_cnt; i++ ) {
     if( FD_UNLIKELY( FD_ED25519_SUCCESS!=fd_ed25519_verify( msg, msg_sz, sigs+64UL*i, accts+32UL*i, ctx->sha ) ) ) {
+      /* Agave finds this in its preflight simulation */
+      if( !skip_preflight ) return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32002,\"message\":\"Transaction simulation failed: Transaction did not pass signature verification\",\"data\":{\"accounts\":null,\"err\":\"SignatureFailure\",\"fee\":null,\"innerInstructions\":null,\"loadedAccountsDataSize\":0,\"loadedAddresses\":null,\"logs\":[],\"postBalances\":null,\"postTokenBalances\":null,\"preBalances\":null,\"preTokenBalances\":null,\"replacementBlockhash\":null,\"returnData\":null,\"unitsConsumed\":0}},\"id\":%s}\n", id_cstr );
       return fd_rpc_err_msg( ctx, id_cstr, -32003, "Transaction signature verification failure" );
     }
   }
@@ -7632,9 +9035,11 @@ sendTransaction( fd_rpc_tile_t *         ctx,
       }
     }
     if( FD_UNLIKELY( !valid ) ) {
-      return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32002,\"message\":\"Transaction simulation failed: Blockhash not found\",\"data\":{\"accounts\":null,\"err\":\"BlockhashNotFound\",\"innerInstructions\":null,\"logs\":[],\"returnData\":null,\"unitsConsumed\":0}},\"id\":%s}\n", id_cstr );
+      return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32002,\"message\":\"Transaction simulation failed: Blockhash not found\",\"data\":{\"accounts\":null,\"err\":\"BlockhashNotFound\",\"fee\":null,\"innerInstructions\":null,\"loadedAccountsDataSize\":0,\"loadedAddresses\":null,\"logs\":[],\"postBalances\":null,\"postTokenBalances\":null,\"preBalances\":null,\"preTokenBalances\":null,\"replacementBlockhash\":null,\"returnData\":null,\"unitsConsumed\":0}},\"id\":%s}\n", id_cstr );
     }
   }
+
+  if( !skip_preflight && FD_UNLIKELY( !fd_rpc_send_preflight( ctx, id_cstr, config, payload, payload_sz, txn, &response ) ) ) return response;
 
   fd_rpc_send_to_leaders( ctx, payload, payload_sz, tip->slot+1UL );
 
@@ -7818,6 +9223,105 @@ fd_rpc_print_exec_err( fd_rpc_tile_t * ctx,
   }
 }
 
+
+/* Agave's wording for the errors a preflight most often ends in */
+static void
+fd_rpc_sim_err_text( fd_rpc_sim_result_t const * r,
+                     char *                      out,
+                     ulong                       out_sz ) {
+  if( r->txn_err==FD_RUNTIME_TXN_ERR_INSTRUCTION_ERROR ) {
+    if( r->exec_err_kind==FD_EXECUTOR_ERR_KIND_INSTR && r->exec_err==FD_EXECUTOR_INSTR_ERR_CUSTOM_ERR ) {
+      snprintf( out, out_sz, "Error processing Instruction %u: custom program error: 0x%x", r->exec_err_idx, r->custom_err );
+      return;
+    }
+    char const * what = "Program failed to complete";
+    if( r->exec_err_kind==FD_EXECUTOR_ERR_KIND_INSTR ) {
+      switch( r->exec_err ) {
+        case FD_EXECUTOR_INSTR_ERR_GENERIC_ERR:            what = "generic instruction error";                     break;
+        case FD_EXECUTOR_INSTR_ERR_INVALID_ARG:            what = "invalid program argument";                      break;
+        case FD_EXECUTOR_INSTR_ERR_INVALID_INSTR_DATA:     what = "invalid instruction data";                      break;
+        case FD_EXECUTOR_INSTR_ERR_INVALID_ACC_DATA:       what = "invalid account data for instruction";          break;
+        case FD_EXECUTOR_INSTR_ERR_ACC_DATA_TOO_SMALL:     what = "account data too small for instruction";        break;
+        case FD_EXECUTOR_INSTR_ERR_INSUFFICIENT_FUNDS:     what = "insufficient funds for instruction";            break;
+        case FD_EXECUTOR_INSTR_ERR_INCORRECT_PROGRAM_ID:   what = "incorrect program id for instruction";          break;
+        case FD_EXECUTOR_INSTR_ERR_MISSING_REQUIRED_SIGNATURE: what = "missing required signature for instruction"; break;
+        case FD_EXECUTOR_INSTR_ERR_ACC_ALREADY_INITIALIZED: what = "instruction requires an uninitialized account"; break;
+        case FD_EXECUTOR_INSTR_ERR_UNINITIALIZED_ACCOUNT:  what = "instruction requires an initialized account";   break;
+        default:                                           what = fd_rpc_instr_err_name( r->exec_err );            break;
+      }
+    }
+    snprintf( out, out_sz, "Error processing Instruction %u: %s", r->exec_err_idx, what );
+    return;
+  }
+  char const * what;
+  switch( r->txn_err ) {
+    case FD_RUNTIME_TXN_ERR_ALREADY_PROCESSED:           what = "This transaction has already been processed"; break;
+    case FD_RUNTIME_TXN_ERR_BLOCKHASH_NOT_FOUND:         what = "Blockhash not found"; break;
+    case FD_RUNTIME_TXN_ERR_ACCOUNT_NOT_FOUND:           what = "Attempt to debit an account but found no record of a prior credit."; break;
+    case FD_RUNTIME_TXN_ERR_PROGRAM_ACCOUNT_NOT_FOUND:   what = "Attempt to load a program that does not exist"; break;
+    case FD_RUNTIME_TXN_ERR_INSUFFICIENT_FUNDS_FOR_FEE:  what = "Insufficient funds for fee"; break;
+    case FD_RUNTIME_TXN_ERR_INVALID_ACCOUNT_FOR_FEE:     what = "This account may not be used to pay transaction fees"; break;
+    default:                                             what = "the transaction failed"; break;
+  }
+  snprintf( out, out_sz, "%s", what );
+}
+
+static int
+fd_rpc_send_preflight( fd_rpc_tile_t *             ctx,
+                       char const *                id_cstr,
+                       fd_rpc_val_t const *        config,
+                       uchar *                     payload,
+                       ulong                       payload_sz,
+                       fd_txn_t const *            txn,
+                       fd_http_server_response_t * res ) {
+  /* Agave simulates on the bank named by preflightCommitment, finalized by default */
+  ulong bank_idx = ctx->finalized_idx;
+  fd_rpc_val_t v[1];
+  if( fd_rpc_cfg_member( config, "preflightCommitment", v ) && v->kind==FD_RPC_VAL_STR ) {
+    if(      fd_jtok_str_eq( &v->str, "processed" ) ) bank_idx = ctx->processed_idx;
+    else if( fd_jtok_str_eq( &v->str, "confirmed" ) ) bank_idx = ctx->confirmed_idx;
+  }
+  if( FD_UNLIKELY( bank_idx==ULONG_MAX ) ) return 1;
+  bank_info_t const * info = &ctx->banks[ bank_idx ];
+
+  ulong next_slot;
+  if( FD_LIKELY( fd_rpc_slot_history_load( ctx, info, &next_slot ) ) ) {
+    fd_rpc_txn_rec_t const * rec = fd_rpc_txn_query( ctx, payload+txn->signature_off, info, next_slot );
+    if( FD_UNLIKELY( rec && rec->slot<=info->slot ) ) {
+      *res = PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32002,\"message\":\"Transaction simulation failed: This transaction has already been processed\",\"data\":{\"accounts\":null,\"err\":\"AlreadyProcessed\",\"fee\":null,\"innerInstructions\":null,\"loadedAccountsDataSize\":0,\"loadedAddresses\":null,\"logs\":[],\"postBalances\":null,\"postTokenBalances\":null,\"preBalances\":null,\"preTokenBalances\":null,\"replacementBlockhash\":null,\"returnData\":null,\"unitsConsumed\":0}},\"id\":%s}\n", id_cstr );
+      return 0;
+    }
+  }
+
+  if( FD_UNLIKELY( !ctx->sim || !ctx->has_features || !ctx->has_epoch_schedule ) ) return 1; /* no simulator: send it as is */
+  fd_rpc_sim_prepare( ctx, info, payload, txn );
+  fd_rpc_sim_result_t r[1];
+  if( FD_UNLIKELY( !fd_rpc_sim_exec( ctx->sim, payload, payload_sz, r ) ) ) return 1;
+  if( FD_LIKELY( !r->txn_err ) ) { fd_rpc_sim_end( ctx->sim ); return 1; }
+
+  char text[ 160 ];
+  fd_rpc_sim_err_text( r, text, sizeof(text) );
+  fd_http_server_printf( ctx->http, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32002,\"message\":\"Transaction simulation failed: %s\",\"data\":{\"accounts\":null,\"err\":", text );
+  fd_rpc_print_sim_err( ctx, r );
+  if( r->fee_charged ) fd_http_server_printf( ctx->http, ",\"fee\":%lu", r->fee );
+  else                 fd_http_server_printf( ctx->http, ",\"fee\":null" );
+  fd_http_server_printf( ctx->http, ",\"innerInstructions\":null,\"loadedAccountsDataSize\":%lu,\"loadedAddresses\":null,\"logs\":[", r->loaded_accounts_data_size );
+  ulong off = 0UL, logs = 0UL;
+  while( off+2UL<=r->log_buf_sz ) {
+    ulong len = (ulong)( r->log_buf[ off+1UL ] & 0x7F );
+    ulong hdr = 2UL;
+    if( r->log_buf[ off+1UL ] & 0x80 ) { if( off+3UL>r->log_buf_sz ) break; len |= (ulong)r->log_buf[ off+2UL ]<<7; hdr = 3UL; }
+    if( off+hdr+len>r->log_buf_sz ) break;
+    fd_http_server_printf( ctx->http, "%s\"", logs++ ? "," : "" );
+    fd_rpc_print_json_text( ctx, r->log_buf+off+hdr, len );
+    fd_http_server_printf( ctx->http, "\"" );
+    off += hdr+len;
+  }
+  fd_http_server_printf( ctx->http, "],\"postBalances\":null,\"postTokenBalances\":null,\"preBalances\":null,\"preTokenBalances\":null,\"replacementBlockhash\":null,\"returnData\":null,\"unitsConsumed\":%lu}},\"id\":%s}\n", r->units_consumed, id_cstr );
+  fd_rpc_sim_end( ctx->sim );
+  *res = STAGE_JSON( ctx );
+  return 0;
+}
 static fd_http_server_response_t
 simulateTransaction( fd_rpc_tile_t *         ctx,
                      char const *            id_cstr,
@@ -7884,6 +9388,10 @@ simulateTransaction( fd_rpc_tile_t *         ctx,
   /* requested post-simulation accounts */
   fd_rpc_val_t accounts_cfg[1], addrs[1];
   int failed = 0; fd_http_server_response_t err_response;
+  /* accounts.encoding: base64 unless the caller asks for another */
+  char acct_enc[ 16 ] = "base64";
+  { fd_rpc_val_t ev[1], ac[1];
+    if( fd_rpc_cfg_member( config, "accounts", ac ) && ac->kind==FD_RPC_VAL_MAP && fd_rpc_cfg_member( ac, "encoding", ev ) && ev->kind==FD_RPC_VAL_STR ) fd_rpc_val_cstr( ev, acct_enc, sizeof(acct_enc) ); }
   if( fd_rpc_cfg_member( config, "accounts", accounts_cfg ) && accounts_cfg->kind==FD_RPC_VAL_MAP &&
       fd_rpc_cfg_member( accounts_cfg, "addresses", addrs ) && addrs->kind==FD_RPC_VAL_SEQ ) {
     {
@@ -7911,7 +9419,7 @@ simulateTransaction( fd_rpc_tile_t *         ctx,
         if( !fd_rpc_sim_account( ctx->sim, i, &pk, &lamports, &owner, &executable, &data, &data_len, &pre ) || memcmp( pk, key, 32UL ) ) continue;
         found = 1;
         if( !lamports ) { fd_http_server_printf( ctx->http, "null" ); break; }
-        if( FD_UNLIKELY( !fd_rpc_encode_account_data( ctx, data, data_len, owner, lamports, executable, "base64", 0UL, ULONG_MAX, id_cstr, &err_response ) ) ) failed = 1;
+        if( FD_UNLIKELY( !fd_rpc_encode_account_data( ctx, data, data_len, owner, lamports, executable, acct_enc, 0UL, ULONG_MAX, id_cstr, &err_response ) ) ) failed = 1;
       }
       if( failed ) break;
       if( !found && r->txn_err ) {
@@ -7921,7 +9429,7 @@ simulateTransaction( fd_rpc_tile_t *         ctx,
         ulong lamports; int executable; uchar owner[ 32UL ]; ulong data_len;
         fd_accdb_read_one_nocache( ctx->accdb, info->accdb_fork_id, key, &lamports, &executable, owner, ctx->scratch.accdb_data_buf, &data_len );
         if( !lamports ) fd_http_server_printf( ctx->http, "null" );
-        else if( FD_UNLIKELY( !fd_rpc_encode_account_data( ctx, ctx->scratch.accdb_data_buf, data_len, owner, lamports, executable, "base64", 0UL, ULONG_MAX, id_cstr, &err_response ) ) ) { failed = 1; break; }
+        else if( FD_UNLIKELY( !fd_rpc_encode_account_data( ctx, ctx->scratch.accdb_data_buf, data_len, owner, lamports, executable, acct_enc, 0UL, ULONG_MAX, id_cstr, &err_response ) ) ) { failed = 1; break; }
       }
     }
     if( !failed ) fd_http_server_printf( ctx->http, "]" );
@@ -8178,11 +9686,52 @@ rpc_json_request( fd_rpc_tile_t * ctx,
   int kind = fd_jtok_peek( j );
 
   if( FD_UNLIKELY( kind==FD_JTOK_ARR ) ) {
-    /* A bug in Agave ¯\_(ツ)_/¯ */
+    /* A batch: answer each call in order inside one array, as Agave
+       does.  Every staged piece lands right after the previous one in
+       the output ring, so the pieces together are one body.  A batch
+       inside a batch is not a call. */
+    fd_jtok_t chk[1];
+    fd_jtok_init( chk, body, body_len );
+    fd_rpc_val_t whole[1];
+    fd_rpc_val_read( chk, whole );
+    if( FD_UNLIKELY( fd_jtok_err( chk ) || fd_jtok_fini( chk ) ) ) {
+      FD_MCNT_INC( RPC, REQUEST_HANDLED_INVALID, 1UL );
+      return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32700,\"message\":\"Parse error\"},\"id\":null}\n" );
+    }
     fd_jtok_arr_enter( j );
-    if( FD_LIKELY( !fd_jtok_arr_next( j ) && !fd_jtok_fini( j ) ) ) return (fd_http_server_response_t){ .content_type = "application/json", .status = 200 };
-    FD_MCNT_INC( RPC, REQUEST_HANDLED_INVALID, 1UL );
-    return PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32700,\"message\":\"Parse error\"},\"id\":null}\n" );
+    fd_http_server_response_t all = PRINTF_JSON( ctx, "[" );
+    ulong cnt = 0UL;
+    int   bad = all.status!=200UL;
+    while( !bad && fd_jtok_arr_next( j ) ) {
+      int ekind = fd_jtok_peek( j );
+      fd_rpc_val_t elem[1];
+      fd_rpc_val_read( j, elem );
+      if( FD_UNLIKELY( fd_jtok_err( j ) ) ) { bad = 1; break; }
+      fd_http_server_response_t sep = {0};
+      if( cnt ) { sep = PRINTF_JSON( ctx, "," ); if( FD_UNLIKELY( sep.status!=200UL ) ) { bad = 1; break; } }
+      fd_http_server_response_t one;
+      if( FD_UNLIKELY( ekind!=FD_JTOK_OBJ ) ) one = PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32600,\"message\":\"Invalid request\"},\"id\":null}" );
+      else                                    one = rpc_json_request( ctx, (uchar const *)elem->raw, elem->raw_sz, ws_conn_id );
+      if( FD_UNLIKELY( one.status==501UL ) )  one = PRINTF_JSON( ctx, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32601,\"message\":\"Method not found\"},\"id\":null}" );
+      if( FD_UNLIKELY( one.status!=200UL || one.static_body ) ) { bad = 1; break; }
+      if( FD_UNLIKELY( !one._body_len ) ) {
+        /* a notification has no answer: take the separator back */
+        if( cnt ) { ctx->http->stage_off -= sep._body_len; all._body_len -= sep._body_len; }
+        continue;
+      }
+      all._body_len += sep._body_len + one._body_len;
+      cnt++;
+    }
+    if( FD_UNLIKELY( bad ) ) return (fd_http_server_response_t){ .content_type = "application/json", .status = 500 };
+    if( FD_UNLIKELY( !cnt ) ) {
+      /* nothing to answer (empty batch, or only notifications): Agave sends an empty body */
+      ctx->http->stage_off -= all._body_len;
+      return (fd_http_server_response_t){ .content_type = "application/json", .status = 200 };
+    }
+    fd_http_server_response_t end = PRINTF_JSON( ctx, "]\n" );
+    if( FD_UNLIKELY( end.status!=200UL ) ) return (fd_http_server_response_t){ .content_type = "application/json", .status = 500 };
+    all._body_len += end._body_len;
+    return all;
   }
 
   if( FD_UNLIKELY( kind!=FD_JTOK_OBJ ) ) {
@@ -8325,13 +9874,21 @@ rpc_json_request( fd_rpc_tile_t * ctx,
   else if( FD_LIKELY( !strcmp( method, "slotUnsubscribe"                   ) ) ) response = slotUnsubscribe( ctx, id_cstr, params, ws_conn_id );
   else if( FD_LIKELY( !strcmp( method, "signatureSubscribe"                ) ) ) response = signatureSubscribe( ctx, id_cstr, params, ws_conn_id );
   else if( FD_LIKELY( !strcmp( method, "accountSubscribe"                  ) ) ) response = accountSubscribe( ctx, id_cstr, params, ws_conn_id );
+  else if( FD_LIKELY( !strcmp( method, "rootSubscribe"                     ) ) ) response = rootSubscribe( ctx, id_cstr, params, ws_conn_id );
+  else if( FD_LIKELY( !strcmp( method, "rootUnsubscribe"                   ) ) ) response = slotUnsubscribe( ctx, id_cstr, params, ws_conn_id );
+  else if( FD_LIKELY( !strcmp( method, "logsSubscribe"                     ) ) ) response = logsSubscribe( ctx, id_cstr, params, ws_conn_id );
+  else if( FD_LIKELY( !strcmp( method, "logsUnsubscribe"                   ) ) ) response = slotUnsubscribe( ctx, id_cstr, params, ws_conn_id );
+  else if( FD_LIKELY( !strcmp( method, "slotsUpdatesSubscribe"             ) ) ) response = slotsUpdatesSubscribe( ctx, id_cstr, params, ws_conn_id );
+  else if( FD_LIKELY( !strcmp( method, "slotsUpdatesUnsubscribe"           ) ) ) response = slotUnsubscribe( ctx, id_cstr, params, ws_conn_id );
+  else if( FD_LIKELY( !strcmp( method, "programSubscribe"                  ) ) ) response = programSubscribe( ctx, id_cstr, params, ws_conn_id );
+  else if( FD_LIKELY( !strcmp( method, "programUnsubscribe"                ) ) ) response = slotUnsubscribe( ctx, id_cstr, params, ws_conn_id );
   else if( FD_LIKELY( !strcmp( method, "accountUnsubscribe"                ) ) ) response = slotUnsubscribe( ctx, id_cstr, params, ws_conn_id );
   else if( FD_LIKELY( !strcmp( method, "signatureUnsubscribe"              ) ) ) response = slotUnsubscribe( ctx, id_cstr, params, ws_conn_id );
   else if( FD_LIKELY( !strcmp( method, "voteSubscribe"                     ) ) ) response = voteSubscribe( ctx, id_cstr, params, ws_conn_id );
   else if( FD_LIKELY( !strcmp( method, "voteUnsubscribe"                   ) ) ) response = voteUnsubscribe( ctx, id_cstr, params, ws_conn_id );
   else if( FD_LIKELY( !strcmp( method, "isBlockhashValid"                  ) ) ) response = isBlockhashValid( ctx, id_cstr, params );
   else if( FD_LIKELY( !strcmp( method, "minimumLedgerSlot"                 ) ) ) response = minimumLedgerSlot( ctx, id_cstr, params );
-  else if( FD_LIKELY( !strcmp( method, "requestAirdrop"                    ) ) ) response = requestAirdrop( ctx, id_cstr, params );
+  else if( FD_LIKELY( !strcmp( method, "requestAirdrop"                    ) ) ) response = ws_conn_id==ULONG_MAX ? requestAirdrop( ctx, id_cstr, params ) : (fd_http_server_response_t){ .status = 501 };
   else if( FD_LIKELY( !strcmp( method, "sendTransaction"                   ) ) ) response = sendTransaction( ctx, id_cstr, params );
   else if( FD_LIKELY( !strcmp( method, "simulateTransaction"               ) ) ) response = simulateTransaction( ctx, id_cstr, params );
   else if( FD_LIKELY( !strcmp( method, "getAgGenesisCert"                  ) ) ) response = getAgGenesisCert( ctx, id_cstr, params );
@@ -8389,6 +9946,18 @@ rpc_ws_close( ulong  ws_conn_id,
   fd_rpc_ws_subscriber_slot_remove( ctx, ws_conn_id );
   for( ulong i=0UL; i<FD_RPC_WS_SIG_SUB_MAX; i++ ) {
     if( ctx->ws_sig_subs[ i ].sub_id && ctx->ws_sig_subs[ i ].ws_conn_id==ws_conn_id ) { ctx->ws_sig_subs[ i ].sub_id = 0UL; ctx->ws_sig_sub_cnt--; }
+  }
+  for( ulong i=0UL; i<FD_RPC_WS_ROOT_SUB_MAX; i++ ) {
+    if( ctx->ws_root_subs[ i ].sub_id && ctx->ws_root_subs[ i ].ws_conn_id==ws_conn_id ) { ctx->ws_root_subs[ i ].sub_id = 0UL; ctx->ws_root_sub_cnt--; }
+  }
+  for( ulong i=0UL; i<FD_RPC_WS_LOGS_SUB_MAX; i++ ) {
+    if( ctx->ws_logs_subs[ i ].sub_id && ctx->ws_logs_subs[ i ].ws_conn_id==ws_conn_id ) { ctx->ws_logs_subs[ i ].sub_id = 0UL; ctx->ws_logs_sub_cnt--; }
+  }
+  for( ulong i=0UL; i<FD_RPC_WS_PROG_SUB_MAX; i++ ) {
+    if( ctx->ws_prog_subs[ i ].sub_id && ctx->ws_prog_subs[ i ].ws_conn_id==ws_conn_id ) { ctx->ws_prog_subs[ i ].sub_id = 0UL; ctx->ws_prog_sub_cnt--; }
+  }
+  for( ulong i=0UL; i<FD_RPC_WS_SUPD_SUB_MAX; i++ ) {
+    if( ctx->ws_supd_subs[ i ].sub_id && ctx->ws_supd_subs[ i ].ws_conn_id==ws_conn_id ) { ctx->ws_supd_subs[ i ].sub_id = 0UL; ctx->ws_supd_sub_cnt--; }
   }
   for( ulong i=0UL; i<FD_RPC_WS_ACCT_SUB_MAX; i++ ) {
     if( ctx->ws_acct_subs[ i ].sub_id && ctx->ws_acct_subs[ i ].ws_conn_id==ws_conn_id ) { ctx->ws_acct_subs[ i ].sub_id = 0UL; ctx->ws_acct_sub_cnt--; }
@@ -8603,6 +10172,8 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->send_datagram_cnt = 0UL;
   ctx->txn_rec_next  = 0UL;
   ctx->vote_stake_valid = 0;
+  ctx->vote_stake_slot = 0UL;
+  ctx->vote_stake_dirty_slot = 0UL;
   ctx->vote_stake_cnt   = 0UL;
   memset( ctx->txn_table, 0, sizeof(ctx->txn_table) );
   for( ulong i=0UL; i<FD_RPC_BLOCK_META_CNT; i++ ) ctx->block_metas[ i ].slot = ULONG_MAX;
